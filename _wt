@@ -1,0 +1,106 @@
+#compdef wt
+
+_wt_get_roles() {
+    python3 -c "
+import json
+from pathlib import Path
+try:
+    data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+    for r in data.get('roles', []):
+        print(r['id'])
+except:
+    pass
+" 2>/dev/null
+}
+
+_wt() {
+    local -a commands
+    commands=(
+        'add:Add a new task'
+        'add-issue:Create task from GitHub issue'
+        'list:List tasks'
+        'ls:List tasks'
+        'start:Start timer on a task'
+        'stop:Stop the active timer'
+        'log:Log time to a task'
+        'notes:Open notes for a task'
+        'link:Link task to GitHub issue'
+        'unlink:Unlink task from GitHub issue'
+        'done:Mark a task as done'
+        'delete:Delete a task'
+        'del:Delete a task'
+        'rm:Delete a task'
+        'status:Show time summary'
+        'config:View or set configuration'
+        'roles:Manage roles'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        start|notes|done|delete|del|rm|log|link)
+            local -a tasks
+            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+            compadd -Q "${tasks[@]}"
+            ;;
+        unlink)
+            # Only show tasks that have github_issue
+            local -a tasks
+            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    if t.get('github_issue'):
+        print(t['title'])
+" 2>/dev/null)}")
+            compadd -Q "${tasks[@]}"
+            ;;
+        add)
+            local -a roles
+            roles=("${(@f)$(_wt_get_roles)}")
+            _arguments \
+                "--role[Role]:role:(${roles[*]})" \
+                '--status[Status]:status:(todo inprogress done)' \
+                '--desc[Description]:'
+            ;;
+        list|ls)
+            local -a roles
+            roles=("${(@f)$(_wt_get_roles)}")
+            _arguments "--role[Filter by role]:role:(${roles[*]})"
+            ;;
+        config)
+            if (( CURRENT == 3 )); then
+                local -a config_keys
+                config_keys=('github-repo:Default GitHub repository (owner/repo)')
+                _describe -t config_keys 'config key' config_keys
+            fi
+            ;;
+        roles)
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('add:Add a new role' 'update:Update role label' 'delete:Delete a role')
+                _describe -t subcommands 'roles subcommand' subcommands
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    update|delete|del|rm)
+                        local -a roles
+                        roles=("${(@f)$(_wt_get_roles)}")
+                        compadd "${roles[@]}"
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+}
+
+_wt "$@"
