@@ -17,8 +17,8 @@ Usage:
     wt link <task> <github-issue>  — Link task to GitHub issue
     wt unlink <task>               — Unlink task from GitHub issue
 
-    wt add-issue [url-or-ref]    — Create task from GitHub issue
-    wt add-issue                 — Interactive: show assigned issues
+    wt add-issue [url-or-ref] [--role ROLE]  — Create task from GitHub issue
+    wt add-issue [--role ROLE]               — Interactive: show assigned issues
 
     wt config                    — Show all config
     wt config <key>              — Show config value
@@ -600,10 +600,24 @@ def cmd_config(args):
 def cmd_add_issue(args):
     """Create a task from a GitHub issue."""
     data = load()
+    roles = get_roles(data)
+    role_ids = get_role_ids(data)
 
-    if args:
+    # Parse --role flag
+    role_id = None
+    remaining_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--role" and i + 1 < len(args):
+            role_id = resolve_role(data, args[i + 1])
+            i += 2
+        else:
+            remaining_args.append(args[i])
+            i += 1
+
+    if remaining_args:
         # Direct mode: create from URL/ref (normalize handles bare numbers)
-        issue_ref = normalize_issue_ref(args[0], data)
+        issue_ref = normalize_issue_ref(remaining_args[0], data)
     else:
         # Interactive mode: list assigned issues
         repo = data.get("config", {}).get("github_repo")
@@ -658,6 +672,33 @@ def cmd_add_issue(args):
         selected = issues[idx]
         issue_ref = f"{repo}#{selected['number']}"
 
+        # Prompt for role if not specified via --role
+        if role_id is None:
+            print(c("\n  Select role:\n", "bold"))
+            for j, r in enumerate(data.get("roles", []), 1):
+                print(f"    {j}. {r['label']} ({r['id']})")
+            print()
+
+            try:
+                role_choice = input(f"  Role (1-{len(data['roles'])}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+
+            if role_choice:
+                try:
+                    role_idx = int(role_choice) - 1
+                    if 0 <= role_idx < len(data["roles"]):
+                        role_id = data["roles"][role_idx]["id"]
+                    else:
+                        print(c("Invalid selection, using 'other'.", "yellow"))
+                        role_id = "other"
+                except ValueError:
+                    print(c("Invalid selection, using 'other'.", "yellow"))
+                    role_id = "other"
+            else:
+                role_id = "other"
+
     # Fetch issue details
     result = subprocess.run(
         ["gh", "issue", "view", *gh_issue_args(issue_ref), "--json", "number,title,state,url"],
@@ -682,8 +723,9 @@ def cmd_add_issue(args):
             print(f"  {t['title']} (id: {t['id']})")
             sys.exit(0)
 
-    roles = get_roles(data)
-    role_id = "other"  # Default role
+    # Default to 'other' if no role specified
+    if role_id is None:
+        role_id = "other"
 
     task = {
         "id": uid(),
