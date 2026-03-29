@@ -29,6 +29,13 @@ Usage:
     wt roles update <id> <label> — Update role label
     wt roles delete <id>         — Delete a role
 
+    wt arc setup                 — Set up Arc browser integration
+    wt arc status                — Show Arc integration status
+    wt arc sync                  — Sync folders with current roles/tasks
+
+    wt tabs                      — List tabs in current task's folder
+    wt tabs cleanup              — Manually trigger tab cleanup
+
 Notes are stored in ~/.workload_tracker_notes/<task_id>.md
 Tasks linked to GitHub issues use the issue for notes instead.
 """
@@ -238,6 +245,21 @@ def cmd_add(args):
     print(c(f"✓ Added: {title}", "green") + f"  [{roles.get(role_id, role_id)}]  [{STATUS_LABELS.get(status, status)}]")
     print(c(f"  id: {task['id']}", "dim"))
 
+    # Arc integration: create task folder
+    if data.get("config", {}).get("arc_space_id"):
+        try:
+            from arc_browser import TaskTabManager, prompt_arc_restart
+            manager = TaskTabManager(data)
+            result = manager.on_task_created(task, save)
+            if result.get("folder_id"):
+                print(c("  [Arc folder created]", "dim"))
+                if result.get("restart_required"):
+                    print(c("  Restart Arc to see the new folder.", "yellow"))
+            elif result.get("error"):
+                print(c(f"  [Arc: {result['error']}]", "dim"))
+        except ImportError:
+            pass
+
 
 def cmd_list(args):
     data = load()
@@ -312,6 +334,17 @@ def cmd_start(args):
     save(data)
     print(c(f"▶  Started: {task['title']}", "green"))
 
+    # Arc integration: focus the Workload Tracker space
+    if data.get("config", {}).get("arc_space_id"):
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(data)
+            result = manager.on_task_started(task)
+            if result.get("focused"):
+                print(c("  [Arc: Focused Workload Tracker space]", "dim"))
+        except ImportError:
+            pass
+
 
 def cmd_stop(args):
     data = load()
@@ -328,6 +361,19 @@ def cmd_stop(args):
     data["active_timer"] = None
     save(data)
     print(c(f"⏹  Stopped: {task['title'] if task else '?'}  ({fmt_mins(elapsed)})", "yellow"))
+
+    # Arc integration: tab cleanup
+    if task and data.get("config", {}).get("tab_cleanup_enabled"):
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(data)
+            result = manager.on_task_stopped(task, prompt_callback=_cli_tab_cleanup_prompt)
+            if result.get("tabs_closed"):
+                print(c(f"  [Arc: Closed {result['tabs_closed']} unrelated tabs]", "dim"))
+            elif result.get("unrelated_tabs"):
+                print(c(f"  [Arc: Found {len(result['unrelated_tabs'])} potentially unrelated tabs]", "dim"))
+        except ImportError:
+            pass
 
 
 def cmd_log(args):
@@ -366,6 +412,21 @@ def cmd_done(args):
     task["status"] = "done"
     save(data)
     print(c(f"✓ Marked done: {task['title']}", "green"))
+
+    # Arc integration: archive tabs and delete folder
+    if task.get("arc_folder_id"):
+        try:
+            from arc_browser import TaskTabManager, prompt_arc_restart
+            manager = TaskTabManager(data)
+            result = manager.on_task_completed(task, save)
+            if result.get("tabs_archived"):
+                print(c(f"  [Arc: Archived {result['tabs_archived']} tabs]", "dim"))
+            if result.get("folder_deleted"):
+                print(c("  [Arc: Folder removed]", "dim"))
+                if result.get("restart_required"):
+                    print(c("  Restart Arc to apply changes.", "yellow"))
+        except ImportError:
+            pass
 
 
 def cmd_delete(args):
@@ -746,6 +807,246 @@ def cmd_add_issue(args):
     print(c(f"  GitHub: {issue_ref}", "cyan"))
 
 
+def _cli_tab_cleanup_prompt(unrelated_tabs):
+    """CLI callback to prompt user about closing unrelated tabs."""
+    if not unrelated_tabs:
+        return []
+
+    print(c("\n  Potentially unrelated tabs:", "yellow"))
+    for i, tab_info in enumerate(unrelated_tabs, 1):
+        print(f"    {i}. {tab_info['title'][:50]}")
+        print(c(f"       {tab_info['url'][:60]}", "dim"))
+        print(c(f"       Reason: {tab_info['reason']}", "dim"))
+
+    try:
+        response = input("\n  Close these tabs? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
+
+    if response in ("y", "yes"):
+        return unrelated_tabs
+    return []
+
+
+def cmd_arc(args):
+    """Manage Arc browser integration."""
+    if not args:
+        print("Usage: wt arc <setup|status|sync>")
+        sys.exit(1)
+
+    subcmd = args[0].lower()
+
+    if subcmd == "setup":
+        try:
+            from arc_browser import TaskTabManager, ArcAppleScript, prompt_arc_restart
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        applescript = ArcAppleScript()
+
+        # Check if Arc is running
+        if applescript.is_arc_running():
+            print(c("Warning: Arc is running.", "yellow"))
+            print("Changes to Arc's sidebar require Arc to be quit first.")
+            try:
+                response = input("Quit Arc now? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+            if response not in ("n", "no"):
+                print("Quitting Arc...")
+                applescript.quit_arc()
+                import time as t
+                t.sleep(1)
+            else:
+                print(c("Cannot proceed while Arc is running.", "red"))
+                sys.exit(1)
+
+        manager = TaskTabManager(data)
+        print("Setting up Workload Tracker space...")
+        result = manager.setup_space_and_folders(save)
+
+        if result.get("errors"):
+            for err in result["errors"]:
+                print(c(f"  Error: {err}", "red"))
+            sys.exit(1)
+
+        print(c(f"✓ Created space: {result['space_id']}", "green"))
+        for role_id, folder_id in result.get("role_folders", {}).items():
+            print(c(f"  ✓ Role folder: {role_id}", "green"))
+
+        # Enable tab cleanup by default
+        data.setdefault("config", {})["tab_cleanup_enabled"] = True
+        save(data)
+        print(c("✓ Tab cleanup enabled", "green"))
+
+        if result.get("restart_required"):
+            prompt_arc_restart()
+
+    elif subcmd == "status":
+        try:
+            from arc_browser import TaskTabManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        manager = TaskTabManager(data)
+        status = manager.get_status()
+
+        print(c("\n  Arc Integration Status\n", "bold"))
+        print(f"  Enabled:            {'Yes' if status['enabled'] else 'No'}")
+        print(f"  Space ID:           {status['space_id'] or '(not set)'}")
+        print(f"  Tab cleanup:        {'On' if status['tab_cleanup_enabled'] else 'Off'}")
+        print(f"  Confidence:         {status['confidence_threshold']:.0%}")
+        print(f"  Arc running:        {'Yes' if status['arc_running'] else 'No'}")
+        print(f"  Role folders:       {status['role_folders']}")
+        print(f"  Task folders:       {status['task_folders']}")
+        print()
+
+    elif subcmd == "sync":
+        try:
+            from arc_browser import TaskTabManager, ArcAppleScript, prompt_arc_restart
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        applescript = ArcAppleScript()
+
+        if applescript.is_arc_running():
+            print(c("Warning: Arc is running.", "yellow"))
+            print("Sync requires Arc to be quit first for folder changes.")
+            try:
+                response = input("Quit Arc now? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+            if response not in ("n", "no"):
+                print("Quitting Arc...")
+                applescript.quit_arc()
+                import time as t
+                t.sleep(1)
+
+        manager = TaskTabManager(data)
+        print("Syncing folders...")
+        result = manager.sync_folders(save)
+
+        if result.get("errors"):
+            for err in result["errors"]:
+                print(c(f"  Error: {err}", "red"))
+
+        print(c(f"✓ Synced {result['roles_synced']} roles, {result['tasks_synced']} tasks", "green"))
+
+        if result.get("restart_required"):
+            prompt_arc_restart()
+
+    else:
+        print(c(f"Unknown arc subcommand: {subcmd}", "red"))
+        print("Usage: wt arc <setup|status|sync>")
+        sys.exit(1)
+
+
+def cmd_tabs(args):
+    """List or manage tabs for the current task."""
+    try:
+        from arc_browser import TaskTabManager, ArcAppleScript
+    except ImportError as e:
+        print(c(f"Error: {e}", "red"))
+        sys.exit(1)
+
+    data = load()
+    at = data.get("active_timer")
+
+    subcmd = args[0].lower() if args else "list"
+
+    if subcmd == "list":
+        if not at:
+            print(c("No active timer. Start a task first.", "dim"))
+            return
+
+        task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
+        if not task:
+            print(c("Active task not found.", "red"))
+            return
+
+        folder_id = task.get("arc_folder_id")
+        if not folder_id:
+            print(c(f"Task '{task['title']}' has no Arc folder.", "dim"))
+            return
+
+        from arc_browser import ArcSidebarManager
+        sidebar = ArcSidebarManager()
+        tabs = sidebar.get_tabs_in_folder(folder_id)
+
+        if not tabs:
+            print(c(f"No tabs in folder for '{task['title']}'", "dim"))
+            return
+
+        print(c(f"\n  Tabs for: {task['title']}\n", "bold"))
+        for tab in tabs:
+            print(f"  • {tab['title'][:50]}")
+            print(c(f"    {tab['url'][:60]}", "dim"))
+        print()
+
+    elif subcmd == "cleanup":
+        if not at:
+            print(c("No active timer. Start a task first.", "dim"))
+            return
+
+        task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
+        if not task:
+            print(c("Active task not found.", "red"))
+            return
+
+        manager = TaskTabManager(data)
+        print(f"Analyzing tabs for '{task['title']}'...")
+        result = manager.on_task_stopped(task, prompt_callback=_cli_tab_cleanup_prompt)
+
+        if result.get("error"):
+            print(c(f"Error: {result['error']}", "red"))
+        elif result.get("tabs_closed"):
+            print(c(f"✓ Closed {result['tabs_closed']} tabs", "green"))
+        elif not result.get("unrelated_tabs"):
+            print(c("All tabs appear related to the task.", "green"))
+
+    elif subcmd == "restore":
+        # Restore archived tabs for a task
+        if len(args) < 2:
+            print("Usage: wt tabs restore <task-id or title>")
+            return
+
+        task = resolve_task(data, " ".join(args[1:]))
+        archived = task.get("archived_tabs", [])
+        if not archived:
+            print(c(f"No archived tabs for '{task['title']}'", "dim"))
+            return
+
+        print(c(f"\n  Archived tabs for: {task['title']}\n", "bold"))
+        for i, tab in enumerate(archived, 1):
+            print(f"  {i}. {tab['title'][:50]}")
+            print(c(f"     {tab['url'][:60]}", "dim"))
+
+        try:
+            response = input("\n  Open these tabs? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if response not in ("n", "no"):
+            applescript = ArcAppleScript()
+            opened = applescript.open_urls([t["url"] for t in archived])
+            print(c(f"✓ Opened {opened} tabs", "green"))
+
+    else:
+        print(c(f"Unknown tabs subcommand: {subcmd}", "red"))
+        print("Usage: wt tabs [list|cleanup|restore <task>]")
+        sys.exit(1)
+
+
 COMMANDS = {
     "add": cmd_add,
     "add-issue": cmd_add_issue,
@@ -764,6 +1065,8 @@ COMMANDS = {
     "unlink": cmd_unlink,
     "config": cmd_config,
     "roles": cmd_roles,
+    "arc": cmd_arc,
+    "tabs": cmd_tabs,
 }
 
 

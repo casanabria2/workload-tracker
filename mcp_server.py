@@ -297,6 +297,17 @@ def start_timer(task_query: str) -> str:
     save(data)
     result_lines.append(f"Started timer on '{task['title']}'")
 
+    # Arc integration: focus space
+    if data.get("config", {}).get("arc_space_id"):
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(data)
+            result = manager.on_task_started(task)
+            if result.get("focused"):
+                result_lines.append("[Arc: Focused Workload Tracker space]")
+        except ImportError:
+            pass
+
     return "\n".join(result_lines)
 
 
@@ -323,7 +334,28 @@ def stop_timer() -> str:
     data["active_timer"] = None
     save(data)
 
-    return f"Stopped timer on '{task['title'] if task else '?'}' ({fmt_mins(elapsed)})"
+    result_lines = [f"Stopped timer on '{task['title'] if task else '?'}' ({fmt_mins(elapsed)})"]
+
+    # Arc integration: report unrelated tabs (don't auto-close in MCP)
+    if task and data.get("config", {}).get("tab_cleanup_enabled"):
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(data)
+            tabs = manager.applescript.get_all_tabs()
+            if tabs:
+                classifications = manager.classifier.classify_tabs(tabs, task)
+                unrelated = manager.classifier.get_unrelated_tabs(classifications)
+                if unrelated:
+                    result_lines.append(f"\n[Arc] Found {len(unrelated)} potentially unrelated tabs:")
+                    for c in unrelated[:5]:  # Show first 5
+                        result_lines.append(f"  - {c.tab.title[:40]}")
+                    if len(unrelated) > 5:
+                        result_lines.append(f"  ... and {len(unrelated) - 5} more")
+                    result_lines.append("Use cleanup_task_tabs() to close them.")
+        except ImportError:
+            pass
+
+    return "\n".join(result_lines)
 
 
 @mcp.tool()
@@ -716,6 +748,174 @@ def create_task_from_issue(issue_ref: str, role: str = "other") -> str:
         f"Role: {roles[role]} | Status: {STATUS_LABELS[status]}\n"
         f"GitHub: {issue_ref}"
     )
+
+
+@mcp.tool()
+def setup_arc_space() -> str:
+    """Set up Arc browser integration with Workload Tracker space and role folders.
+
+    Note: Arc must be quit before running this. Changes require Arc restart.
+    """
+    try:
+        from arc_browser import TaskTabManager, ArcAppleScript
+    except ImportError:
+        return "Error: arc_browser module not found."
+
+    data = load()
+    applescript = ArcAppleScript()
+
+    if applescript.is_arc_running():
+        return (
+            "Error: Arc is currently running.\n"
+            "Please quit Arc first, then run this command again.\n"
+            "Changes to Arc's sidebar require Arc to be closed."
+        )
+
+    manager = TaskTabManager(data)
+    result = manager.setup_space_and_folders(save)
+
+    if result.get("errors"):
+        return "Errors:\n" + "\n".join(result["errors"])
+
+    lines = [
+        f"Created Workload Tracker space: {result['space_id']}",
+        f"Created {len(result.get('role_folders', {}))} role folders",
+    ]
+
+    # Enable tab cleanup
+    data.setdefault("config", {})["tab_cleanup_enabled"] = True
+    save(data)
+    lines.append("Tab cleanup enabled")
+    lines.append("\nRestart Arc to see the changes.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_arc_status() -> str:
+    """Get the current Arc browser integration status."""
+    try:
+        from arc_browser import TaskTabManager
+    except ImportError:
+        return "Error: arc_browser module not found."
+
+    data = load()
+    manager = TaskTabManager(data)
+    status = manager.get_status()
+
+    lines = [
+        "Arc Integration Status:",
+        f"  Enabled: {'Yes' if status['enabled'] else 'No'}",
+        f"  Space ID: {status['space_id'] or '(not set)'}",
+        f"  Tab cleanup: {'On' if status['tab_cleanup_enabled'] else 'Off'}",
+        f"  Confidence threshold: {status['confidence_threshold']:.0%}",
+        f"  Arc running: {'Yes' if status['arc_running'] else 'No'}",
+        f"  Role folders: {status['role_folders']}",
+        f"  Task folders: {status['task_folders']}",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def cleanup_task_tabs(task_query: str | None = None, close_tabs: bool = False) -> str:
+    """Analyze and optionally close unrelated tabs for a task.
+
+    Args:
+        task_query: Task ID or partial title (uses active task if not specified)
+        close_tabs: If True, close the unrelated tabs. If False, just report them.
+    """
+    try:
+        from arc_browser import TaskTabManager
+    except ImportError:
+        return "Error: arc_browser module not found."
+
+    data = load()
+
+    # Find task
+    if task_query:
+        task = resolve_task(data, task_query)
+        if not task:
+            return f"No task found matching '{task_query}'"
+    else:
+        at = data.get("active_timer")
+        if not at:
+            return "No active timer. Specify a task or start a timer first."
+        task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
+        if not task:
+            return "Active task not found."
+
+    manager = TaskTabManager(data)
+    tabs = manager.applescript.get_all_tabs()
+
+    if not tabs:
+        return "No tabs found in Arc."
+
+    classifications = manager.classifier.classify_tabs(tabs, task)
+    unrelated = manager.classifier.get_unrelated_tabs(classifications)
+
+    if not unrelated:
+        return f"All {len(tabs)} tabs appear related to '{task['title']}'."
+
+    lines = [f"Task: {task['title']}", f"Found {len(unrelated)} potentially unrelated tabs:\n"]
+
+    for c in unrelated:
+        lines.append(f"  • {c.tab.title[:50]}")
+        lines.append(f"    {c.tab.url[:60]}")
+        lines.append(f"    Reason: {c.reason}\n")
+
+    if close_tabs:
+        closed = 0
+        for _ in unrelated:
+            if manager.applescript.close_current_tab():
+                closed += 1
+                import time as t
+                t.sleep(0.1)
+        lines.append(f"\nClosed {closed} tabs.")
+    else:
+        lines.append("\nSet close_tabs=True to close these tabs.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def sync_arc_folders() -> str:
+    """Sync Arc folders with current roles and tasks.
+
+    Creates missing role and task folders. Requires Arc to be quit.
+    """
+    try:
+        from arc_browser import TaskTabManager, ArcAppleScript
+    except ImportError:
+        return "Error: arc_browser module not found."
+
+    data = load()
+
+    if not data.get("config", {}).get("arc_space_id"):
+        return "Error: Arc space not set up. Run setup_arc_space() first."
+
+    applescript = ArcAppleScript()
+    if applescript.is_arc_running():
+        return (
+            "Error: Arc is currently running.\n"
+            "Please quit Arc first, then run this command again."
+        )
+
+    manager = TaskTabManager(data)
+    result = manager.sync_folders(save)
+
+    lines = [
+        f"Synced {result['roles_synced']} role folders",
+        f"Synced {result['tasks_synced']} task folders",
+    ]
+
+    if result.get("errors"):
+        lines.append("\nErrors:")
+        lines.extend(f"  - {e}" for e in result["errors"])
+
+    if result.get("restart_required"):
+        lines.append("\nRestart Arc to see the changes.")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

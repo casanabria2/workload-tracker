@@ -185,6 +185,67 @@ class TaskModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Tab Cleanup (Arc Integration)
+# ──────────────────────────────────────────────────────────
+
+class TabCleanupModal(ModalScreen):
+    """Modal for selecting which unrelated tabs to close."""
+    CSS = """
+    TabCleanupModal { align: center middle; }
+    #cleanup-box {
+        width: 70;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #cleanup-box Label { margin-bottom: 1; }
+    .tab-item { margin-bottom: 1; }
+    .tab-url { color: $text-muted; }
+    .tab-reason { color: $text-muted; font-style: italic; }
+    #tab-list { max-height: 20; border: solid $primary; margin-bottom: 1; padding: 1; }
+    """
+
+    def __init__(self, unrelated_tabs: list, task_title: str):
+        super().__init__()
+        self._tabs = unrelated_tabs
+        self._task_title = task_title
+        self._selected = set(range(len(unrelated_tabs)))  # All selected by default
+
+    def compose(self) -> ComposeResult:
+        with Container(id="cleanup-box"):
+            yield Label(f"[bold]Tab Cleanup — {self._task_title}[/]")
+            yield Label(f"Found {len(self._tabs)} potentially unrelated tabs:")
+            with ScrollableContainer(id="tab-list"):
+                for i, tab in enumerate(self._tabs):
+                    yield Static(
+                        f"[{'green' if i in self._selected else 'dim'}]●[/] "
+                        f"{tab.get('title', 'Unknown')[:45]}\n"
+                        f"  [dim]{tab.get('url', '')[:55]}[/]\n"
+                        f"  [italic dim]{tab.get('reason', '')}[/]",
+                        id=f"tab-{i}",
+                        classes="tab-item"
+                    )
+            with Horizontal():
+                yield Button("Close Selected", variant="primary", id="btn-close-tabs")
+                yield Button("Keep All", id="btn-keep")
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss([])
+
+    @on(Button.Pressed, "#btn-close-tabs")
+    def close_tabs(self):
+        selected_tabs = [self._tabs[i] for i in sorted(self._selected)]
+        self.dismiss(selected_tabs)
+
+    @on(Button.Pressed, "#btn-keep")
+    def keep_all(self):
+        self.dismiss([])
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Log Time
 # ──────────────────────────────────────────────────────────
 
@@ -561,8 +622,13 @@ class WorkloadTracker(App):
                     "note": "Timer session", "at": time.time()
                 })
             self._data["active_timer"] = None
+            save_data(self._data)
+
+            # Arc integration: tab cleanup
+            self._arc_tab_cleanup(task)
         else:
             # Stop any running timer first
+            stopped_task = None
             if at:
                 prev = next((t for t in self._data["tasks"] if t["id"] == at["task_id"]), None)
                 if prev:
@@ -572,11 +638,67 @@ class WorkloadTracker(App):
                             "id": uid(), "minutes": round(elapsed, 2),
                             "note": "Timer session", "at": time.time()
                         })
+                    stopped_task = prev
             self._data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
-        save_data(self._data)
+            save_data(self._data)
+
+            # Arc integration: focus space on start
+            self._arc_on_task_started(task)
+
+            # Arc integration: tab cleanup for previously stopped task
+            if stopped_task:
+                self._arc_tab_cleanup(stopped_task)
+
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
+
+    def _arc_on_task_started(self, task: dict):
+        """Arc integration: focus space when starting a task."""
+        if not self._data.get("config", {}).get("arc_space_id"):
+            return
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(self._data)
+            manager.on_task_started(task)
+        except ImportError:
+            pass
+
+    def _arc_tab_cleanup(self, task: dict):
+        """Arc integration: show tab cleanup modal if enabled."""
+        if not self._data.get("config", {}).get("tab_cleanup_enabled"):
+            return
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(self._data)
+
+            # Get tabs and classify
+            tabs = manager.applescript.get_all_tabs()
+            if not tabs:
+                return
+
+            classifications = manager.classifier.classify_tabs(tabs, task)
+            unrelated = manager.classifier.get_unrelated_tabs(classifications)
+
+            if unrelated:
+                unrelated_data = [
+                    {"url": c.tab.url, "title": c.tab.title, "reason": c.reason}
+                    for c in unrelated
+                ]
+                self.push_screen(
+                    TabCleanupModal(unrelated_data, task["title"]),
+                    lambda tabs_to_close: self._on_tabs_cleanup(tabs_to_close, manager)
+                )
+        except ImportError:
+            pass
+
+    def _on_tabs_cleanup(self, tabs_to_close: list, manager):
+        """Callback when user selects tabs to close."""
+        if not tabs_to_close:
+            return
+        for _ in tabs_to_close:
+            manager.applescript.close_current_tab()
+            time.sleep(0.1)
 
     def action_log_time(self):
         task = self._selected_task()
@@ -601,9 +723,27 @@ class WorkloadTracker(App):
             return
         current = task.get("status", "todo")
         idx = STATUSES.index(current) if current in STATUSES else 0
-        task["status"] = STATUSES[(idx + 1) % len(STATUSES)]
+        new_status = STATUSES[(idx + 1) % len(STATUSES)]
+        old_status = task["status"]
+        task["status"] = new_status
         save_data(self._data)
         self._populate_table()
+
+        # Arc integration: cleanup folder when marked done
+        if new_status == "done" and old_status != "done":
+            self._arc_on_task_completed(task)
+
+    def _arc_on_task_completed(self, task: dict):
+        """Arc integration: archive tabs and remove folder when task is done."""
+        if not task.get("arc_folder_id"):
+            return
+        try:
+            from arc_browser import TaskTabManager
+            manager = TaskTabManager(self._data)
+            manager.on_task_completed(task, save_data)
+            self.notify("Arc folder archived. Restart Arc to apply.", severity="information")
+        except ImportError:
+            pass
 
 
 if __name__ == "__main__":
