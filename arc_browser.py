@@ -92,7 +92,7 @@ class ArcSidebarManager:
         for old_backup in backups[:-10]:
             old_backup.unlink()
 
-        # Save
+        # Save with 2-space indent (Arc's format)
         self.sidebar_path.write_text(json.dumps(data, indent=2))
 
     def _find_container_with_spaces(self, data: dict) -> Optional[dict]:
@@ -164,7 +164,10 @@ class ArcSidebarManager:
                 pinned_container_id
             ]
         }
-        container["spaces"].append(new_space)
+
+        # Arc requires BOTH a string ID reference AND the full dict object
+        container["spaces"].append(space_id)      # String ID first
+        container["spaces"].append(new_space)     # Full dict second
 
         # Initialize items array if needed
         if "items" not in container:
