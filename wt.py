@@ -832,20 +832,97 @@ def _cli_tab_cleanup_prompt(unrelated_tabs):
 def cmd_arc(args):
     """Manage Arc browser integration."""
     if not args:
-        print("Usage: wt arc <setup|status|sync>")
+        print("Usage: wt arc <setup|status|sync|link|spaces>")
         sys.exit(1)
 
     subcmd = args[0].lower()
 
+    if subcmd == "spaces":
+        # List all Arc spaces
+        try:
+            from arc_browser import ArcSidebarManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        sidebar = ArcSidebarManager()
+        spaces = sidebar.list_spaces()
+
+        print(c("\n  Arc Spaces:\n", "bold"))
+        for space in spaces:
+            print(f"  {space['title']:<30} {space['id']}")
+        print()
+        print(c("  Use 'wt arc link <space-name>' to link to a space", "dim"))
+        return
+
+    if subcmd == "link":
+        # Link to an existing space by name
+        if len(args) < 2:
+            print("Usage: wt arc link <space-name>")
+            print("  Links to an existing Arc space (create it in Arc first)")
+            sys.exit(1)
+
+        space_name = " ".join(args[1:])
+
+        try:
+            from arc_browser import ArcSidebarManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        sidebar = ArcSidebarManager()
+
+        space = sidebar.find_space_by_name(space_name)
+        if not space:
+            print(c(f"Space '{space_name}' not found.", "red"))
+            print("Available spaces:")
+            for s in sidebar.list_spaces():
+                print(f"  {s['title']}")
+            sys.exit(1)
+
+        # Store the space ID
+        data.setdefault("config", {})["arc_space_id"] = space["id"]
+        data["config"]["tab_cleanup_enabled"] = True
+        save(data)
+
+        print(c(f"✓ Linked to space: {space_name}", "green"))
+        print(c(f"  Space ID: {space['id']}", "dim"))
+        print(c("  Tab cleanup enabled", "dim"))
+        print()
+        print("Now run 'wt arc sync' to create role folders.")
+        return
+
     if subcmd == "setup":
         try:
-            from arc_browser import TaskTabManager, ArcAppleScript, prompt_arc_restart
+            from arc_browser import TaskTabManager, ArcAppleScript, ArcSidebarManager, prompt_arc_restart
         except ImportError as e:
             print(c(f"Error: {e}", "red"))
             sys.exit(1)
 
         data = load()
         applescript = ArcAppleScript()
+        sidebar = ArcSidebarManager()
+
+        # Check for Arc Sync
+        if sidebar.is_sync_enabled():
+            print(c("Warning: Arc Sync appears to be enabled.", "yellow"))
+            print()
+            print("Arc Sync may overwrite local changes when Arc launches.")
+            print("Recommended approach:")
+            print("  1. Create the space manually in Arc (click + > New Space)")
+            print("  2. Name it 'Workload Tracker'")
+            print("  3. Run: wt arc link 'Workload Tracker'")
+            print()
+            print("Or disable Arc Sync temporarily in Arc Settings > Sync & Profiles.")
+            print()
+            try:
+                response = input("Continue anyway? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+            if response not in ("y", "yes"):
+                sys.exit(0)
 
         # Check if Arc is running
         if applescript.is_arc_running():

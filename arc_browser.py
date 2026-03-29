@@ -66,6 +66,16 @@ class ArcSidebarManager:
             raise FileNotFoundError(f"Arc sidebar not found at {self.sidebar_path}")
         return json.loads(self.sidebar_path.read_text())
 
+    def is_sync_enabled(self) -> bool:
+        """Check if Arc Sync appears to be enabled."""
+        try:
+            data = self.load_sidebar()
+            sync_state = data.get("firebaseSyncState", {})
+            # If there's a lastSyncedTimestamp, sync is likely enabled
+            return "lastSyncedTimestamp" in sync_state
+        except Exception:
+            return False
+
     def save_sidebar(self, data: dict):
         """Backup and save StorableSidebar.json.
 
@@ -124,15 +134,35 @@ class ArcSidebarManager:
             if isinstance(space, dict) and space.get("title") == WORKLOAD_TRACKER_SPACE_NAME:
                 return space["id"]
 
-        # Create new space
+        # Create new space with full structure Arc expects
         space_id = self._generate_uuid()
+        pinned_container_id = self._generate_uuid()
+        unpinned_container_id = self._generate_uuid()
+
         new_space = {
             "id": space_id,
             "title": WORKLOAD_TRACKER_SPACE_NAME,
             "customInfo": {
-                "iconType": "emoji",
-                "emoji": "📋"
-            }
+                "iconType": {
+                    "emoji_v2": "📋",
+                    "emoji": 128203  # Unicode codepoint for 📋
+                }
+            },
+            "profile": {
+                "default": False
+            },
+            "newContainerIDs": [
+                {"pinned": {}},
+                pinned_container_id,
+                {"unpinned": {"_0": {"shared": {}}}},
+                unpinned_container_id
+            ],
+            "containerIDs": [
+                "unpinned",
+                unpinned_container_id,
+                "pinned",
+                pinned_container_id
+            ]
         }
         container["spaces"].append(new_space)
 
@@ -147,6 +177,34 @@ class ArcSidebarManager:
         """Get the Workload Tracker space ID if it exists."""
         space = self.get_workload_tracker_space()
         return space["id"] if space else None
+
+    def find_space_by_name(self, name: str) -> Optional[dict]:
+        """Find any space by name."""
+        data = self.load_sidebar()
+        container = self._find_container_with_spaces(data)
+        if not container:
+            return None
+
+        for space in container.get("spaces", []):
+            if isinstance(space, dict) and space.get("title") == name:
+                return space
+        return None
+
+    def list_spaces(self) -> list[dict]:
+        """List all spaces with their IDs and titles."""
+        data = self.load_sidebar()
+        container = self._find_container_with_spaces(data)
+        if not container:
+            return []
+
+        spaces = []
+        for space in container.get("spaces", []):
+            if isinstance(space, dict):
+                spaces.append({
+                    "id": space.get("id", "?"),
+                    "title": space.get("title", space.get("id", "?")),
+                })
+        return spaces
 
     def create_role_folder(self, role_id: str, role_label: str, space_id: str) -> str:
         """Create a folder for a role in the Workload Tracker space.
