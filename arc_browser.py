@@ -403,11 +403,46 @@ class ArcAppleScript:
         )
         return result.returncode == 0, result.stdout.strip()
 
+    def ensure_pinned_tabs_expanded(self) -> bool:
+        """Ensure pinned tabs are expanded (not collapsed).
+
+        Checks View menu for "Expand Pinned Tabs" option - if present, clicks it.
+        Returns True if action was taken or tabs were already expanded.
+        """
+        script = '''
+        tell application "Arc"
+            activate
+        end tell
+        delay 0.2
+
+        tell application "System Events"
+            tell process "Arc"
+                -- Check if "Expand Pinned Tabs" menu item exists (means they're collapsed)
+                try
+                    set viewMenu to menu "View" of menu bar 1
+                    if exists menu item "Expand Pinned Tabs" of viewMenu then
+                        click menu item "Expand Pinned Tabs" of viewMenu
+                        return "expanded"
+                    else
+                        return "already_expanded"
+                    end if
+                on error
+                    return "error"
+                end try
+            end tell
+        end tell
+        '''
+        success, output = self._run_applescript(script)
+        return success and output in ("expanded", "already_expanded")
+
     def switch_to_space(self, space_name: str) -> bool:
         """Switch to a specific space by name.
 
         Returns True if successful.
         """
+        # Clear cached coordinates when switching spaces
+        self._role_folder_coords_cache = {}
+
         script = f'''
         tell application "Arc"
             activate
@@ -425,7 +460,11 @@ class ArcAppleScript:
         return "ok"
         '''
         success, output = self._run_applescript(script)
-        return success and "ok" in output
+        if success and "ok" in output:
+            # Ensure pinned tabs are expanded after switching
+            self.ensure_pinned_tabs_expanded()
+            return True
+        return False
 
     def create_folder(self, folder_name: str) -> bool:
         """Create a folder in Arc using UI scripting.
@@ -567,7 +606,23 @@ class ArcAppleScript:
                     return (int(parts[0]), int(parts[1]))
                 except ValueError:
                     pass
+
+        # If not found, try expanding pinned tabs and search again
+        if self.ensure_pinned_tabs_expanded():
+            time.sleep(0.3)
+            success, output = self._run_applescript(script)
+            if success and output and output != "not_found":
+                parts = [p.strip() for p in output.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    try:
+                        return (int(parts[0]), int(parts[1]))
+                    except ValueError:
+                        pass
+
         return None
+
+    # Cache for role folder coordinates (cleared when switching spaces)
+    _role_folder_coords_cache: dict = {}
 
     def create_nested_folder_by_name(self, folder_name: str, parent_folder_title: str) -> bool:
         """Create a nested folder inside a parent folder identified by title.
@@ -578,10 +633,20 @@ class ArcAppleScript:
 
         Returns True if successful.
         """
-        coords = self.find_folder_coordinates(parent_folder_title)
+        # Use cached coordinates if available, otherwise find and cache
+        if parent_folder_title not in self._role_folder_coords_cache:
+            coords = self.find_folder_coordinates(parent_folder_title)
+            if coords:
+                self._role_folder_coords_cache[parent_folder_title] = coords
+
+        coords = self._role_folder_coords_cache.get(parent_folder_title)
         if not coords:
             return False
         return self.create_nested_folder(folder_name, coords[0], coords[1])
+
+    def clear_folder_coords_cache(self):
+        """Clear the cached folder coordinates."""
+        self._role_folder_coords_cache.clear()
 
     def create_nested_folder(self, folder_name: str, parent_folder_x: int, parent_folder_y: int) -> bool:
         """Create a nested folder inside a parent folder using right-click context menu.
