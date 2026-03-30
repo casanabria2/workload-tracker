@@ -440,8 +440,6 @@ class ArcAppleScript:
 
         Returns True if successful.
         """
-        # Clear cached coordinates when switching spaces
-        self._role_folder_coords_cache = {}
 
         script = f'''
         tell application "Arc"
@@ -559,6 +557,7 @@ class ArcAppleScript:
         """Find the exact screen coordinates of a folder by searching the UI hierarchy.
 
         Uses Accessibility API to search for the folder by its title text.
+        Returns the LEFTMOST match (least indented = role folder, not nested).
 
         Args:
             folder_title: Title of the folder to find
@@ -566,6 +565,7 @@ class ArcAppleScript:
         Returns (x, y) coordinates (center of element) or None if not found.
         """
         safe_title = folder_title.replace('"', '\\"')
+        # Find ALL matches and return the leftmost one (role folders are less indented)
         script = f'''
         tell application "Arc" to activate
         delay 0.3
@@ -573,8 +573,11 @@ class ArcAppleScript:
         tell application "System Events"
             tell process "Arc"
                 set frontmost to true
+                set bestX to 999999
+                set bestY to 0
+                set foundAny to false
 
-                -- Search entire contents for the folder title
+                -- Search entire contents for ALL matching elements
                 try
                     set allElements to entire contents of front window
                     repeat with elem in allElements
@@ -584,17 +587,24 @@ class ArcAppleScript:
                                 if elemValue is "{safe_title}" then
                                     set elemPos to position of elem
                                     set elemSize to size of elem
-                                    -- Return position with element center offset
-                                    set centerX to (item 1 of elemPos) + 50
-                                    set centerY to (item 2 of elemPos) + ((item 2 of elemSize) / 2)
-                                    return (centerX as integer) & "," & (centerY as integer)
+                                    set elemX to (item 1 of elemPos)
+                                    -- Keep the leftmost match (smallest X = least indented)
+                                    if elemX < bestX then
+                                        set bestX to elemX
+                                        set bestY to (item 2 of elemPos) + ((item 2 of elemSize) / 2)
+                                        set foundAny to true
+                                    end if
                                 end if
                             end if
                         end try
                     end repeat
                 end try
 
-                return "not_found"
+                if foundAny then
+                    return ((bestX + 50) as integer) & "," & (bestY as integer)
+                else
+                    return "not_found"
+                end if
             end tell
         end tell
         '''
@@ -621,9 +631,6 @@ class ArcAppleScript:
 
         return None
 
-    # Cache for role folder coordinates (cleared when switching spaces)
-    _role_folder_coords_cache: dict = {}
-
     def create_nested_folder_by_name(self, folder_name: str, parent_folder_title: str) -> bool:
         """Create a nested folder inside a parent folder identified by title.
 
@@ -633,20 +640,11 @@ class ArcAppleScript:
 
         Returns True if successful.
         """
-        # Use cached coordinates if available, otherwise find and cache
-        if parent_folder_title not in self._role_folder_coords_cache:
-            coords = self.find_folder_coordinates(parent_folder_title)
-            if coords:
-                self._role_folder_coords_cache[parent_folder_title] = coords
-
-        coords = self._role_folder_coords_cache.get(parent_folder_title)
+        # Always find fresh coordinates since folder positions shift
+        coords = self.find_folder_coordinates(parent_folder_title)
         if not coords:
             return False
         return self.create_nested_folder(folder_name, coords[0], coords[1])
-
-    def clear_folder_coords_cache(self):
-        """Clear the cached folder coordinates."""
-        self._role_folder_coords_cache.clear()
 
     def create_nested_folder(self, folder_name: str, parent_folder_x: int, parent_folder_y: int) -> bool:
         """Create a nested folder inside a parent folder using right-click context menu.
