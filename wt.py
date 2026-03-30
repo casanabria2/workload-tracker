@@ -924,21 +924,49 @@ def cmd_arc(args):
 
         # Check if Arc is running
         if applescript.is_arc_running():
-            print(c("Warning: Arc is running.", "yellow"))
-            print("Changes to Arc's sidebar require Arc to be quit first.")
+            print(c("Arc is currently running.", "yellow"))
+            print("Changes to Arc's sidebar require Arc to be fully closed first.")
+            print()
+            print("Options:")
+            print("  1. I'll close it myself")
+            print("  2. Force quit Arc")
+            print("  3. Cancel")
+            print()
             try:
-                response = input("Quit Arc now? [Y/n]: ").strip().lower()
+                response = input("Choose [1/2/3]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 sys.exit(0)
-            if response not in ("n", "no"):
-                print("Quitting Arc...")
+
+            import time as t
+
+            if response == "1":
+                print("Please close Arc completely, then press Enter...")
+                try:
+                    input()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    sys.exit(0)
+            elif response == "2":
+                print("Force quitting Arc...")
                 applescript.quit_arc()
-                import time as t
-                t.sleep(1)
+                t.sleep(2)
             else:
-                print(c("Cannot proceed while Arc is running.", "red"))
+                print("Cancelled.")
+                sys.exit(0)
+
+            # Verify Arc is actually closed
+            attempts = 0
+            while applescript.is_arc_running() and attempts < 10:
+                print("Waiting for Arc to close...")
+                t.sleep(1)
+                attempts += 1
+
+            if applescript.is_arc_running():
+                print(c("Error: Arc is still running. Please close it manually and try again.", "red"))
                 sys.exit(1)
+
+            print(c("✓ Arc is closed", "green"))
 
         manager = TaskTabManager(data)
 
