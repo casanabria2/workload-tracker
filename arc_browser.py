@@ -631,6 +631,26 @@ class ArcAppleScript:
 
         return None
 
+    def collapse_and_expand_pinned_tabs(self):
+        """Collapse then expand pinned tabs to reset all folders to collapsed state."""
+        self._run_applescript('''
+            tell application "System Events"
+                tell process "Arc"
+                    -- Collapse pinned tabs
+                    try
+                        click menu item "Collapse Pinned Tabs" of menu "View" of menu bar 1
+                        delay 0.3
+                    end try
+                    -- Expand pinned tabs
+                    try
+                        click menu item "Expand Pinned Tabs" of menu "View" of menu bar 1
+                        delay 0.3
+                    end try
+                end tell
+            end tell
+        ''')
+        time.sleep(0.3)
+
     def create_nested_folder_by_name(self, folder_name: str, parent_folder_title: str) -> bool:
         """Create a nested folder inside a parent folder identified by title.
 
@@ -640,7 +660,10 @@ class ArcAppleScript:
 
         Returns True if successful.
         """
-        # Always find fresh coordinates since folder positions shift
+        # Reset all folders to collapsed state before finding coordinates
+        self.collapse_and_expand_pinned_tabs()
+
+        # Find fresh coordinates
         coords = self.find_folder_coordinates(parent_folder_title)
         if not coords:
             return False
