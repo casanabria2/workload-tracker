@@ -1048,6 +1048,52 @@ def cmd_arc(args):
 
         save(data)
 
+        # Step 3: Create nested folders for existing tasks
+        active_tasks = [t for t in data.get("tasks", []) if t.get("status") != "done"]
+        if active_tasks:
+            print()
+            print(f"Creating nested folders for {len(active_tasks)} active tasks...")
+
+            # Build role label lookup
+            role_lookup = {r["id"]: r["label"] for r in data.get("roles", [])}
+
+            task_folders_created = 0
+            for task in active_tasks:
+                role_id = task.get("role_id", "other")
+                role_label = role_lookup.get(role_id, "Other")
+
+                print(c(f"  Creating: {task['title'][:40]}...", "dim") if len(task['title']) > 40 else c(f"  Creating: {task['title']}", "dim"))
+
+                if applescript.create_nested_folder_by_name(task["title"], role_label):
+                    task_folders_created += 1
+                    t.sleep(0.3)  # Brief pause between folders
+                else:
+                    print(c(f"    Failed to create folder", "yellow"))
+
+            if task_folders_created == len(active_tasks):
+                print(c(f"✓ Created {task_folders_created} task folders", "green"))
+            else:
+                print(c(f"Created {task_folders_created}/{len(active_tasks)} task folders", "yellow"))
+
+            # Link task folder IDs
+            t.sleep(1)
+            try:
+                arc_data = sidebar.load_sidebar()
+                container = arc_data['sidebar']['containers'][1]
+                items = container.get('items', [])
+
+                for task in active_tasks:
+                    for item in items:
+                        if (isinstance(item, dict) and
+                            item.get("title") == task["title"] and
+                            "list" in item.get("data", {})):
+                            task["arc_folder_id"] = item["id"]
+                            break
+            except Exception:
+                pass  # Non-fatal
+
+            save(data)
+
         print()
         print(c("✓ Setup complete!", "green", "bold"))
 
