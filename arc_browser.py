@@ -67,14 +67,15 @@ class ArcSidebarManager:
         return json.loads(self.sidebar_path.read_text())
 
     def is_sync_enabled(self) -> bool:
-        """Check if Arc Sync appears to be enabled."""
-        try:
-            data = self.load_sidebar()
-            sync_state = data.get("firebaseSyncState", {})
-            # If there's a lastSyncedTimestamp, sync is likely enabled
-            return "lastSyncedTimestamp" in sync_state
-        except Exception:
-            return False
+        """Check if Arc Sync is actively enabled.
+
+        Note: This is difficult to detect reliably as Arc keeps sync metadata
+        even after sync is disabled. Returns False to avoid false positives.
+        """
+        # Arc keeps firebaseSyncState data even when sync is disabled,
+        # so we can't reliably detect if sync is currently active.
+        # Return False to avoid annoying users with false warnings.
+        return False
 
     def save_sidebar(self, data: dict):
         """Backup and save StorableSidebar.json.

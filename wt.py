@@ -922,49 +922,48 @@ def cmd_arc(args):
             if response not in ("y", "yes"):
                 sys.exit(0)
 
-        # Check if Arc is running
+        # Check if Arc is running and try to close it
+        import time as t
         if applescript.is_arc_running():
-            print(c("Arc is currently running.", "yellow"))
-            print("Changes to Arc's sidebar require Arc to be fully closed first.")
-            print()
-            print("Options:")
-            print("  1. I'll close it myself")
-            print("  2. Force quit Arc")
-            print("  3. Cancel")
-            print()
-            try:
-                response = input("Choose [1/2/3]: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                sys.exit(0)
+            print("Closing Arc...")
+            applescript.quit_arc()
+            t.sleep(2)
 
-            import time as t
-
-            if response == "1":
-                print("Please close Arc completely, then press Enter...")
-                try:
-                    input()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    sys.exit(0)
-            elif response == "2":
-                print("Force quitting Arc...")
-                applescript.quit_arc()
-                t.sleep(2)
-            else:
-                print("Cancelled.")
-                sys.exit(0)
-
-            # Verify Arc is actually closed
+            # Wait for Arc to close
             attempts = 0
-            while applescript.is_arc_running() and attempts < 10:
-                print("Waiting for Arc to close...")
+            while applescript.is_arc_running() and attempts < 5:
                 t.sleep(1)
                 attempts += 1
 
+            # If still running, ask user
             if applescript.is_arc_running():
-                print(c("Error: Arc is still running. Please close it manually and try again.", "red"))
-                sys.exit(1)
+                print(c("Arc is still running.", "yellow"))
+                print()
+                print("Options:")
+                print("  1. I'll close it myself")
+                print("  2. Cancel")
+                print()
+                try:
+                    response = input("Choose [1/2]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    sys.exit(0)
+
+                if response == "1":
+                    print("Please close Arc completely, then press Enter...")
+                    try:
+                        input()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        sys.exit(0)
+
+                    # Verify Arc is closed
+                    if applescript.is_arc_running():
+                        print(c("Error: Arc is still running.", "red"))
+                        sys.exit(1)
+                else:
+                    print("Cancelled.")
+                    sys.exit(0)
 
             print(c("✓ Arc is closed", "green"))
 
