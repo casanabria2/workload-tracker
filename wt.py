@@ -967,6 +967,17 @@ def cmd_arc(args):
 
             print(c("✓ Arc is closed", "green"))
 
+        # Clear any old Arc IDs before setup
+        if data.get("config", {}).get("arc_space_id"):
+            del data["config"]["arc_space_id"]
+        for role in data.get("roles", []):
+            if "arc_folder_id" in role:
+                del role["arc_folder_id"]
+        for task in data.get("tasks", []):
+            if "arc_folder_id" in task:
+                del task["arc_folder_id"]
+        save(data)
+
         manager = TaskTabManager(data)
 
         # Step 1: Create the space via JSON (requires Arc to be quit)
@@ -1003,26 +1014,39 @@ def cmd_arc(args):
         else:
             print(c(f"Created {created}/{len(role_labels)} role folders", "yellow"))
 
-        # Look up folder IDs from Arc's sidebar
-        t.sleep(1)
+        # Look up folder IDs from Arc's sidebar (with retry)
         print("Linking folder IDs...")
-        sidebar = ArcSidebarManager()
-        try:
-            arc_data = sidebar.load_sidebar()
-            container = arc_data['sidebar']['containers'][1]
-            items = container.get('items', [])
+        t.sleep(2)  # Give Arc time to write sidebar
 
-            for role in data.get("roles", []):
-                for item in items:
-                    if (isinstance(item, dict) and
-                        item.get("title") == role["label"] and
-                        "list" in item.get("data", {})):
-                        role["arc_folder_id"] = item["id"]
-                        print(c(f"  ✓ Linked: {role['label']}", "dim"))
-                        break
-            save(data)
-        except Exception as e:
-            print(c(f"  Warning: Could not link folder IDs: {e}", "yellow"))
+        sidebar = ArcSidebarManager()
+        linked_count = 0
+        for attempt in range(3):
+            try:
+                arc_data = sidebar.load_sidebar()
+                container = arc_data['sidebar']['containers'][1]
+                items = container.get('items', [])
+
+                for role in data.get("roles", []):
+                    if "arc_folder_id" in role:
+                        continue  # Already linked
+                    for item in items:
+                        if (isinstance(item, dict) and
+                            item.get("title") == role["label"] and
+                            "list" in item.get("data", {})):
+                            role["arc_folder_id"] = item["id"]
+                            print(c(f"  ✓ Linked: {role['label']}", "dim"))
+                            linked_count += 1
+                            break
+
+                if linked_count == len(role_labels):
+                    break
+                elif attempt < 2:
+                    t.sleep(1)
+            except Exception as e:
+                if attempt == 2:
+                    print(c(f"  Warning: Could not link folder IDs: {e}", "yellow"))
+
+        save(data)
 
         print()
         print(c("✓ Setup complete!", "green", "bold"))
