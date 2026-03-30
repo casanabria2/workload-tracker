@@ -402,6 +402,236 @@ class ArcAppleScript:
         )
         return result.returncode == 0, result.stdout.strip()
 
+    def switch_to_space(self, space_name: str) -> bool:
+        """Switch to a specific space by name.
+
+        Returns True if successful.
+        """
+        script = f'''
+        tell application "Arc"
+            activate
+        end tell
+
+        delay 0.5
+
+        tell application "System Events"
+            tell process "Arc"
+                click menu item "{space_name}" of menu "Spaces" of menu bar 1
+            end tell
+        end tell
+
+        delay 0.5
+        return "ok"
+        '''
+        success, output = self._run_applescript(script)
+        return success and "ok" in output
+
+    def create_folder(self, folder_name: str) -> bool:
+        """Create a folder in Arc using UI scripting.
+
+        Creates a folder in the currently focused space.
+        Returns True if successful.
+        """
+        # Escape any quotes in folder name
+        safe_name = folder_name.replace('"', '\\"')
+        script = f'''
+        tell application "Arc"
+            activate
+        end tell
+
+        delay 0.3
+
+        tell application "System Events"
+            tell process "Arc"
+                -- Use Tabs menu > New Folder
+                click menu item "New Folder…" of menu "Tabs" of menu bar 1
+                delay 0.8
+
+                -- Type the folder name
+                keystroke "{safe_name}"
+                delay 0.3
+
+                -- Press Enter to confirm
+                key code 36
+            end tell
+        end tell
+
+        delay 0.5
+        return "ok"
+        '''
+        success, output = self._run_applescript(script)
+        return success and "ok" in output
+
+    def create_folders_in_space(self, space_name: str, folder_names: list[str]) -> int:
+        """Switch to a space and create multiple folders.
+
+        Returns the number of folders successfully created.
+        """
+        if not self.switch_to_space(space_name):
+            return 0
+
+        created = 0
+        for name in folder_names:
+            if self.create_folder(name):
+                created += 1
+            time.sleep(0.3)  # Brief pause between folders
+
+        return created
+
+    def create_task_folder(self, task_title: str, role_label: str) -> bool:
+        """Create a task folder in the Workload Tracker space.
+
+        Creates folder with format: "[Role] Task Title"
+        Returns True if successful.
+        """
+        if not self.switch_to_space(WORKLOAD_TRACKER_SPACE_NAME):
+            return False
+
+        folder_name = f"[{role_label}] {task_title}"
+        return self.create_folder(folder_name)
+
+    def get_window_position(self) -> Optional[tuple[int, int]]:
+        """Get Arc window position using System Events.
+
+        Returns (x, y) coordinates or None if not found.
+        """
+        script = '''
+        tell application "System Events"
+            tell process "Arc"
+                set win to front window
+                set winPos to position of win
+                return ((item 1 of winPos) as integer) & "," & ((item 2 of winPos) as integer)
+            end tell
+        end tell
+        '''
+        success, output = self._run_applescript(script)
+        if success and output:
+            # Parse "x, ,, y" format that AppleScript sometimes produces
+            parts = [p.strip() for p in output.replace(" ", "").split(",") if p.strip()]
+            if len(parts) >= 2:
+                try:
+                    return (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
+        return None
+
+    def find_folder_coordinates(self, folder_title: str) -> Optional[tuple[int, int]]:
+        """Find the exact screen coordinates of a folder by searching the UI hierarchy.
+
+        Uses Accessibility API to search for the folder by its title text.
+
+        Args:
+            folder_title: Title of the folder to find
+
+        Returns (x, y) coordinates (center of element) or None if not found.
+        """
+        safe_title = folder_title.replace('"', '\\"')
+        script = f'''
+        tell application "Arc" to activate
+        delay 0.3
+
+        tell application "System Events"
+            tell process "Arc"
+                set frontmost to true
+
+                -- Search entire contents for the folder title
+                try
+                    set allElements to entire contents of front window
+                    repeat with elem in allElements
+                        try
+                            if (class of elem is static text) then
+                                set elemValue to value of elem
+                                if elemValue is "{safe_title}" then
+                                    set elemPos to position of elem
+                                    set elemSize to size of elem
+                                    -- Return position with element center offset
+                                    set centerX to (item 1 of elemPos) + 50
+                                    set centerY to (item 2 of elemPos) + ((item 2 of elemSize) / 2)
+                                    return (centerX as integer) & "," & (centerY as integer)
+                                end if
+                            end if
+                        end try
+                    end repeat
+                end try
+
+                return "not_found"
+            end tell
+        end tell
+        '''
+        success, output = self._run_applescript(script)
+        if success and output and output != "not_found":
+            parts = [p.strip() for p in output.split(",") if p.strip()]
+            if len(parts) >= 2:
+                try:
+                    return (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
+        return None
+
+    def create_nested_folder_by_name(self, folder_name: str, parent_folder_title: str) -> bool:
+        """Create a nested folder inside a parent folder identified by title.
+
+        Args:
+            folder_name: Name for the new nested folder
+            parent_folder_title: Title of the parent folder to nest under
+
+        Returns True if successful.
+        """
+        coords = self.find_folder_coordinates(parent_folder_title)
+        if not coords:
+            return False
+        return self.create_nested_folder(folder_name, coords[0], coords[1])
+
+    def create_nested_folder(self, folder_name: str, parent_folder_x: int, parent_folder_y: int) -> bool:
+        """Create a nested folder inside a parent folder using right-click context menu.
+
+        Uses Quartz for right-click and System Events for menu navigation.
+        Args:
+            folder_name: Name for the new nested folder
+            parent_folder_x: X coordinate of the parent folder in Arc sidebar
+            parent_folder_y: Y coordinate of the parent folder in Arc sidebar
+
+        Returns True if successful.
+        """
+        try:
+            from Quartz.CoreGraphics import (
+                CGEventCreateMouseEvent, CGEventPost, kCGEventRightMouseDown,
+                kCGEventRightMouseUp, kCGHIDEventTap
+            )
+        except ImportError:
+            raise ImportError("pyobjc-framework-Quartz required. Install with: pip install pyobjc-framework-Quartz")
+
+        # Ensure Arc is active
+        self._run_applescript('tell application "Arc" to activate')
+        time.sleep(0.3)
+
+        # Perform right-click at parent folder coordinates
+        event = CGEventCreateMouseEvent(None, kCGEventRightMouseDown, (parent_folder_x, parent_folder_y), 2)
+        CGEventPost(kCGHIDEventTap, event)
+        time.sleep(0.05)
+        event = CGEventCreateMouseEvent(None, kCGEventRightMouseUp, (parent_folder_x, parent_folder_y), 2)
+        CGEventPost(kCGHIDEventTap, event)
+        time.sleep(0.5)
+
+        # Navigate to "New Nested folder..." (2nd item) - need 2 down arrows since menu starts with no selection
+        # Then press Enter, type name, press Enter again
+        safe_name = folder_name.replace('"', '\\"')
+        script = f'''
+        tell application "System Events"
+            key code 125
+            delay 0.15
+            key code 125
+            delay 0.2
+            key code 36
+            delay 0.8
+            keystroke "{safe_name}"
+            delay 0.3
+            key code 36
+        end tell
+        '''
+        success, _ = self._run_applescript(script)
+        return success
+
     def is_arc_running(self) -> bool:
         """Check if Arc is running."""
         script = '''
@@ -732,35 +962,66 @@ class TaskTabManager:
         return None
 
     def on_task_created(self, task: dict, save_callback) -> dict:
-        """Create a folder for a new task.
+        """Create a nested folder for a new task under its role folder using UI scripting.
 
         Returns:
             Dict with creation results
         """
         results = {
-            "folder_id": None,
-            "restart_required": False,
+            "folder_created": False,
+            "nested": False,
             "error": None
         }
 
         if not self.is_arc_integration_enabled():
             return results
 
-        role_folder_id = self.get_role_folder_id(task.get("role_id", "other"))
-        if not role_folder_id:
-            results["error"] = f"No Arc folder for role {task.get('role_id')}"
-            return results
+        # Get role info for folder naming
+        role_label = "Other"
+        for role in self.data.get("roles", []):
+            if role["id"] == task.get("role_id", "other"):
+                role_label = role["label"]
+                break
 
         try:
-            folder_id = self.sidebar.create_task_folder(
-                task["id"],
-                task["title"],
-                role_folder_id
-            )
-            task["arc_folder_id"] = folder_id
-            results["folder_id"] = folder_id
-            results["restart_required"] = True
-            save_callback(self.data)
+            # First, switch to Workload Tracker space
+            if not self.applescript.switch_to_space(WORKLOAD_TRACKER_SPACE_NAME):
+                results["error"] = "Failed to switch to Workload Tracker space"
+                return results
+
+            time.sleep(0.3)
+
+            # Try to create nested folder under the role folder
+            if self.applescript.create_nested_folder_by_name(task["title"], role_label):
+                results["folder_created"] = True
+                results["nested"] = True
+
+                # Try to find and link the folder ID from Arc's data
+                time.sleep(0.5)
+                try:
+                    arc_data = self.sidebar.load_sidebar()
+                    container = arc_data['sidebar']['containers'][1]
+                    items = container.get('items', [])
+
+                    for item in items:
+                        if (isinstance(item, dict) and
+                            item.get("title") == task["title"] and
+                            "list" in item.get("data", {})):
+                            task["arc_folder_id"] = item["id"]
+                            break
+                except Exception:
+                    pass  # Non-fatal if we can't link ID
+
+                save_callback(self.data)
+            else:
+                # Fallback: create top-level folder with role prefix
+                folder_name = f"[{role_label}] {task['title']}"
+                if self.applescript.create_folder(folder_name):
+                    results["folder_created"] = True
+                    results["nested"] = False
+                    save_callback(self.data)
+                else:
+                    results["error"] = "Failed to create folder via UI"
         except Exception as e:
             results["error"] = str(e)
 

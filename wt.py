@@ -245,16 +245,14 @@ def cmd_add(args):
     print(c(f"✓ Added: {title}", "green") + f"  [{roles.get(role_id, role_id)}]  [{STATUS_LABELS.get(status, status)}]")
     print(c(f"  id: {task['id']}", "dim"))
 
-    # Arc integration: create task folder
+    # Arc integration: create task folder via UI scripting
     if data.get("config", {}).get("arc_space_id"):
         try:
-            from arc_browser import TaskTabManager, prompt_arc_restart
+            from arc_browser import TaskTabManager
             manager = TaskTabManager(data)
             result = manager.on_task_created(task, save)
-            if result.get("folder_id"):
+            if result.get("folder_created"):
                 print(c("  [Arc folder created]", "dim"))
-                if result.get("restart_required"):
-                    print(c("  Restart Arc to see the new folder.", "yellow"))
             elif result.get("error"):
                 print(c(f"  [Arc: {result['error']}]", "dim"))
         except ImportError:
@@ -943,7 +941,9 @@ def cmd_arc(args):
                 sys.exit(1)
 
         manager = TaskTabManager(data)
-        print("Setting up Workload Tracker space...")
+
+        # Step 1: Create the space via JSON (requires Arc to be quit)
+        print("Creating Workload Tracker space...")
         result = manager.setup_space_and_folders(save)
 
         if result.get("errors"):
@@ -952,16 +952,53 @@ def cmd_arc(args):
             sys.exit(1)
 
         print(c(f"✓ Created space: {result['space_id']}", "green"))
-        for role_id, folder_id in result.get("role_folders", {}).items():
-            print(c(f"  ✓ Role folder: {role_id}", "green"))
 
         # Enable tab cleanup by default
         data.setdefault("config", {})["tab_cleanup_enabled"] = True
         save(data)
         print(c("✓ Tab cleanup enabled", "green"))
 
-        if result.get("restart_required"):
-            prompt_arc_restart()
+        # Step 2: Launch Arc and create role folders via UI scripting
+        print()
+        print("Now launching Arc to create role folders via UI...")
+        print(c("(This works with Arc Sync)", "dim"))
+
+        applescript.launch_arc()
+        import time as t
+        t.sleep(2)
+
+        # Create role folders using UI scripting
+        role_labels = [r["label"] for r in data.get("roles", [])]
+        created = applescript.create_folders_in_space("Workload Tracker", role_labels)
+
+        if created == len(role_labels):
+            print(c(f"✓ Created {created} role folders", "green"))
+        else:
+            print(c(f"Created {created}/{len(role_labels)} role folders", "yellow"))
+
+        # Look up folder IDs from Arc's sidebar
+        t.sleep(1)
+        print("Linking folder IDs...")
+        sidebar = ArcSidebarManager()
+        try:
+            arc_data = sidebar.load_sidebar()
+            container = arc_data['sidebar']['containers'][1]
+            items = container.get('items', [])
+
+            for role in data.get("roles", []):
+                for item in items:
+                    if (isinstance(item, dict) and
+                        item.get("title") == role["label"] and
+                        "list" in item.get("data", {})):
+                        role["arc_folder_id"] = item["id"]
+                        print(c(f"  ✓ Linked: {role['label']}", "dim"))
+                        break
+            save(data)
+        except Exception as e:
+            print(c(f"  Warning: Could not link folder IDs: {e}", "yellow"))
+
+        print()
+        print(c("✓ Setup complete!", "green", "bold"))
 
     elif subcmd == "status":
         try:
