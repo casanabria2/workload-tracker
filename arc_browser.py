@@ -615,18 +615,23 @@ class ArcAppleScript:
         time.sleep(0.5)
 
         # Navigate to "New Nested folder..." (2nd item) - need 2 down arrows since menu starts with no selection
-        # Then press Enter, type name, press Enter again
+        # Then press Enter, wait for dialog, type name, press Enter again
         safe_name = folder_name.replace('"', '\\"')
         script = f'''
         tell application "System Events"
+            -- Navigate menu: 2 down arrows to select "New Nested folder..."
             key code 125
             delay 0.15
             key code 125
             delay 0.2
+            -- Press Enter to open the folder creation dialog
             key code 36
-            delay 0.8
+            -- Wait for dialog to appear and text field to be ready
+            delay 1.2
+            -- Type the folder name
             keystroke "{safe_name}"
-            delay 0.3
+            delay 0.5
+            -- Press Enter to confirm
             key code 36
         end tell
         '''
