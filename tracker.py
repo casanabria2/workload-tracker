@@ -33,6 +33,8 @@ from textual.widgets import (
 )
 from textual.reactive import reactive
 
+from idle_detector import get_idle_seconds
+
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
 
@@ -129,16 +131,16 @@ class TaskModal(ModalScreen):
 
     def __init__(self, task_data: Optional[dict] = None, roles: Optional[list] = None):
         super().__init__()
-        self._task = task_data
+        self._task_data = task_data
         self._roles = roles or []
 
     def compose(self) -> ComposeResult:
-        t = self._task or {}
+        t = self._task_data or {}
         role_options = [(r["label"], r["id"]) for r in self._roles]
         default_role = self._roles[0]["id"] if self._roles else "other"
         status_options = [(STATUS_LABELS[s], s) for s in STATUSES]
         with Container(id="modal-box"):
-            yield Label("Edit task" if self._task else "New task")
+            yield Label("Edit task" if self._task_data else "New task")
             yield Input(value=t.get("title", ""), placeholder="Task title...", id="inp-title")
             yield Input(value=t.get("description", ""), placeholder="Description (optional)", id="inp-desc")
             yield Select(role_options, value=t.get("role_id", default_role), id="sel-role", prompt="Select role")
@@ -173,13 +175,13 @@ class TaskModal(ModalScreen):
         role_id = self.query_one("#sel-role").value or "demokit"
         status = self.query_one("#sel-status").value or "todo"
         result = {
-            "id": self._task["id"] if self._task else uid(),
+            "id": self._task_data["id"] if self._task_data else uid(),
             "title": title,
             "description": desc,
             "role_id": role_id,
             "status": status,
-            "logs": self._task.get("logs", []) if self._task else [],
-            "created_at": self._task.get("created_at", time.time()) if self._task else time.time(),
+            "logs": self._task_data.get("logs", []) if self._task_data else [],
+            "created_at": self._task_data.get("created_at", time.time()) if self._task_data else time.time(),
         }
         self.dismiss(result)
 
@@ -243,6 +245,56 @@ class TabCleanupModal(ModalScreen):
     @on(Button.Pressed, "#btn-keep")
     def keep_all(self):
         self.dismiss([])
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Delete
+# ──────────────────────────────────────────────────────────
+
+class ConfirmDeleteModal(ModalScreen):
+    """Modal to confirm task deletion."""
+    CSS = """
+    ConfirmDeleteModal { align: center middle; }
+    #confirm-box {
+        width: 50;
+        height: auto;
+        background: $surface;
+        border: tall $error;
+        padding: 1 2;
+    }
+    #confirm-box Label { margin-bottom: 1; }
+    #confirm-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str):
+        super().__init__()
+        self._task_title = task_title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm-box"):
+            yield Label("[bold red]Delete Task?[/]")
+            yield Label(f"'{self._task_title}'")
+            yield Label("[dim]This cannot be undone.[/]")
+            with Horizontal(id="confirm-actions"):
+                yield Button("Delete  [y]", variant="error", id="btn-confirm")
+                yield Button("Cancel  [esc]", id="btn-cancel")
+
+    def on_mount(self):
+        self.query_one("#btn-cancel").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-confirm")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel")
+    def cancel(self):
+        self.dismiss(False)
 
 
 # ──────────────────────────────────────────────────────────
@@ -419,6 +471,15 @@ class WorkloadTracker(App):
 
     def _populate_table(self):
         table = self.query_one("#task-table", DataTable)
+
+        # Preserve cursor position by saving the selected row key
+        selected_key = None
+        try:
+            if table.cursor_row is not None and table.row_count > 0:
+                selected_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            pass
+
         table.clear()
         tasks = self._visible_tasks()
         role_map = get_role_map(self._data)
@@ -450,6 +511,16 @@ class WorkloadTracker(App):
                 task.get("description", ""),
                 key=task["id"],
             )
+
+        # Restore cursor position
+        if selected_key:
+            try:
+                for idx, row_key in enumerate(table.rows.keys()):
+                    if row_key.value == selected_key:
+                        table.cursor_coordinate = (idx, table.cursor_coordinate.column)
+                        break
+            except Exception:
+                pass
 
     def _visible_tasks(self) -> list:
         tasks = self._data.get("tasks", [])
@@ -537,9 +608,68 @@ class WorkloadTracker(App):
 
     def _tick(self):
         if self._data.get("active_timer"):
+            self._check_presence()
             self._refresh_sidebar()
             self._populate_table()
             self._refresh_overview()
+
+    # ── Presence Detection ────────────────────────────────
+
+    def _check_presence(self):
+        """Check if user is idle and auto-stop timer if threshold exceeded."""
+        config = self._data.get("config", {})
+        if not config.get("presence_detection_enabled", False):
+            return
+
+        timeout_minutes = config.get("idle_timeout_minutes", 15)
+        idle_seconds = get_idle_seconds()
+        idle_minutes = idle_seconds / 60
+
+        if idle_minutes >= timeout_minutes:
+            self._auto_stop_timer(idle_seconds)
+
+    def _auto_stop_timer(self, idle_seconds: float):
+        """Auto-stop timer due to inactivity."""
+        at = self._data.get("active_timer")
+        if not at:
+            return
+
+        task = next((t for t in self._data["tasks"] if t["id"] == at["task_id"]), None)
+        if not task:
+            self._data["active_timer"] = None
+            save_data(self._data)
+            return
+
+        # Calculate elapsed time
+        elapsed_seconds = time.time() - at["started_at"]
+        elapsed_minutes = elapsed_seconds / 60
+
+        # Optionally subtract idle time
+        config = self._data.get("config", {})
+        if config.get("subtract_idle_time", True):
+            logged_minutes = max(0, elapsed_minutes - (idle_seconds / 60))
+            note = f"Timer session (auto-stopped, {int(idle_seconds / 60)}m idle subtracted)"
+        else:
+            logged_minutes = elapsed_minutes
+            note = "Timer session (auto-stopped due to inactivity)"
+
+        # Log time if meaningful
+        if logged_minutes > 0.1:
+            task.setdefault("logs", []).append({
+                "id": uid(), "minutes": round(logged_minutes, 2),
+                "note": note, "at": time.time()
+            })
+
+        self._data["active_timer"] = None
+        save_data(self._data)
+
+        # Notify user
+        idle_mins = int(idle_seconds / 60)
+        self.notify(
+            f"Timer stopped: {idle_mins}m idle. Logged {fmt_mins(logged_minutes)} to '{task['title'][:20]}'",
+            severity="warning",
+            timeout=10
+        )
 
     # ── Actions ───────────────────────────────────────────
 
@@ -600,9 +730,20 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if not task:
             return
+        self.push_screen(
+            ConfirmDeleteModal(task["title"]),
+            lambda confirmed: self._on_delete_confirmed(task["id"], confirmed)
+        )
+
+    def _on_delete_confirmed(self, task_id: str, confirmed: bool):
+        if not confirmed:
+            return
+        task = next((t for t in self._data["tasks"] if t["id"] == task_id), None)
+        if not task:
+            return
         if self._is_running(task):
             self._data["active_timer"] = None
-        self._data["tasks"] = [t for t in self._data["tasks"] if t["id"] != task["id"]]
+        self._data["tasks"] = [t for t in self._data["tasks"] if t["id"] != task_id]
         save_data(self._data)
         self._populate_table()
         self._refresh_sidebar()

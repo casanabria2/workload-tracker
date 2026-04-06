@@ -13,6 +13,7 @@ Usage:
     wt status
     wt done <task-id or partial title>
     wt delete <task-id or partial title>
+    wt rename <task> <new title>       — Rename a task
 
     wt link <task> <github-issue>  — Link task to GitHub issue
     wt unlink <task>               — Unlink task from GitHub issue
@@ -23,6 +24,11 @@ Usage:
     wt config                    — Show all config
     wt config <key>              — Show config value
     wt config <key> <value>      — Set config value
+
+    wt presence                  — Show presence detection status
+    wt presence on               — Enable with default 15-minute timeout
+    wt presence off              — Disable presence detection
+    wt presence <minutes>        — Set timeout and enable
 
     wt roles                     — List all roles
     wt roles add <id> <label>    — Add a new role
@@ -439,6 +445,23 @@ def cmd_delete(args):
     print(c(f"✓ Deleted: {task['title']}", "yellow"))
 
 
+def cmd_rename(args):
+    if len(args) < 2:
+        print("Usage: wt rename <task-id or title> <new title>")
+        print("  Example: wt rename 'old name' 'new name'")
+        sys.exit(1)
+    data = load()
+    # First arg is task identifier, rest is new title
+    task_query = args[0]
+    new_title = " ".join(args[1:])
+    task = resolve_task(data, task_query)
+    old_title = task["title"]
+    task["title"] = new_title
+    save(data)
+    print(c(f"✓ Renamed: {old_title}", "dim"))
+    print(c(f"       → {new_title}", "green"))
+
+
 def cmd_status(args):
     data = load()
     tasks = data.get("tasks", [])
@@ -625,6 +648,11 @@ def cmd_config(args):
     data = load()
     config = data.setdefault("config", {})
 
+    # Keys that should be converted to specific types
+    BOOL_KEYS = {"presence_detection_enabled", "subtract_idle_time", "tab_cleanup_enabled"}
+    INT_KEYS = {"idle_timeout_minutes"}
+    FLOAT_KEYS = {"tab_confidence_threshold"}
+
     if not args:
         # Show all config
         if not config:
@@ -649,11 +677,80 @@ def cmd_config(args):
             print(value)
         return
 
-    # Set value
-    value = args[1]
+    # Set value with type conversion
+    raw_value = args[1]
+
+    if key_normalized in BOOL_KEYS:
+        value = raw_value.lower() in ("true", "1", "yes", "on")
+    elif key_normalized in INT_KEYS:
+        try:
+            value = int(raw_value)
+        except ValueError:
+            print(c(f"Error: {key} must be an integer.", "red"))
+            sys.exit(1)
+    elif key_normalized in FLOAT_KEYS:
+        try:
+            value = float(raw_value)
+        except ValueError:
+            print(c(f"Error: {key} must be a number.", "red"))
+            sys.exit(1)
+    else:
+        value = raw_value
+
     config[key_normalized] = value
     save(data)
     print(c(f"✓ Set {key}: {value}", "green"))
+
+
+def cmd_presence(args):
+    """Manage presence detection (auto-stop timer on idle)."""
+    data = load()
+    config = data.setdefault("config", {})
+
+    if not args:
+        # Show status
+        enabled = config.get("presence_detection_enabled", False)
+        timeout = config.get("idle_timeout_minutes", 15)
+        subtract = config.get("subtract_idle_time", True)
+
+        print(c("\n  Presence Detection\n", "bold"))
+        print(f"  Enabled:       {'Yes' if enabled else 'No'}")
+        print(f"  Timeout:       {timeout} minutes")
+        print(f"  Subtract idle: {'Yes' if subtract else 'No'}")
+        print()
+
+        if not enabled:
+            print(c("  Enable with: wt presence on", "dim"))
+        print()
+        return
+
+    arg = args[0].lower()
+
+    if arg == "on":
+        config["presence_detection_enabled"] = True
+        timeout = config.get("idle_timeout_minutes", 15)
+        save(data)
+        print(c(f"✓ Presence detection enabled ({timeout}m timeout)", "green"))
+
+    elif arg == "off":
+        config["presence_detection_enabled"] = False
+        save(data)
+        print(c("✓ Presence detection disabled", "yellow"))
+
+    elif arg.isdigit():
+        minutes = int(arg)
+        if minutes < 1:
+            print(c("Error: Timeout must be at least 1 minute.", "red"))
+            sys.exit(1)
+        config["presence_detection_enabled"] = True
+        config["idle_timeout_minutes"] = minutes
+        save(data)
+        print(c(f"✓ Presence detection enabled with {minutes}m timeout", "green"))
+
+    else:
+        print(c(f"Unknown argument: {arg}", "red"))
+        print("Usage: wt presence [on|off|<minutes>]")
+        sys.exit(1)
 
 
 def cmd_add_issue(args):
@@ -1270,11 +1367,14 @@ COMMANDS = {
     "delete": cmd_delete,
     "del": cmd_delete,
     "rm": cmd_delete,
+    "rename": cmd_rename,
+    "mv": cmd_rename,
     "status": cmd_status,
     "notes": cmd_notes,
     "link": cmd_link,
     "unlink": cmd_unlink,
     "config": cmd_config,
+    "presence": cmd_presence,
     "roles": cmd_roles,
     "arc": cmd_arc,
     "tabs": cmd_tabs,

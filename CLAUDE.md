@@ -25,7 +25,8 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, notes, link, unlink, done, delete, status, roles, arc, tabs.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, notes, link, unlink, done, delete, status, roles, arc, tabs, presence, config.
+- **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
@@ -48,6 +49,9 @@ Arc browser integration: Tasks can have associated Arc folders. When enabled, th
 - `config.arc_space_id` — UUID of Workload Tracker space
 - `config.tab_cleanup_enabled` — Enable tab classification on timer stop
 - `config.tab_confidence_threshold` — Confidence threshold for unrelated tab detection (default: 0.7)
+- `config.presence_detection_enabled` — Enable auto-stop timer on idle (default: false)
+- `config.idle_timeout_minutes` — Minutes of inactivity before auto-stop (default: 15)
+- `config.subtract_idle_time` — Subtract idle time from logged session (default: true)
 
 ### Domain Constants
 
@@ -75,6 +79,23 @@ Key classes in `arc_browser.py`:
 - `ArcAppleScript` — AppleScript commands for tab operations
 - `TabClassifier` — Claude API for classifying tab relevance to tasks
 - `TaskTabManager` — Orchestrates the workflow hooks
+
+### Presence Detection
+
+Auto-stops the timer when the user is idle (away from keyboard/mouse) for a configurable period. macOS only.
+
+```bash
+wt presence              # Show status
+wt presence on           # Enable with default 15-minute timeout
+wt presence off          # Disable
+wt presence 20           # Set timeout to 20 minutes and enable
+```
+
+Implementation:
+- `idle_detector.py` queries macOS `ioreg -c IOHIDSystem` for HIDIdleTime (nanoseconds since last input)
+- `tracker.py` checks idle time in the `_tick()` loop (runs every 1 second when timer active)
+- When idle exceeds threshold, timer auto-stops and logs time (optionally subtracting idle time)
+- User receives a Textual notification in the TUI
 
 ## Known Limitations
 
