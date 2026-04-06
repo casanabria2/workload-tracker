@@ -8,7 +8,7 @@ Keyboard shortcuts:
   e        — Edit selected task
   d        — Delete selected task
   t        — Toggle timer on selected task
-  l        — Log time manually on selected task
+  l        — Manage time logs (add/edit/delete/split/merge)
   s        — Cycle status of selected task
   1-4      — Filter by role (1=DemoKit, 2=Demos, 3=Strategic, 4=Other, 0=All)
   tab      — Switch between Task board / Overview panels
@@ -368,6 +368,484 @@ class LogTimeModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Edit Log Entry
+# ──────────────────────────────────────────────────────────
+
+class EditLogEntryModal(ModalScreen):
+    """Modal for editing a single log entry."""
+    CSS = """
+    EditLogEntryModal { align: center middle; }
+    #edit-log-box {
+        width: 56;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #edit-log-box Label { margin-bottom: 1; }
+    #edit-log-box Input { margin-bottom: 1; }
+    """
+
+    def __init__(self, log_entry: dict):
+        super().__init__()
+        self._log = log_entry
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit-log-box"):
+            yield Label("[bold]Edit Log Entry[/]")
+            yield Label(f"ID: {self._log.get('id', '?')[:15]}...")
+            yield Input(
+                value=str(self._log.get("minutes", 0)),
+                placeholder="Minutes",
+                id="inp-edit-mins",
+                type="number"
+            )
+            yield Input(
+                value=self._log.get("note", ""),
+                placeholder="Note",
+                id="inp-edit-note"
+            )
+            with Horizontal():
+                yield Button("Save  [s]", variant="primary", id="btn-save-log")
+                yield Button("Cancel  [esc]", id="btn-cancel-log")
+
+    def on_mount(self):
+        self.query_one("#inp-edit-mins").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "s" and not isinstance(self.focused, Input):
+            self._save()
+
+    @on(Button.Pressed, "#btn-save-log")
+    def save(self):
+        self._save()
+
+    @on(Button.Pressed, "#btn-cancel-log")
+    def cancel(self):
+        self.dismiss(None)
+
+    def _save(self):
+        try:
+            mins = float(self.query_one("#inp-edit-mins").value)
+        except ValueError:
+            self.query_one("#inp-edit-mins").focus()
+            return
+        if mins <= 0:
+            return
+        note = self.query_one("#inp-edit-note").value.strip()
+        self.dismiss({"minutes": mins, "note": note})
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Split Log Entry
+# ──────────────────────────────────────────────────────────
+
+class SplitLogModal(ModalScreen):
+    """Modal for splitting a log entry."""
+    CSS = """
+    SplitLogModal { align: center middle; }
+    #split-box {
+        width: 56;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #split-box Label { margin-bottom: 1; }
+    #split-box Input { margin-bottom: 1; }
+    """
+
+    def __init__(self, log_entry: dict):
+        super().__init__()
+        self._log = log_entry
+
+    def compose(self) -> ComposeResult:
+        total = self._log.get("minutes", 0)
+        with Container(id="split-box"):
+            yield Label("[bold]Split Log Entry[/]")
+            yield Label(f"Total: {fmt_mins(total)}")
+            yield Label("Split at minute:")
+            yield Input(
+                placeholder=f"1-{int(total)-1}",
+                id="inp-split-at",
+                type="number"
+            )
+            yield Label("[dim]Creates two entries: first part + remainder[/]")
+            with Horizontal():
+                yield Button("Split  [s]", variant="primary", id="btn-split")
+                yield Button("Cancel  [esc]", id="btn-cancel-split")
+
+    def on_mount(self):
+        self.query_one("#inp-split-at").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "s" and not isinstance(self.focused, Input):
+            self._split()
+
+    @on(Button.Pressed, "#btn-split")
+    def split(self):
+        self._split()
+
+    @on(Button.Pressed, "#btn-cancel-split")
+    def cancel(self):
+        self.dismiss(None)
+
+    def _split(self):
+        try:
+            split_at = float(self.query_one("#inp-split-at").value)
+        except ValueError:
+            self.query_one("#inp-split-at").focus()
+            return
+        total = self._log.get("minutes", 0)
+        if split_at <= 0 or split_at >= total:
+            return
+        self.dismiss(split_at)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Delete Log
+# ──────────────────────────────────────────────────────────
+
+class ConfirmDeleteLogModal(ModalScreen):
+    """Modal to confirm log deletion."""
+    CSS = """
+    ConfirmDeleteLogModal { align: center middle; }
+    #confirm-log-box {
+        width: 50;
+        height: auto;
+        background: $surface;
+        border: tall $error;
+        padding: 1 2;
+    }
+    #confirm-log-box Label { margin-bottom: 1; }
+    """
+
+    def __init__(self, log_entry: dict):
+        super().__init__()
+        self._log = log_entry
+
+    def compose(self) -> ComposeResult:
+        mins = self._log.get("minutes", 0)
+        note = self._log.get("note", "—")
+        with Container(id="confirm-log-box"):
+            yield Label("[bold red]Delete Log Entry?[/]")
+            yield Label(f"{fmt_mins(mins)} — {note[:30]}")
+            yield Label("[dim]This cannot be undone.[/]")
+            with Horizontal():
+                yield Button("Delete  [y]", variant="error", id="btn-confirm-del")
+                yield Button("Cancel  [esc]", id="btn-cancel-del")
+
+    def on_mount(self):
+        self.query_one("#btn-cancel-del").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-confirm-del")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-del")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Edit Logs (Full Management)
+# ──────────────────────────────────────────────────────────
+
+class EditLogsModal(ModalScreen):
+    """Full log management modal with add, edit, delete, split, merge."""
+    CSS = """
+    EditLogsModal { align: center middle; }
+    #logs-modal-box {
+        width: 80;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #logs-modal-box Label { margin-bottom: 1; }
+    #logs-table { height: 20; margin-bottom: 1; }
+    #logs-actions { margin-bottom: 1; }
+    #logs-help { color: $text-muted; }
+    .add-section { margin-bottom: 1; }
+    .add-section Input { width: 20; margin-right: 1; }
+    """
+
+    def __init__(self, task_dict: dict, data: dict, save_callback):
+        super().__init__()
+        self._task_dict = task_dict
+        self._data = data
+        self._save = save_callback
+        self._selected_log_ids: set = set()
+
+    def compose(self) -> ComposeResult:
+        total = sum(l.get("minutes", 0) for l in self._task_dict.get("logs", []))
+        with Container(id="logs-modal-box"):
+            yield Label(f"[bold]Time Logs — {self._task_dict['title']}[/]")
+            yield Label(f"Total: {fmt_mins(total)}")
+            yield DataTable(id="logs-table", cursor_type="row", zebra_stripes=True)
+            with Horizontal(classes="add-section"):
+                yield Input(placeholder="Minutes", id="inp-add-mins", type="number")
+                yield Input(placeholder="Note (optional)", id="inp-add-note")
+                yield Button("Add  [a]", variant="primary", id="btn-add-log")
+            with Horizontal(id="logs-actions"):
+                yield Button("Edit  [e]", id="btn-edit")
+                yield Button("Delete  [d]", variant="error", id="btn-delete")
+                yield Button("Split  [s]", id="btn-split-log")
+                yield Button("Merge  [m]", id="btn-merge")
+                yield Button("Close  [esc]", id="btn-close-logs")
+            yield Label("[dim]Keys: \\[a]dd \\[e]dit \\[d]elete \\[s]plit \\[m]erge with next row[/]", id="logs-help")
+
+    def on_mount(self):
+        self._build_table()
+        table = self.query_one("#logs-table", DataTable)
+        table.focus()
+
+    def _build_table(self):
+        table = self.query_one("#logs-table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("ID", "Duration", "Note", "Time Range", "Date")
+        logs = self._task_dict.get("logs", [])
+        for log in logs:
+            log_id = log.get("id", "?")[:11]
+            mins = fmt_mins(log.get("minutes", 0))
+            note = log.get("note", "—")[:25]
+            started = log.get("started_at")
+            ended = log.get("ended_at")
+            at = log.get("at", 0)
+
+            if started and ended:
+                start_str = datetime.fromtimestamp(started).strftime("%H:%M")
+                end_str = datetime.fromtimestamp(ended).strftime("%H:%M")
+                time_range = f"{start_str}-{end_str}"
+            else:
+                time_range = "—"
+
+            date_str = datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M") if at else "—"
+            table.add_row(log_id, mins, note, time_range, date_str, key=log.get("id"))
+
+    def _get_selected_log(self) -> Optional[dict]:
+        table = self.query_one("#logs-table", DataTable)
+        if table.cursor_row is None or table.row_count == 0:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+            return next((l for l in self._task_dict.get("logs", []) if l.get("id") == key), None)
+        except Exception:
+            return None
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(True)  # True indicates logs may have changed
+        elif event.key == "a":
+            self._add_log()
+        elif event.key == "e":
+            self._edit_log()
+        elif event.key == "d":
+            self._delete_log()
+        elif event.key == "s":
+            self._split_log()
+        elif event.key == "m":
+            self._start_merge()
+
+    @on(Button.Pressed, "#btn-add-log")
+    def add_btn(self):
+        self._add_log()
+
+    @on(Button.Pressed, "#btn-edit")
+    def edit_btn(self):
+        self._edit_log()
+
+    @on(Button.Pressed, "#btn-delete")
+    def delete_btn(self):
+        self._delete_log()
+
+    @on(Button.Pressed, "#btn-split-log")
+    def split_btn(self):
+        self._split_log()
+
+    @on(Button.Pressed, "#btn-merge")
+    def merge_btn(self):
+        self._start_merge()
+
+    @on(Button.Pressed, "#btn-close-logs")
+    def close_btn(self):
+        self.dismiss(True)
+
+    def _add_log(self):
+        try:
+            mins = float(self.query_one("#inp-add-mins").value)
+        except ValueError:
+            self.query_one("#inp-add-mins").focus()
+            return
+        if mins <= 0:
+            return
+        note = self.query_one("#inp-add-note").value.strip() or "Manual entry"
+        log = {"id": uid(), "minutes": mins, "note": note, "at": time.time()}
+        self._task_dict.setdefault("logs", []).append(log)
+        self._save(self._data)
+        self._build_table()
+        self._update_total()
+        self.query_one("#inp-add-mins").value = ""
+        self.query_one("#inp-add-note").value = ""
+
+    def _update_total(self):
+        total = sum(l.get("minutes", 0) for l in self._task_dict.get("logs", []))
+        # Update the total label - it's the second Label in the container
+        labels = self.query("Label")
+        if len(labels) > 1:
+            labels[1].update(f"Total: {fmt_mins(total)}")
+
+    def _edit_log(self):
+        log = self._get_selected_log()
+        if not log:
+            return
+        self.app.push_screen(
+            EditLogEntryModal(log),
+            lambda result: self._on_edit_done(log, result)
+        )
+
+    def _on_edit_done(self, log: dict, result: Optional[dict]):
+        if not result:
+            return
+        log["minutes"] = result["minutes"]
+        log["note"] = result["note"]
+        self._save(self._data)
+        self._build_table()
+        self._update_total()
+
+    def _delete_log(self):
+        log = self._get_selected_log()
+        if not log:
+            return
+        self.app.push_screen(
+            ConfirmDeleteLogModal(log),
+            lambda confirmed: self._on_delete_done(log, confirmed)
+        )
+
+    def _on_delete_done(self, log: dict, confirmed: bool):
+        if not confirmed:
+            return
+        self._task_dict["logs"] = [l for l in self._task_dict.get("logs", []) if l.get("id") != log.get("id")]
+        self._save(self._data)
+        self._build_table()
+        self._update_total()
+
+    def _split_log(self):
+        log = self._get_selected_log()
+        if not log:
+            return
+        if log.get("minutes", 0) < 2:
+            return  # Can't split less than 2 minutes
+        self.app.push_screen(
+            SplitLogModal(log),
+            lambda split_at: self._on_split_done(log, split_at)
+        )
+
+    def _on_split_done(self, log: dict, split_at: Optional[float]):
+        if not split_at:
+            return
+
+        total_mins = log.get("minutes", 0)
+        first_mins = split_at
+        second_mins = total_mins - split_at
+        note = log.get("note", "")
+        started = log.get("started_at")
+        ended = log.get("ended_at")
+
+        # Calculate proportional timestamps if available
+        if started and ended:
+            duration = ended - started
+            ratio = first_mins / total_mins
+            mid_time = started + (duration * ratio)
+
+            first_log = {
+                "id": uid(), "minutes": round(first_mins, 2),
+                "note": f"{note} (1/2)", "at": mid_time,
+                "started_at": started, "ended_at": mid_time
+            }
+            second_log = {
+                "id": uid(), "minutes": round(second_mins, 2),
+                "note": f"{note} (2/2)", "at": ended,
+                "started_at": mid_time, "ended_at": ended
+            }
+        else:
+            at = log.get("at", time.time())
+            first_log = {
+                "id": uid(), "minutes": round(first_mins, 2),
+                "note": f"{note} (1/2)", "at": at
+            }
+            second_log = {
+                "id": uid(), "minutes": round(second_mins, 2),
+                "note": f"{note} (2/2)", "at": at
+            }
+
+        # Replace original with two new entries
+        logs = self._task_dict.get("logs", [])
+        log_idx = next((i for i, l in enumerate(logs) if l.get("id") == log.get("id")), None)
+        if log_idx is not None:
+            logs[log_idx:log_idx+1] = [first_log, second_log]
+            self._save(self._data)
+            self._build_table()
+
+    def _start_merge(self):
+        """Merge requires selecting two rows. We'll use the current + next row."""
+        table = self.query_one("#logs-table", DataTable)
+        if table.row_count < 2:
+            return
+
+        logs = self._task_dict.get("logs", [])
+        if table.cursor_row is None or table.cursor_row >= len(logs) - 1:
+            return
+
+        log1 = logs[table.cursor_row]
+        log2 = logs[table.cursor_row + 1]
+
+        # Combine
+        combined_mins = log1.get("minutes", 0) + log2.get("minutes", 0)
+        note1 = log1.get("note", "")
+        note2 = log2.get("note", "")
+        combined_note = f"Merged: {note1} + {note2}"
+
+        # Use earliest start and latest end
+        started1 = log1.get("started_at")
+        started2 = log2.get("started_at")
+        ended1 = log1.get("ended_at")
+        ended2 = log2.get("ended_at")
+
+        merged_log = {
+            "id": uid(),
+            "minutes": round(combined_mins, 2),
+            "note": combined_note,
+            "at": max(log1.get("at", 0), log2.get("at", 0))
+        }
+
+        if started1 and started2:
+            merged_log["started_at"] = min(started1, started2)
+        if ended1 and ended2:
+            merged_log["ended_at"] = max(ended1, ended2)
+
+        # Remove old logs and insert merged at same position
+        log_idx = table.cursor_row
+        self._task_dict["logs"] = [l for l in logs if l.get("id") not in (log1.get("id"), log2.get("id"))]
+        self._task_dict["logs"].insert(log_idx, merged_log)
+
+        self._save(self._data)
+        self._build_table()
+        self._update_total()
+
+
+# ──────────────────────────────────────────────────────────
 # Main App
 # ──────────────────────────────────────────────────────────
 
@@ -411,7 +889,7 @@ class WorkloadTracker(App):
         Binding("e",   "edit_task",   "Edit"),
         Binding("d",   "delete_task", "Delete"),
         Binding("t",   "toggle_timer","Timer"),
-        Binding("l",   "log_time",    "Log time"),
+        Binding("l",   "log_time",    "Manage logs"),
         Binding("s",   "cycle_status","Cycle status"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
@@ -641,7 +1119,9 @@ class WorkloadTracker(App):
             return
 
         # Calculate elapsed time
-        elapsed_seconds = time.time() - at["started_at"]
+        started_at = at["started_at"]
+        ended_at = time.time()
+        elapsed_seconds = ended_at - started_at
         elapsed_minutes = elapsed_seconds / 60
 
         # Optionally subtract idle time
@@ -657,7 +1137,8 @@ class WorkloadTracker(App):
         if logged_minutes > 0.1:
             task.setdefault("logs", []).append({
                 "id": uid(), "minutes": round(logged_minutes, 2),
-                "note": note, "at": time.time()
+                "note": note, "at": ended_at,
+                "started_at": started_at, "ended_at": ended_at
             })
 
         self._data["active_timer"] = None
@@ -756,11 +1237,14 @@ class WorkloadTracker(App):
         at = self._data.get("active_timer")
         if at and at.get("task_id") == task["id"]:
             # Stop timer — commit minutes
-            elapsed = (time.time() - at["started_at"]) / 60
+            started_at = at["started_at"]
+            ended_at = time.time()
+            elapsed = (ended_at - started_at) / 60
             if elapsed > 0.1:
                 task.setdefault("logs", []).append({
                     "id": uid(), "minutes": round(elapsed, 2),
-                    "note": "Timer session", "at": time.time()
+                    "note": "Timer session", "at": ended_at,
+                    "started_at": started_at, "ended_at": ended_at
                 })
             self._data["active_timer"] = None
             save_data(self._data)
@@ -773,11 +1257,14 @@ class WorkloadTracker(App):
             if at:
                 prev = next((t for t in self._data["tasks"] if t["id"] == at["task_id"]), None)
                 if prev:
-                    elapsed = (time.time() - at["started_at"]) / 60
+                    started_at = at["started_at"]
+                    ended_at = time.time()
+                    elapsed = (ended_at - started_at) / 60
                     if elapsed > 0.1:
                         prev.setdefault("logs", []).append({
                             "id": uid(), "minutes": round(elapsed, 2),
-                            "note": "Timer session", "at": time.time()
+                            "note": "Timer session", "at": ended_at,
+                            "started_at": started_at, "ended_at": ended_at
                         })
                     stopped_task = prev
             self._data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
@@ -842,18 +1329,16 @@ class WorkloadTracker(App):
             time.sleep(0.1)
 
     def action_log_time(self):
-        task = self._selected_task()
-        if not task:
+        selected = self._selected_task()
+        if not selected:
             return
-        self.push_screen(LogTimeModal(task_data=task), lambda log: self._on_log_saved(task["id"], log))
+        self.push_screen(
+            EditLogsModal(task_dict=selected, data=self._data, save_callback=save_data),
+            lambda changed: self._on_logs_modal_closed(changed)
+        )
 
-    def _on_log_saved(self, task_id: str, log: Optional[dict]):
-        if not log:
-            return
-        task = next((t for t in self._data["tasks"] if t["id"] == task_id), None)
-        if task:
-            task.setdefault("logs", []).append(log)
-            save_data(self._data)
+    def _on_logs_modal_closed(self, changed: bool):
+        if changed:
             self._populate_table()
             self._refresh_sidebar()
             self._refresh_overview()

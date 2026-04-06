@@ -117,11 +117,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # Stop running timer
                 task = next((t for t in tasks if t["id"] == at["task_id"]), None)
                 if task:
-                    elapsed = (time.time() - at["started_at"]) / 60
+                    started_at = at["started_at"]
+                    ended_at = time.time()
+                    elapsed = (ended_at - started_at) / 60
                     if elapsed > 0.05:
                         task.setdefault("logs", []).append({
                             "id": uid(), "minutes": round(elapsed, 2),
-                            "note": "Stream Deck session", "at": time.time()
+                            "note": "Stream Deck session", "at": ended_at,
+                            "started_at": started_at, "ended_at": ended_at
                         })
                 data["active_timer"] = None
                 save_data(data)

@@ -15,6 +15,12 @@ Usage:
     wt delete <task-id or partial title>
     wt rename <task> <new title>       — Rename a task
 
+    wt logs <task>                              — List all time logs for a task
+    wt edit-log <task> <log-id> [--minutes M] [--note N]  — Edit log entry
+    wt delete-log <task> <log-id>               — Delete log entry
+    wt split-log <task> <log-id> <minutes>      — Split log at minute mark
+    wt merge-logs <task> <log-id-1> <log-id-2>  — Merge two log entries
+
     wt link <task> <github-issue>  — Link task to GitHub issue
     wt unlink <task>               — Unlink task from GitHub issue
 
@@ -326,11 +332,14 @@ def cmd_start(args):
     if at:
         prev = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
         if prev:
-            elapsed = (time.time() - at["started_at"]) / 60
+            started_at = at["started_at"]
+            ended_at = time.time()
+            elapsed = (ended_at - started_at) / 60
             if elapsed > 0.05:
                 prev.setdefault("logs", []).append({
                     "id": uid(), "minutes": round(elapsed, 2),
-                    "note": "Timer session", "at": time.time()
+                    "note": "Timer session", "at": ended_at,
+                    "started_at": started_at, "ended_at": ended_at
                 })
         print(c(f"⏹  Stopped: {prev['title'] if prev else '?'}", "yellow"))
 
@@ -356,11 +365,14 @@ def cmd_stop(args):
     if not at:
         print(c("No active timer.", "dim")); return
     task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
-    elapsed = (time.time() - at["started_at"]) / 60
+    started_at = at["started_at"]
+    ended_at = time.time()
+    elapsed = (ended_at - started_at) / 60
     if task and elapsed > 0.05:
         task.setdefault("logs", []).append({
             "id": uid(), "minutes": round(elapsed, 2),
-            "note": "Timer session", "at": time.time()
+            "note": "Timer session", "at": ended_at,
+            "started_at": started_at, "ended_at": ended_at
         })
     data["active_timer"] = None
     save(data)
@@ -406,6 +418,286 @@ def cmd_log(args):
     })
     save(data)
     print(c(f"✓ Logged {fmt_mins(mins)} to '{task['title']}'  ({note})", "green"))
+
+
+def cmd_logs(args):
+    """List all time logs for a task."""
+    if not args:
+        print("Usage: wt logs <task-id or title>"); sys.exit(1)
+    data = load()
+    task = resolve_task(data, " ".join(args))
+    logs = task.get("logs", [])
+
+    if not logs:
+        print(c(f"No time logs for '{task['title']}'", "dim"))
+        return
+
+    total_mins = sum(l.get("minutes", 0) for l in logs)
+    print(c(f"\n  Time logs for: {task['title']}", "bold"))
+    print(c(f"  Total: {fmt_mins(total_mins)}\n", "dim"))
+
+    for log in logs:
+        log_id = log.get("id", "?")[:11]
+        mins = log.get("minutes", 0)
+        note = log.get("note", "—")[:30]
+        at = log.get("at", 0)
+        started = log.get("started_at")
+        ended = log.get("ended_at")
+
+        # Format time range if available
+        if started and ended:
+            start_str = datetime.fromtimestamp(started).strftime("%H:%M")
+            end_str = datetime.fromtimestamp(ended).strftime("%H:%M")
+            time_range = f"[{start_str}-{end_str}]"
+        else:
+            time_range = ""
+
+        at_str = datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M") if at else ""
+
+        print(f"  {log_id}...  {fmt_mins(mins):>7}  {note:<30}  {time_range:>13}  {at_str}")
+    print()
+
+
+def cmd_edit_log(args):
+    """Edit a log entry's minutes or note."""
+    if len(args) < 2:
+        print("Usage: wt edit-log <task> <log-id> [--minutes M] [--note N]")
+        print("  Example: wt edit-log 'My task' 20260403085 --minutes 45")
+        sys.exit(1)
+
+    data = load()
+
+    # Parse arguments - find log-id and flags
+    task_parts = []
+    log_id_prefix = None
+    new_minutes = None
+    new_note = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--minutes" and i + 1 < len(args):
+            try:
+                new_minutes = float(args[i + 1])
+            except ValueError:
+                print(c("Error: minutes must be a number", "red")); sys.exit(1)
+            i += 2
+        elif args[i] == "--note" and i + 1 < len(args):
+            new_note = args[i + 1]
+            i += 2
+        elif log_id_prefix is None and len(args[i]) >= 8 and args[i][:8].isdigit():
+            # Looks like a log ID (starts with timestamp)
+            log_id_prefix = args[i]
+            i += 1
+        else:
+            task_parts.append(args[i])
+            i += 1
+
+    if not task_parts:
+        print(c("Error: task identifier required", "red")); sys.exit(1)
+    if not log_id_prefix:
+        print(c("Error: log ID required", "red")); sys.exit(1)
+    if new_minutes is None and new_note is None:
+        print(c("Error: specify --minutes and/or --note", "red")); sys.exit(1)
+
+    task = resolve_task(data, " ".join(task_parts))
+    logs = task.get("logs", [])
+
+    # Find log by ID prefix
+    log = next((l for l in logs if l.get("id", "").startswith(log_id_prefix)), None)
+    if not log:
+        print(c(f"No log found with ID starting with '{log_id_prefix}'", "red"))
+        sys.exit(1)
+
+    # Apply changes
+    old_mins = log.get("minutes", 0)
+    old_note = log.get("note", "")
+
+    if new_minutes is not None:
+        log["minutes"] = new_minutes
+    if new_note is not None:
+        log["note"] = new_note
+
+    save(data)
+
+    if new_minutes is not None and new_note is not None:
+        print(c(f"✓ Updated log: {fmt_mins(old_mins)} → {fmt_mins(new_minutes)}, note → '{new_note}'", "green"))
+    elif new_minutes is not None:
+        print(c(f"✓ Updated log: {fmt_mins(old_mins)} → {fmt_mins(new_minutes)}", "green"))
+    else:
+        print(c(f"✓ Updated log note: '{old_note}' → '{new_note}'", "green"))
+
+
+def cmd_delete_log(args):
+    """Delete a log entry."""
+    if len(args) < 2:
+        print("Usage: wt delete-log <task> <log-id>")
+        sys.exit(1)
+
+    data = load()
+
+    # Last arg is log ID, rest is task query
+    log_id_prefix = args[-1]
+    task = resolve_task(data, " ".join(args[:-1]))
+    logs = task.get("logs", [])
+
+    # Find log by ID prefix
+    log = next((l for l in logs if l.get("id", "").startswith(log_id_prefix)), None)
+    if not log:
+        print(c(f"No log found with ID starting with '{log_id_prefix}'", "red"))
+        sys.exit(1)
+
+    # Confirm deletion
+    mins = log.get("minutes", 0)
+    note = log.get("note", "—")
+    print(f"Delete log entry: {fmt_mins(mins)} — {note}")
+    try:
+        response = input("Confirm delete? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    if response not in ("y", "yes"):
+        print("Cancelled.")
+        sys.exit(0)
+
+    task["logs"] = [l for l in logs if l.get("id") != log.get("id")]
+    save(data)
+    print(c(f"✓ Deleted log entry ({fmt_mins(mins)})", "yellow"))
+
+
+def cmd_split_log(args):
+    """Split a log entry at a specified minute mark."""
+    if len(args) < 3:
+        print("Usage: wt split-log <task> <log-id> <minutes>")
+        print("  Example: wt split-log 'My task' 20260403085 25")
+        print("  Splits a 60min log at 25min into two entries: 25min + 35min")
+        sys.exit(1)
+
+    data = load()
+
+    # Parse: last arg is split point, second-to-last is log ID, rest is task
+    try:
+        split_at = float(args[-1])
+    except ValueError:
+        print(c("Error: split point must be a number", "red")); sys.exit(1)
+
+    log_id_prefix = args[-2]
+    task = resolve_task(data, " ".join(args[:-2]))
+    logs = task.get("logs", [])
+
+    # Find log by ID prefix
+    log_idx = next((i for i, l in enumerate(logs) if l.get("id", "").startswith(log_id_prefix)), None)
+    if log_idx is None:
+        print(c(f"No log found with ID starting with '{log_id_prefix}'", "red"))
+        sys.exit(1)
+
+    log = logs[log_idx]
+    total_mins = log.get("minutes", 0)
+
+    if split_at <= 0 or split_at >= total_mins:
+        print(c(f"Error: split point must be between 0 and {total_mins}", "red"))
+        sys.exit(1)
+
+    # Calculate split
+    first_mins = split_at
+    second_mins = total_mins - split_at
+    note = log.get("note", "")
+    started = log.get("started_at")
+    ended = log.get("ended_at")
+
+    # Calculate proportional timestamps if available
+    if started and ended:
+        duration = ended - started
+        ratio = first_mins / total_mins
+        mid_time = started + (duration * ratio)
+
+        first_log = {
+            "id": uid(), "minutes": round(first_mins, 2),
+            "note": f"{note} (1/2)", "at": mid_time,
+            "started_at": started, "ended_at": mid_time
+        }
+        second_log = {
+            "id": uid(), "minutes": round(second_mins, 2),
+            "note": f"{note} (2/2)", "at": ended,
+            "started_at": mid_time, "ended_at": ended
+        }
+    else:
+        at = log.get("at", time.time())
+        first_log = {
+            "id": uid(), "minutes": round(first_mins, 2),
+            "note": f"{note} (1/2)", "at": at
+        }
+        second_log = {
+            "id": uid(), "minutes": round(second_mins, 2),
+            "note": f"{note} (2/2)", "at": at
+        }
+
+    # Replace original with two new entries
+    logs[log_idx:log_idx+1] = [first_log, second_log]
+    save(data)
+
+    print(c(f"✓ Split {fmt_mins(total_mins)} into {fmt_mins(first_mins)} + {fmt_mins(second_mins)}", "green"))
+
+
+def cmd_merge_logs(args):
+    """Merge two log entries into one."""
+    if len(args) < 3:
+        print("Usage: wt merge-logs <task> <log-id-1> <log-id-2>")
+        sys.exit(1)
+
+    data = load()
+
+    # Parse: last two args are log IDs, rest is task
+    log_id_1 = args[-2]
+    log_id_2 = args[-1]
+    task = resolve_task(data, " ".join(args[:-2]))
+    logs = task.get("logs", [])
+
+    # Find logs by ID prefix
+    log1 = next((l for l in logs if l.get("id", "").startswith(log_id_1)), None)
+    log2 = next((l for l in logs if l.get("id", "").startswith(log_id_2)), None)
+
+    if not log1:
+        print(c(f"No log found with ID starting with '{log_id_1}'", "red")); sys.exit(1)
+    if not log2:
+        print(c(f"No log found with ID starting with '{log_id_2}'", "red")); sys.exit(1)
+    if log1.get("id") == log2.get("id"):
+        print(c("Error: cannot merge a log with itself", "red")); sys.exit(1)
+
+    # Combine
+    combined_mins = log1.get("minutes", 0) + log2.get("minutes", 0)
+    note1 = log1.get("note", "")
+    note2 = log2.get("note", "")
+    combined_note = f"Merged: {note1} + {note2}"
+
+    # Use earliest start and latest end
+    started1 = log1.get("started_at")
+    started2 = log2.get("started_at")
+    ended1 = log1.get("ended_at")
+    ended2 = log2.get("ended_at")
+
+    merged_log = {
+        "id": uid(),
+        "minutes": round(combined_mins, 2),
+        "note": combined_note,
+        "at": max(log1.get("at", 0), log2.get("at", 0))
+    }
+
+    # Add timestamps if both logs have them
+    if started1 and started2:
+        merged_log["started_at"] = min(started1, started2)
+    if ended1 and ended2:
+        merged_log["ended_at"] = max(ended1, ended2)
+
+    # Remove old logs and add merged
+    task["logs"] = [l for l in logs if l.get("id") not in (log1.get("id"), log2.get("id"))]
+    task["logs"].append(merged_log)
+
+    # Sort by 'at' timestamp
+    task["logs"].sort(key=lambda x: x.get("at", 0))
+
+    save(data)
+    print(c(f"✓ Merged {fmt_mins(log1.get('minutes', 0))} + {fmt_mins(log2.get('minutes', 0))} = {fmt_mins(combined_mins)}", "green"))
 
 
 def cmd_done(args):
@@ -1363,6 +1655,11 @@ COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
     "log": cmd_log,
+    "logs": cmd_logs,
+    "edit-log": cmd_edit_log,
+    "delete-log": cmd_delete_log,
+    "split-log": cmd_split_log,
+    "merge-logs": cmd_merge_logs,
     "done": cmd_done,
     "delete": cmd_delete,
     "del": cmd_delete,

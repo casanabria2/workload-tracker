@@ -25,10 +25,10 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, notes, link, unlink, done, delete, status, roles, arc, tabs, presence, config.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, status, roles, arc, tabs, presence, config.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 
 ### Data Model
@@ -38,7 +38,23 @@ Plain JSON with three top-level keys:
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color. Roles are user-configurable via `wt roles` commands.
 
-Time tracking: `logs[]` array of `{id, minutes, note, at}` entries. Timer sessions auto-commit as log entries when stopped.
+Time tracking: `logs[]` array of log entries. Timer sessions auto-commit as log entries when stopped.
+
+Log entry structure:
+```json
+{
+  "id": "20260403085012abcd",
+  "minutes": 45.5,
+  "note": "Timer session",
+  "at": 1712181070,
+  "started_at": 1712177400,  // optional: when work started
+  "ended_at": 1712181060     // optional: when work ended
+}
+```
+
+- `minutes` is the source of truth (allows manual adjustment)
+- `started_at`/`ended_at` are automatically captured for timer sessions
+- Existing logs without timestamps remain valid (backward compatible)
 
 GitHub integration: Tasks can be linked to GitHub issues via `wt link <task> owner/repo#123`. When linked, `wt notes` opens the issue in browser instead of local notes file. The `github_issue` field stores the reference (e.g., `owner/repo#123`).
 
@@ -80,6 +96,26 @@ Key classes in `arc_browser.py`:
 - `TabClassifier` — Claude API for classifying tab relevance to tasks
 - `TaskTabManager` — Orchestrates the workflow hooks
 
+### Time Log Management
+
+Full log editing capabilities via CLI, TUI, and MCP:
+
+```bash
+wt logs <task>                              # List all logs with timestamps
+wt edit-log <task> <log-id> [--minutes M] [--note N]  # Edit entry
+wt delete-log <task> <log-id>               # Delete entry (with confirmation)
+wt split-log <task> <log-id> <minutes>      # Split at minute mark
+wt merge-logs <task> <log-id-1> <log-id-2>  # Combine two entries
+```
+
+Log IDs are timestamp-based (e.g., `20260403085012abcd`). Commands accept ID prefixes for convenience.
+
+**TUI**: Press `l` on a task to open the log management modal. Keyboard shortcuts: `a`=add, `e`=edit, `d`=delete, `s`=split, `m`=merge (merges current + next row).
+
+**Split logic**: A 60min log split at 25min creates two entries (25min + 35min) with proportionally divided timestamps.
+
+**Merge logic**: Combines minutes, concatenates notes as "Merged: note1 + note2", uses earliest start and latest end timestamps.
+
 ### Presence Detection
 
 Auto-stops the timer when the user is idle (away from keyboard/mouse) for a configurable period. macOS only.
@@ -101,7 +137,7 @@ Implementation:
 
 - TUI reads `active_timer` on launch but timer display may need manual refresh to start ticking
 - Stream Deck `/filter/<role>` endpoint doesn't sync to TUI (separate processes)
-- No `wt edit` command yet
+- No `wt edit` command for tasks yet (use TUI for editing task title/description/role)
 - No export/report functionality
 - Arc integration requires Arc to be quit for folder changes
 - Arc Sync may interfere with sidebar JSON modifications

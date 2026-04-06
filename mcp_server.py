@@ -282,13 +282,17 @@ def start_timer(task_query: str) -> str:
     if at:
         prev = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
         if prev:
-            elapsed = (time.time() - at["started_at"]) / 60
+            started_at = at["started_at"]
+            ended_at = time.time()
+            elapsed = (ended_at - started_at) / 60
             if elapsed > 0.05:
                 prev.setdefault("logs", []).append({
                     "id": uid(),
                     "minutes": round(elapsed, 2),
                     "note": "Timer session",
-                    "at": time.time(),
+                    "at": ended_at,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
                 })
             result_lines.append(f"Stopped timer on '{prev['title']}' ({fmt_mins(elapsed)})")
 
@@ -321,14 +325,18 @@ def stop_timer() -> str:
         return "No timer is currently running."
 
     task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
-    elapsed = (time.time() - at["started_at"]) / 60
+    started_at = at["started_at"]
+    ended_at = time.time()
+    elapsed = (ended_at - started_at) / 60
 
     if task and elapsed > 0.05:
         task.setdefault("logs", []).append({
             "id": uid(),
             "minutes": round(elapsed, 2),
             "note": "Timer session",
-            "at": time.time(),
+            "at": ended_at,
+            "started_at": started_at,
+            "ended_at": ended_at,
         })
 
     data["active_timer"] = None
@@ -384,6 +392,242 @@ def log_time(task_query: str, minutes: float, note: str = "Manual entry") -> str
     save(data)
 
     return f"Logged {fmt_mins(minutes)} to '{task['title']}' ({note})"
+
+
+@mcp.tool()
+def list_logs(task_query: str) -> str:
+    """List all time logs for a task.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    logs = task.get("logs", [])
+    if not logs:
+        return f"No time logs for '{task['title']}'"
+
+    total = sum(l.get("minutes", 0) for l in logs)
+    lines = [
+        f"Time logs for: {task['title']}",
+        f"Total: {fmt_mins(total)}",
+        ""
+    ]
+
+    for log in logs:
+        log_id = log.get("id", "?")[:11]
+        mins = fmt_mins(log.get("minutes", 0))
+        note = log.get("note", "—")[:30]
+        started = log.get("started_at")
+        ended = log.get("ended_at")
+        at = log.get("at", 0)
+
+        if started and ended:
+            start_str = datetime.fromtimestamp(started).strftime("%H:%M")
+            end_str = datetime.fromtimestamp(ended).strftime("%H:%M")
+            time_range = f"[{start_str}-{end_str}]"
+        else:
+            time_range = ""
+
+        at_str = datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M") if at else ""
+        lines.append(f"{log_id}...  {mins:>7}  {note:<30}  {time_range:>13}  {at_str}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edit_log(task_query: str, log_id: str, minutes: float | None = None, note: str | None = None) -> str:
+    """Edit a log entry's minutes or note.
+
+    Args:
+        task_query: Task ID or partial title
+        log_id: Log ID or prefix (first 8+ characters)
+        minutes: New minutes value (optional)
+        note: New note text (optional)
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    if minutes is None and note is None:
+        return "Error: specify minutes and/or note to update"
+
+    logs = task.get("logs", [])
+    log = next((l for l in logs if l.get("id", "").startswith(log_id)), None)
+    if not log:
+        return f"No log found with ID starting with '{log_id}'"
+
+    old_mins = log.get("minutes", 0)
+    old_note = log.get("note", "")
+
+    if minutes is not None:
+        log["minutes"] = minutes
+    if note is not None:
+        log["note"] = note
+
+    save(data)
+
+    changes = []
+    if minutes is not None:
+        changes.append(f"{fmt_mins(old_mins)} → {fmt_mins(minutes)}")
+    if note is not None:
+        changes.append(f"note → '{note}'")
+
+    return f"Updated log: {', '.join(changes)}"
+
+
+@mcp.tool()
+def delete_log(task_query: str, log_id: str) -> str:
+    """Delete a log entry.
+
+    Args:
+        task_query: Task ID or partial title
+        log_id: Log ID or prefix (first 8+ characters)
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    logs = task.get("logs", [])
+    log = next((l for l in logs if l.get("id", "").startswith(log_id)), None)
+    if not log:
+        return f"No log found with ID starting with '{log_id}'"
+
+    mins = log.get("minutes", 0)
+    note = log.get("note", "—")
+
+    task["logs"] = [l for l in logs if l.get("id") != log.get("id")]
+    save(data)
+
+    return f"Deleted log: {fmt_mins(mins)} — {note}"
+
+
+@mcp.tool()
+def split_log(task_query: str, log_id: str, split_at_minutes: float) -> str:
+    """Split a log entry at a specified minute mark.
+
+    Args:
+        task_query: Task ID or partial title
+        log_id: Log ID or prefix (first 8+ characters)
+        split_at_minutes: Minute mark to split at (creates two entries)
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    logs = task.get("logs", [])
+    log_idx = next((i for i, l in enumerate(logs) if l.get("id", "").startswith(log_id)), None)
+    if log_idx is None:
+        return f"No log found with ID starting with '{log_id}'"
+
+    log = logs[log_idx]
+    total_mins = log.get("minutes", 0)
+
+    if split_at_minutes <= 0 or split_at_minutes >= total_mins:
+        return f"Error: split point must be between 0 and {total_mins}"
+
+    first_mins = split_at_minutes
+    second_mins = total_mins - split_at_minutes
+    note = log.get("note", "")
+    started = log.get("started_at")
+    ended = log.get("ended_at")
+
+    # Calculate proportional timestamps if available
+    if started and ended:
+        duration = ended - started
+        ratio = first_mins / total_mins
+        mid_time = started + (duration * ratio)
+
+        first_log = {
+            "id": uid(), "minutes": round(first_mins, 2),
+            "note": f"{note} (1/2)", "at": mid_time,
+            "started_at": started, "ended_at": mid_time
+        }
+        second_log = {
+            "id": uid(), "minutes": round(second_mins, 2),
+            "note": f"{note} (2/2)", "at": ended,
+            "started_at": mid_time, "ended_at": ended
+        }
+    else:
+        at = log.get("at", time.time())
+        first_log = {
+            "id": uid(), "minutes": round(first_mins, 2),
+            "note": f"{note} (1/2)", "at": at
+        }
+        second_log = {
+            "id": uid(), "minutes": round(second_mins, 2),
+            "note": f"{note} (2/2)", "at": at
+        }
+
+    # Replace original with two new entries
+    logs[log_idx:log_idx+1] = [first_log, second_log]
+    save(data)
+
+    return f"Split {fmt_mins(total_mins)} into {fmt_mins(first_mins)} + {fmt_mins(second_mins)}"
+
+
+@mcp.tool()
+def merge_logs(task_query: str, log_id_1: str, log_id_2: str) -> str:
+    """Merge two log entries into one.
+
+    Args:
+        task_query: Task ID or partial title
+        log_id_1: First log ID or prefix
+        log_id_2: Second log ID or prefix
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    logs = task.get("logs", [])
+    log1 = next((l for l in logs if l.get("id", "").startswith(log_id_1)), None)
+    log2 = next((l for l in logs if l.get("id", "").startswith(log_id_2)), None)
+
+    if not log1:
+        return f"No log found with ID starting with '{log_id_1}'"
+    if not log2:
+        return f"No log found with ID starting with '{log_id_2}'"
+    if log1.get("id") == log2.get("id"):
+        return "Error: cannot merge a log with itself"
+
+    # Combine
+    combined_mins = log1.get("minutes", 0) + log2.get("minutes", 0)
+    note1 = log1.get("note", "")
+    note2 = log2.get("note", "")
+    combined_note = f"Merged: {note1} + {note2}"
+
+    # Use earliest start and latest end
+    started1 = log1.get("started_at")
+    started2 = log2.get("started_at")
+    ended1 = log1.get("ended_at")
+    ended2 = log2.get("ended_at")
+
+    merged_log = {
+        "id": uid(),
+        "minutes": round(combined_mins, 2),
+        "note": combined_note,
+        "at": max(log1.get("at", 0), log2.get("at", 0))
+    }
+
+    if started1 and started2:
+        merged_log["started_at"] = min(started1, started2)
+    if ended1 and ended2:
+        merged_log["ended_at"] = max(ended1, ended2)
+
+    # Remove old logs and add merged
+    task["logs"] = [l for l in logs if l.get("id") not in (log1.get("id"), log2.get("id"))]
+    task["logs"].append(merged_log)
+    task["logs"].sort(key=lambda x: x.get("at", 0))
+
+    save(data)
+    return f"Merged {fmt_mins(log1.get('minutes', 0))} + {fmt_mins(log2.get('minutes', 0))} = {fmt_mins(combined_mins)}"
 
 
 @mcp.tool()
