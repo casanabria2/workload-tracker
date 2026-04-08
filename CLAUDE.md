@@ -28,7 +28,7 @@ Five single-file Python tools sharing one data file (`~/.workload_tracker.json`)
 - **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, status, roles, arc, tabs, presence, config.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 
 ### Data Model
@@ -36,7 +36,7 @@ Five single-file Python tools sharing one data file (`~/.workload_tracker.json`)
 Plain JSON with three top-level keys:
 - `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`
 - `active_timer` — `{task_id, started_at}` or null
-- `roles[]` — Each role has: id, label, color. Roles are user-configurable via `wt roles` commands.
+- `roles[]` — Each role has: id, label, color, and optionally `github_repo`. Roles are user-configurable via `wt roles` commands.
 
 Time tracking: `logs[]` array of log entries. Timer sessions auto-commit as log entries when stopped.
 
@@ -132,6 +132,108 @@ Implementation:
 - `tracker.py` checks idle time in the `_tick()` loop (runs every 1 second when timer active)
 - When idle exceeds threshold, timer auto-stops and logs time (optionally subtracting idle time)
 - User receives a Textual notification in the TUI
+
+### Task Closing Workflow with GitHub Project Integration
+
+When a task is marked as "done" (via CLI `wt done`, TUI status cycling, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
+
+**Role → Repository Mapping:**
+
+Each role can have an optional `github_repo` field:
+
+```bash
+wt roles set-repo demokit grafana/field-eng-demo-kit
+wt roles set-repo demos grafana/field-eng
+wt roles set-repo strategic grafana/field-eng
+wt roles set-repo testing casanabria2/workload-tracker  # for testing
+# "other" role has no repo (skips GitHub integration)
+```
+
+**Close Workflow:**
+
+1. If the role has **no configured repo**: Task is simply marked as done (no GitHub integration)
+2. If the role **has a configured repo**:
+   - Task must have a linked GitHub issue
+   - If no issue exists, user is prompted to create one (with local notes as body)
+   - Issue is added to the configured GitHub project (if configured)
+   - Project item is updated with Status=Done and logged hours
+   - **GitHub issue is automatically closed**
+
+**Configuration:**
+
+```bash
+wt config github_project_owner grafana      # Org that owns the project
+wt config github_project_number 123         # Project number
+```
+
+Config values in `~/.workload_tracker.json`:
+
+```json
+{
+  "config": {
+    "github_project_owner": "grafana",
+    "github_project_number": 123
+  },
+  "roles": [
+    {"id": "demokit", "label": "Managing DemoKit", "color": "blue", "github_repo": "grafana/field-eng-demo-kit"},
+    {"id": "demos", "label": "Demos & Workshops", "color": "green", "github_repo": "grafana/field-eng"},
+    {"id": "other", "label": "Other", "color": "white"}
+  ]
+}
+```
+
+**MCP Usage:**
+
+```python
+# Close a task (prompts if issue creation needed in CLI/TUI)
+set_task_status("My task", "done")
+
+# Close and auto-create issue if missing
+set_task_status("My task", "done", create_issue=True)
+
+# Configure role repos
+set_role_repo("demokit", "grafana/field-eng-demo-kit")
+set_role_repo("other")  # Clear repo (disables GitHub integration for role)
+```
+
+### GitHub CLI (gh) Reference
+
+Key patterns for working with the `gh` CLI:
+
+**Issue Operations:**
+```bash
+gh issue create -R owner/repo --title "Title" --body "Body" --assignee @me
+gh issue view 123 -R owner/repo --json number,state,assignees
+gh issue edit 123 -R owner/repo --add-assignee @me  # Idempotent, won't duplicate
+gh issue close 123 -R owner/repo
+gh issue delete 123 -R owner/repo --yes  # Permanent deletion (admin only)
+```
+
+**Project Operations:**
+
+The `gh project item-edit` command requires **full IDs**, not numbers or names:
+```bash
+# Get project ID (not the number!)
+gh project view 123 --owner org --format json  # Returns {"id": "PVT_xxx", ...}
+
+# Get field IDs
+gh project field-list 123 --owner org --format json
+# Returns: {"fields": [{"id": "PVTF_xxx", "name": "Status", "options": [{"id": "abc", "name": "Done"}]}]}
+
+# Add item to project (uses project number + owner)
+gh project item-add 123 --owner org --url https://github.com/owner/repo/issues/456 --format json
+
+# Edit item (uses project ID, item ID, field ID, option ID - NO --owner flag)
+gh project item-edit --project-id PVT_xxx --id PVTI_xxx --field-id PVTF_xxx --single-select-option-id abc
+gh project item-edit --project-id PVT_xxx --id PVTI_xxx --field-id PVTF_yyy --number 5
+```
+
+**Important gotchas:**
+- `gh project item-edit` does NOT accept `--owner` flag (unlike other project commands)
+- Field names like "Status" or "Hours" must be resolved to field IDs first
+- Single-select options like "Done" must be resolved to option IDs
+- Project number (e.g., 123) vs project ID (e.g., PVT_xxx) are different things
+- `--add-assignee @me` is idempotent - safe to call even if already assigned
 
 ## Known Limitations
 

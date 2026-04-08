@@ -36,10 +36,11 @@ Usage:
     wt presence off              — Disable presence detection
     wt presence <minutes>        — Set timeout and enable
 
-    wt roles                     — List all roles
-    wt roles add <id> <label>    — Add a new role
-    wt roles update <id> <label> — Update role label
-    wt roles delete <id>         — Delete a role
+    wt roles                          — List all roles
+    wt roles add <id> <label>         — Add a new role
+    wt roles update <id> <label>      — Update role label
+    wt roles delete <id>              — Delete a role
+    wt roles set-repo <id> [repo]     — Set/clear GitHub repo for a role
 
     wt arc setup                 — Set up Arc browser integration
     wt arc status                — Show Arc integration status
@@ -216,6 +217,244 @@ def gh_issue_args(issue_ref: str) -> list[str]:
         return ["-R", match.group(1), match.group(2)]
     # Fallback (URL or other format) - let gh handle it
     return [issue_ref]
+
+
+# ── GitHub Project Integration ───────────────────────────
+
+def get_role_repo(task: dict, data: dict) -> str | None:
+    """Get the GitHub repo for a task's role. Returns None if not configured."""
+    role_id = task.get("role_id", "other")
+    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
+    return role.get("github_repo") if role else None
+
+
+def create_github_issue(task: dict, repo: str) -> str:
+    """Create a GitHub issue for a task in the specified repo.
+    Includes local notes in issue body.
+    Returns the issue reference (owner/repo#number).
+    """
+    import re
+
+    # Read local notes if they exist
+    npath = notes_path(task["id"])
+    body = ""
+    if npath.exists():
+        body = npath.read_text()
+
+    # Create issue via gh CLI (assign to current user)
+    cmd = ["gh", "issue", "create", "-R", repo, "--title", task["title"], "--assignee", "@me"]
+    if body:
+        cmd.extend(["--body", body])
+    else:
+        cmd.extend(["--body", f"Task created from workload tracker: {task['title']}"])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Failed to create issue: {result.stderr}")
+
+    # Parse issue URL from output, convert to reference
+    # gh outputs: https://github.com/owner/repo/issues/123
+    url = result.stdout.strip()
+    url_match = re.match(r'https?://github\.com/([^/]+/[^/]+)/issues/(\d+)', url)
+    if url_match:
+        return f"{url_match.group(1)}#{url_match.group(2)}"
+    else:
+        raise Exception(f"Could not parse issue URL: {url}")
+
+
+def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
+    """Add issue to GitHub project and set Status=Done, add hours to Project Hours.
+
+    Returns dict with item_id and success status.
+    """
+    config = data.get("config", {})
+    owner = config.get("github_project_owner", "grafana")
+    project_num = config.get("github_project_number")
+
+    if not project_num:
+        raise Exception("github_project_number not configured. Set with: wt config github_project_number <number>")
+
+    # Get project info (need full project ID for item-edit)
+    project_result = subprocess.run([
+        "gh", "project", "view", str(project_num),
+        "--owner", owner, "--format", "json"
+    ], capture_output=True, text=True)
+
+    if project_result.returncode != 0:
+        raise Exception(f"Failed to get project info: {project_result.stderr}")
+
+    project_data = json.loads(project_result.stdout)
+    project_id = project_data.get("id")
+
+    # Get field IDs
+    fields_result = subprocess.run([
+        "gh", "project", "field-list", str(project_num),
+        "--owner", owner, "--format", "json"
+    ], capture_output=True, text=True)
+
+    if fields_result.returncode != 0:
+        raise Exception(f"Failed to get project fields: {fields_result.stderr}")
+
+    fields_data = json.loads(fields_result.stdout)
+    fields = {f["name"]: f for f in fields_data.get("fields", [])}
+
+    status_field = fields.get("Status", {})
+    hours_field = fields.get("Hours", {})
+
+    if not status_field.get("id"):
+        raise Exception("Project missing 'Status' field")
+
+    # Find "Done" option ID for Status field
+    done_option_id = None
+    for opt in status_field.get("options", []):
+        if opt.get("name") == "Done":
+            done_option_id = opt.get("id")
+            break
+
+    if not done_option_id:
+        raise Exception("Status field missing 'Done' option")
+
+    # Convert issue ref to URL
+    issue_url = f"https://github.com/{issue_ref.replace('#', '/issues/')}"
+
+    # Add to project (returns item ID)
+    result = subprocess.run([
+        "gh", "project", "item-add", str(project_num),
+        "--owner", owner, "--url", issue_url, "--format", "json"
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise Exception(f"Failed to add to project: {result.stderr}")
+
+    item_data = json.loads(result.stdout)
+    item_id = item_data.get("id")
+
+    if not item_id:
+        raise Exception("No item ID returned from project")
+
+    # Update Status field to "Done"
+    status_result = subprocess.run([
+        "gh", "project", "item-edit",
+        "--project-id", project_id,
+        "--id", item_id,
+        "--field-id", status_field["id"],
+        "--single-select-option-id", done_option_id
+    ], capture_output=True, text=True)
+
+    if status_result.returncode != 0:
+        raise Exception(f"Failed to set Status: {status_result.stderr}")
+
+    # Update Project Hours field (if it exists)
+    if hours_field.get("id"):
+        hours_result = subprocess.run([
+            "gh", "project", "item-edit",
+            "--project-id", project_id,
+            "--id", item_id,
+            "--field-id", hours_field["id"],
+            "--number", str(hours)
+        ], capture_output=True, text=True)
+
+        if hours_result.returncode != 0:
+            raise Exception(f"Failed to set Project Hours: {hours_result.stderr}")
+
+    return {"item_id": item_id, "success": True}
+
+
+def close_github_issue(issue_ref: str) -> bool:
+    """Close a GitHub issue. Returns True on success."""
+    result = subprocess.run(
+        ["gh", "issue", "close", *gh_issue_args(issue_ref)],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
+def ensure_issue_assigned(issue_ref: str) -> bool:
+    """Ensure the current user is assigned to a GitHub issue.
+    Adds @me as assignee if not already assigned. Returns True on success.
+    """
+    # gh issue edit --add-assignee is idempotent - won't duplicate if already assigned
+    result = subprocess.run(
+        ["gh", "issue", "edit", *gh_issue_args(issue_ref), "--add-assignee", "@me"],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
+def close_task(task: dict, data: dict, save_callback, prompt_callback=None) -> dict:
+    """
+    Full task closing workflow.
+
+    Args:
+        task: The task dict to close
+        data: The full data dict
+        save_callback: Function to call to save data
+        prompt_callback: Optional function(msg) -> bool to prompt user for confirmation
+
+    Returns:
+        Dict with results: {success, issue_created, issue_closed, project_updated, skipped_github, error}
+    """
+    result = {
+        "success": False,
+        "issue_created": False,
+        "issue_closed": False,
+        "project_updated": False,
+        "skipped_github": False,
+        "error": None
+    }
+
+    # 1. Check if role has a GitHub repo
+    repo = get_role_repo(task, data)
+
+    if not repo:
+        # No GitHub integration for this role - just close
+        task["status"] = "done"
+        save_callback(data)
+        result["success"] = True
+        result["skipped_github"] = True
+        return result
+
+    # 2. Ensure GitHub issue exists
+    if not task.get("github_issue"):
+        if prompt_callback:
+            create = prompt_callback(
+                f"Task '{task['title']}' has no GitHub issue. Create one in {repo}?"
+            )
+            if not create:
+                result["error"] = "Task must have GitHub issue to close (role requires it)"
+                return result
+
+        try:
+            issue_ref = create_github_issue(task, repo)
+            task["github_issue"] = issue_ref
+            result["issue_created"] = True
+            save_callback(data)
+        except Exception as e:
+            result["error"] = f"Failed to create issue: {e}"
+            return result
+
+    # 3. Add to project and update fields
+    config = data.get("config", {})
+    if config.get("github_project_number"):
+        try:
+            total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
+            hours = round(total_mins / 60)
+
+            add_to_project_and_update(task["github_issue"], hours, data)
+            result["project_updated"] = True
+        except Exception as e:
+            # Project update is non-fatal - still mark task as done
+            result["error"] = f"Project update failed: {e}"
+
+    # 4. Close the GitHub issue
+    if close_github_issue(task["github_issue"]):
+        result["issue_closed"] = True
+
+    # 5. Mark as done
+    task["status"] = "done"
+    save_callback(data)
+    result["success"] = True
+    return result
 
 
 # ── Commands ──────────────────────────────────────────────
@@ -705,21 +944,46 @@ def cmd_done(args):
         print("Usage: wt done <task-id or title>"); sys.exit(1)
     data = load()
     task = resolve_task(data, " ".join(args))
-    task["status"] = "done"
-    save(data)
-    print(c(f"✓ Marked done: {task['title']}", "green"))
+
+    def prompt_cb(msg):
+        try:
+            response = input(f"{msg} [Y/n]: ").strip().lower()
+            return response != 'n'
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+    result = close_task(task, data, save, prompt_callback=prompt_cb)
+
+    if result["success"]:
+        print(c(f"✓ Closed: {task['title']}", "green"))
+        if result["skipped_github"]:
+            print(c(f"  (No GitHub integration for this role)", "dim"))
+        else:
+            if result["issue_created"]:
+                print(c(f"  Created issue: {task['github_issue']}", "dim"))
+            if result["issue_closed"]:
+                print(c(f"  Closed issue: {task['github_issue']}", "dim"))
+            if result["project_updated"]:
+                hours = round(sum(l.get("minutes", 0) for l in task.get("logs", [])) / 60)
+                print(c(f"  Updated project (Status: Done, Hours: {hours})", "dim"))
+            elif result.get("error"):
+                print(c(f"  Warning: {result['error']}", "yellow"))
+    else:
+        print(c(f"Failed to close: {result.get('error')}", "red"))
+        sys.exit(1)
 
     # Arc integration: archive tabs and delete folder
     if task.get("arc_folder_id"):
         try:
             from arc_browser import TaskTabManager, prompt_arc_restart
             manager = TaskTabManager(data)
-            result = manager.on_task_completed(task, save)
-            if result.get("tabs_archived"):
-                print(c(f"  [Arc: Archived {result['tabs_archived']} tabs]", "dim"))
-            if result.get("folder_deleted"):
+            arc_result = manager.on_task_completed(task, save)
+            if arc_result.get("tabs_archived"):
+                print(c(f"  [Arc: Archived {arc_result['tabs_archived']} tabs]", "dim"))
+            if arc_result.get("folder_deleted"):
                 print(c("  [Arc: Folder removed]", "dim"))
-                if result.get("restart_required"):
+                if arc_result.get("restart_required"):
                     print(c("  Restart Arc to apply changes.", "yellow"))
         except ImportError:
             pass
@@ -811,7 +1075,7 @@ def cmd_notes(args):
 
 
 def cmd_roles(args):
-    """Manage roles: list, add, update, delete"""
+    """Manage roles: list, add, update, delete, set-repo"""
     data = load()
 
     if not args:
@@ -819,7 +1083,9 @@ def cmd_roles(args):
         print(c("\n  Roles:\n", "bold"))
         for r in data.get("roles", []):
             task_count = len([t for t in data["tasks"] if t.get("role_id") == r["id"]])
-            print(f"  {r['id']:<15} {r['label']:<30} ({task_count} tasks)")
+            repo = r.get("github_repo", "")
+            repo_str = f"→ {repo}" if repo else "(no repo)"
+            print(f"  {r['id']:<15} {r['label']:<25} {repo_str:<35} ({task_count} tasks)")
         print()
         return
 
@@ -871,9 +1137,39 @@ def cmd_roles(args):
         save(data)
         print(c(f"✓ Deleted role: {role_id}", "yellow"))
 
+    elif subcmd == "set-repo":
+        if len(args) < 2:
+            print("Usage: wt roles set-repo <id> [repo]")
+            print("  Set a GitHub repo for a role (owner/repo format)")
+            print("  Omit repo to clear the setting")
+            sys.exit(1)
+        role_id = args[1].lower()
+
+        role = next((r for r in data["roles"] if r["id"] == role_id), None)
+        if not role:
+            print(c(f"Role '{role_id}' not found.", "red")); sys.exit(1)
+
+        if len(args) < 3:
+            # Clear the repo
+            if "github_repo" in role:
+                del role["github_repo"]
+                save(data)
+                print(c(f"✓ Cleared GitHub repo for role: {role_id}", "yellow"))
+            else:
+                print(c(f"Role '{role_id}' has no GitHub repo set.", "dim"))
+        else:
+            repo = args[2]
+            # Validate repo format (owner/repo)
+            if "/" not in repo or repo.count("/") != 1:
+                print(c("Error: Repo must be in owner/repo format", "red"))
+                sys.exit(1)
+            role["github_repo"] = repo
+            save(data)
+            print(c(f"✓ Set GitHub repo for {role_id}: {repo}", "green"))
+
     else:
         print(c(f"Unknown roles subcommand: {subcmd}", "red"))
-        print("Usage: wt roles [add|update|delete] ...")
+        print("Usage: wt roles [add|update|delete|set-repo] ...")
         sys.exit(1)
 
 
@@ -910,6 +1206,9 @@ def cmd_link(args):
         npath = notes_path(task["id"])
         print(c(f"Warning: Task has local notes at {npath}", "yellow"))
         print(c("  Local notes will be ignored when GitHub issue is linked.", "dim"))
+
+    # Ensure current user is assigned to the issue
+    ensure_issue_assigned(issue_ref)
 
     # Store the issue reference (normalized form)
     task["github_issue"] = issue_ref

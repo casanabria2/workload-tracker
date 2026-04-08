@@ -34,6 +34,7 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
+from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -245,6 +246,58 @@ class TabCleanupModal(ModalScreen):
     @on(Button.Pressed, "#btn-keep")
     def keep_all(self):
         self.dismiss([])
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Create GitHub Issue
+# ──────────────────────────────────────────────────────────
+
+class ConfirmCreateIssueModal(ModalScreen):
+    """Modal to confirm creating a GitHub issue for a task."""
+    CSS = """
+    ConfirmCreateIssueModal { align: center middle; }
+    #issue-box {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #issue-box Label { margin-bottom: 1; }
+    #issue-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, repo: str):
+        super().__init__()
+        self._task_title = task_title
+        self._repo = repo
+
+    def compose(self) -> ComposeResult:
+        with Container(id="issue-box"):
+            yield Label("[bold]Create GitHub Issue?[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label(f"No GitHub issue linked.")
+            yield Label(f"Create one in [cyan]{self._repo}[/]?")
+            with Horizontal(id="issue-actions"):
+                yield Button("Create Issue  [y]", variant="primary", id="btn-create")
+                yield Button("Cancel  [esc]", id="btn-cancel-issue")
+
+    def on_mount(self):
+        self.query_one("#btn-create").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-create")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-issue")
+    def cancel(self):
+        self.dismiss(False)
 
 
 # ──────────────────────────────────────────────────────────
@@ -1351,13 +1404,95 @@ class WorkloadTracker(App):
         idx = STATUSES.index(current) if current in STATUSES else 0
         new_status = STATUSES[(idx + 1) % len(STATUSES)]
         old_status = task["status"]
-        task["status"] = new_status
-        save_data(self._data)
-        self._populate_table()
 
-        # Arc integration: cleanup folder when marked done
+        # If transitioning to "done", use the close workflow
         if new_status == "done" and old_status != "done":
+            self._close_task_with_workflow(task)
+        else:
+            task["status"] = new_status
+            save_data(self._data)
+            self._populate_table()
+
+    def _close_task_with_workflow(self, task: dict):
+        """Handle the task closing workflow with GitHub integration."""
+        # Check if role has a GitHub repo
+        repo = get_role_repo(task, self._data)
+
+        if not repo:
+            # No GitHub integration - just close
+            task["status"] = "done"
+            save_data(self._data)
+            self._populate_table()
+            self.notify(f"Closed: {task['title']}", severity="information")
             self._arc_on_task_completed(task)
+            return
+
+        # If task has no GitHub issue, prompt to create one
+        if not task.get("github_issue"):
+            self.push_screen(
+                ConfirmCreateIssueModal(task["title"], repo),
+                lambda create: self._on_create_issue_response(task, repo, create)
+            )
+        else:
+            # Has issue, proceed with closing
+            self._complete_close_workflow(task)
+
+    def _on_create_issue_response(self, task: dict, repo: str, create: bool):
+        """Handle response from create issue modal."""
+        if not create:
+            self.notify("Task must have GitHub issue to close (role requires it)", severity="warning")
+            return
+
+        # Run blocking GitHub operations in a worker thread
+        self._run_close_workflow(task, repo, create_issue=True)
+
+    @work(thread=True)
+    def _run_close_workflow(self, task: dict, repo: str, create_issue: bool = False):
+        """Run the close workflow in a background thread to avoid blocking."""
+        # Create issue if needed
+        if create_issue:
+            try:
+                issue_ref = create_github_issue(task, repo)
+                task["github_issue"] = issue_ref
+                save_data(self._data)
+                self.call_from_thread(self.notify, f"Created issue: {issue_ref}", severity="information")
+            except Exception as e:
+                self.call_from_thread(self.notify, f"Failed to create issue: {e}", severity="error")
+                return
+
+        # Update project if configured
+        config = self._data.get("config", {})
+        if config.get("github_project_number"):
+            try:
+                total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
+                hours = round(total_mins / 60)
+                add_to_project_and_update(task["github_issue"], hours, self._data)
+                self.call_from_thread(self.notify, f"Updated project (Hours: {hours})", severity="information")
+            except Exception as e:
+                self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
+
+        # Close the GitHub issue
+        if task.get("github_issue"):
+            if close_github_issue(task["github_issue"]):
+                self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
+
+        # Mark as done
+        task["status"] = "done"
+        save_data(self._data)
+
+        # Update UI from main thread
+        self.call_from_thread(self._finish_close_workflow, task)
+
+    def _finish_close_workflow(self, task: dict):
+        """Update UI after close workflow completes."""
+        self._populate_table()
+        self._refresh_sidebar()
+        self._refresh_overview()
+        self._arc_on_task_completed(task)
+
+    def _complete_close_workflow(self, task: dict):
+        """Complete the close workflow for task that already has an issue."""
+        self._run_close_workflow(task, "", create_issue=False)
 
     def _arc_on_task_completed(self, task: dict):
         """Arc integration: archive tabs and remove folder when task is done."""

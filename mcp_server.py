@@ -78,6 +78,13 @@ def get_role_ids(data: dict) -> list:
     return [r["id"] for r in data.get("roles", [])]
 
 
+def get_role_repo(task: dict, data: dict) -> str | None:
+    """Get the GitHub repo for a task's role. Returns None if not configured."""
+    role_id = task.get("role_id", "other")
+    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
+    return role.get("github_repo") if role else None
+
+
 def fmt_mins(mins: float) -> str:
     if not mins:
         return "0m"
@@ -631,12 +638,17 @@ def merge_logs(task_query: str, log_id_1: str, log_id_2: str) -> str:
 
 
 @mcp.tool()
-def set_task_status(task_query: str, status: str) -> str:
+def set_task_status(task_query: str, status: str, create_issue: bool = False) -> str:
     """Set the status of a task.
+
+    When setting status to 'done', this triggers the close workflow:
+    - If the role has a configured GitHub repo, the task must have a linked issue
+    - The issue is added to the configured GitHub project with logged hours
 
     Args:
         task_query: Task ID or partial title
         status: New status: todo, inprogress, or done
+        create_issue: If True and setting to done, create GitHub issue if missing
     """
     data = load()
     task = resolve_task(data, task_query)
@@ -647,10 +659,116 @@ def set_task_status(task_query: str, status: str) -> str:
         return f"Invalid status '{status}'. Use: todo, inprogress, done"
 
     old_status = task.get("status", "todo")
+
+    # Special handling for closing tasks (transitioning to "done")
+    if status == "done" and old_status != "done":
+        return _close_task_mcp(task, data, create_issue)
+
     task["status"] = status
     save(data)
 
     return f"Changed '{task['title']}' from {STATUS_LABELS[old_status]} to {STATUS_LABELS[status]}"
+
+
+def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:
+    """Handle task closing workflow for MCP."""
+    import subprocess
+    import re
+
+    result_lines = []
+
+    # Check if role has a GitHub repo
+    repo = get_role_repo(task, data)
+
+    if not repo:
+        # No GitHub integration - just close
+        task["status"] = "done"
+        save(data)
+        return f"Closed '{task['title']}' (no GitHub integration for this role)"
+
+    # Check if task has GitHub issue
+    if not task.get("github_issue"):
+        if create_issue:
+            # Create the issue
+            try:
+                # Read local notes if they exist
+                npath = NOTES_DIR / f"{task['id']}.md"
+                body = ""
+                if npath.exists():
+                    body = npath.read_text()
+
+                cmd = ["gh", "issue", "create", "-R", repo, "--title", task["title"]]
+                if body:
+                    cmd.extend(["--body", body])
+                else:
+                    cmd.extend(["--body", f"Task created from workload tracker: {task['title']}"])
+
+                gh_result = subprocess.run(cmd, capture_output=True, text=True)
+                if gh_result.returncode != 0:
+                    return f"Error: Failed to create issue: {gh_result.stderr}"
+
+                # Parse issue URL
+                url = gh_result.stdout.strip()
+                url_match = re.match(r'https?://github\.com/([^/]+/[^/]+)/issues/(\d+)', url)
+                if url_match:
+                    issue_ref = f"{url_match.group(1)}#{url_match.group(2)}"
+                    task["github_issue"] = issue_ref
+                    save(data)
+                    result_lines.append(f"Created issue: {issue_ref}")
+                else:
+                    return f"Error: Could not parse issue URL: {url}"
+            except Exception as e:
+                return f"Error creating issue: {e}"
+        else:
+            return (
+                f"Error: Task '{task['title']}' has no GitHub issue linked.\n"
+                f"This role ({task.get('role_id')}) requires issues in {repo}.\n"
+                f"Either:\n"
+                f"  - Link an existing issue: link_github_issue('{task['title']}', 'owner/repo#123')\n"
+                f"  - Create one: set_task_status('{task['title']}', 'done', create_issue=True)"
+            )
+
+    # Update project if configured
+    config = data.get("config", {})
+    if config.get("github_project_number"):
+        try:
+            owner = config.get("github_project_owner", "grafana")
+            project_num = config.get("github_project_number")
+            issue_url = f"https://github.com/{task['github_issue'].replace('#', '/issues/')}"
+
+            # Add to project
+            add_result = subprocess.run([
+                "gh", "project", "item-add", str(project_num),
+                "--owner", owner, "--url", issue_url, "--format", "json"
+            ], capture_output=True, text=True)
+
+            if add_result.returncode == 0:
+                total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
+                hours = round(total_mins / 60)
+                result_lines.append(f"Added to project (Hours: {hours})")
+            else:
+                result_lines.append(f"Warning: Could not add to project: {add_result.stderr}")
+        except Exception as e:
+            result_lines.append(f"Warning: Project update failed: {e}")
+
+    # Close the GitHub issue
+    if task.get("github_issue"):
+        close_result = subprocess.run(
+            ["gh", "issue", "close", *gh_issue_args(task["github_issue"])],
+            capture_output=True, text=True
+        )
+        if close_result.returncode == 0:
+            result_lines.append(f"Closed issue: {task['github_issue']}")
+        else:
+            result_lines.append(f"Warning: Could not close issue: {close_result.stderr}")
+
+    # Mark as done
+    task["status"] = "done"
+    save(data)
+
+    result_lines.insert(0, f"Closed '{task['title']}'")
+
+    return "\n".join(result_lines)
 
 
 @mcp.tool()
@@ -863,12 +981,14 @@ def add_github_comment(task_query: str, comment: str) -> str:
 
 @mcp.tool()
 def list_roles() -> str:
-    """List all available roles."""
+    """List all available roles with their GitHub repo configuration."""
     data = load()
     lines = ["Available roles:\n"]
     for r in data.get("roles", []):
         task_count = len([t for t in data["tasks"] if t.get("role_id") == r["id"]])
-        lines.append(f"  {r['id']:<15} {r['label']:<30} ({task_count} tasks)")
+        repo = r.get("github_repo", "")
+        repo_str = f"→ {repo}" if repo else "(no repo)"
+        lines.append(f"  {r['id']:<15} {r['label']:<25} {repo_str:<35} ({task_count} tasks)")
     return "\n".join(lines)
 
 
@@ -931,6 +1051,39 @@ def delete_role(role_id: str) -> str:
     data["roles"] = [r for r in data["roles"] if r["id"] != role_id]
     save(data)
     return f"Deleted role: {role_id}"
+
+
+@mcp.tool()
+def set_role_repo(role_id: str, github_repo: str | None = None) -> str:
+    """Set or clear the GitHub repo for a role.
+
+    When a role has a configured repo, tasks with that role require a GitHub issue
+    when being closed. The issue is automatically created in the configured repo.
+
+    Args:
+        role_id: The role ID to update
+        github_repo: GitHub repo in owner/repo format, or None to clear
+    """
+    data = load()
+    role = next((r for r in data["roles"] if r["id"] == role_id), None)
+
+    if not role:
+        return f"Error: Role '{role_id}' not found."
+
+    if github_repo:
+        # Validate format
+        if "/" not in github_repo or github_repo.count("/") != 1:
+            return "Error: Repo must be in owner/repo format (e.g., 'grafana/field-eng')"
+        role["github_repo"] = github_repo
+        save(data)
+        return f"Set GitHub repo for '{role_id}': {github_repo}"
+    else:
+        if "github_repo" in role:
+            del role["github_repo"]
+            save(data)
+            return f"Cleared GitHub repo for role: {role_id}"
+        else:
+            return f"Role '{role_id}' has no GitHub repo set."
 
 
 @mcp.tool()
