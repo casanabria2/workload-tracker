@@ -5,7 +5,7 @@ Quick command-line interface to manage tasks without launching the full TUI.
 
 Usage:
     wt add "Task title" --role strategic --status inprogress
-    wt list [--role strategic]
+    wt list [--role strategic] [--all]
     wt start <task-id or partial title>
     wt stop
     wt log <task-id or partial title> <minutes> [note]
@@ -531,6 +531,15 @@ def add_issue_comment(issue_ref: str, comment: str) -> bool:
     return result.returncode == 0
 
 
+def update_issue_title(issue_ref: str, new_title: str) -> bool:
+    """Update the title of a GitHub issue. Returns True on success."""
+    result = subprocess.run(
+        ["gh", "issue", "edit", *gh_issue_args(issue_ref), "--title", new_title],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
 def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comment_callback=None) -> dict:
     """
     Full task closing workflow.
@@ -684,15 +693,22 @@ def cmd_list(args):
     role_ids = get_role_ids(data)
 
     filter_role = None
+    show_done = False
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
             filter_role = resolve_role(data, args[i+1]); i += 2
+        elif args[i] in ("--all", "-a"):
+            show_done = True; i += 1
         else:
             i += 1
 
     if filter_role:
         tasks = [t for t in tasks if t.get("role_id") == filter_role]
+
+    # Hide done tasks by default
+    if not show_done:
+        tasks = [t for t in tasks if t.get("status") != "done"]
 
     if not tasks:
         print(c("No tasks.", "dim")); return
@@ -1193,6 +1209,13 @@ def cmd_rename(args):
     save(data)
     print(c(f"✓ Renamed: {old_title}", "dim"))
     print(c(f"       → {new_title}", "green"))
+
+    # Update linked GitHub issue title if present
+    if task.get("github_issue"):
+        if update_issue_title(task["github_issue"], new_title):
+            print(c(f"  Updated GitHub issue: {task['github_issue']}", "dim"))
+        else:
+            print(c(f"  Warning: Failed to update GitHub issue title", "yellow"))
 
 
 def cmd_status(args):

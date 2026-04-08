@@ -200,12 +200,15 @@ def add_task(
 
 
 @mcp.tool()
-def list_tasks(role: str | None = None, status: str | None = None) -> str:
+def list_tasks(role: str | None = None, status: str | None = None, include_done: bool = False) -> str:
     """List all tasks, optionally filtered by role or status.
+
+    By default, done tasks are hidden. Use include_done=True or status="done" to see them.
 
     Args:
         role: Filter by role ID (use list_roles to see available roles)
         status: Filter by status (todo, inprogress, done)
+        include_done: Include done tasks in the list (default: False)
     """
     data = load()
     tasks = data.get("tasks", [])
@@ -216,6 +219,9 @@ def list_tasks(role: str | None = None, status: str | None = None) -> str:
         tasks = [t for t in tasks if t.get("role_id") == role]
     if status:
         tasks = [t for t in tasks if t.get("status") == status]
+    elif not include_done:
+        # Hide done tasks by default unless explicitly filtering by status or include_done
+        tasks = [t for t in tasks if t.get("status") != "done"]
 
     if not tasks:
         return "No tasks found."
@@ -796,6 +802,41 @@ def delete_task(task_query: str) -> str:
     save(data)
 
     return f"Deleted task '{task['title']}'"
+
+
+@mcp.tool()
+def rename_task(task_query: str, new_title: str) -> str:
+    """Rename a task. Also updates the linked GitHub issue title if present.
+
+    Args:
+        task_query: Task ID or partial title
+        new_title: The new title for the task
+    """
+    import subprocess
+
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    old_title = task["title"]
+    task["title"] = new_title
+    save(data)
+
+    result_lines = [f"Renamed '{old_title}' → '{new_title}'"]
+
+    # Update linked GitHub issue title if present
+    if task.get("github_issue"):
+        gh_result = subprocess.run(
+            ["gh", "issue", "edit", *gh_issue_args(task["github_issue"]), "--title", new_title],
+            capture_output=True, text=True
+        )
+        if gh_result.returncode == 0:
+            result_lines.append(f"Updated GitHub issue: {task['github_issue']}")
+        else:
+            result_lines.append(f"Warning: Failed to update GitHub issue title: {gh_result.stderr}")
+
+    return "\n".join(result_lines)
 
 
 @mcp.tool()

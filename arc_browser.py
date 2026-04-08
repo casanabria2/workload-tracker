@@ -660,10 +660,10 @@ class ArcAppleScript:
 
         Returns True if successful.
         """
-        # Reset all folders to collapsed state before finding coordinates
-        self.collapse_and_expand_pinned_tabs()
+        # Ensure pinned tabs are expanded so we can find folder coordinates
+        self.ensure_pinned_tabs_expanded()
 
-        # Find fresh coordinates
+        # Find folder coordinates
         coords = self.find_folder_coordinates(parent_folder_title)
         if not coords:
             return False

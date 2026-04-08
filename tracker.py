@@ -34,7 +34,7 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
-from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status
+from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status, get_role_activity, update_project_activity
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -184,6 +184,15 @@ class TaskModal(ModalScreen):
             "logs": self._task_data.get("logs", []) if self._task_data else [],
             "created_at": self._task_data.get("created_at", time.time()) if self._task_data else time.time(),
         }
+        # Preserve additional fields from existing task
+        if self._task_data:
+            for key in ("github_issue", "arc_folder_id", "archived_tabs"):
+                if key in self._task_data:
+                    result[key] = self._task_data[key]
+            # Track if title changed for GitHub issue update
+            if self._task_data.get("title") != title:
+                result["_title_changed"] = True
+                result["_old_title"] = self._task_data.get("title")
         self.dismiss(result)
 
 
@@ -944,6 +953,7 @@ class WorkloadTracker(App):
         Binding("t",   "toggle_timer","Timer"),
         Binding("l",   "log_time",    "Manage logs"),
         Binding("s",   "cycle_status","Cycle status"),
+        Binding("a",   "toggle_show_done", "Show done"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
         Binding("3",   "filter_role_3", "Strategic",show=False),
@@ -955,6 +965,7 @@ class WorkloadTracker(App):
 
     filter_role: reactive[str] = reactive("all")
     active_tab: reactive[str] = reactive("board")
+    show_done: reactive[bool] = reactive(False)
 
     def __init__(self):
         super().__init__()
@@ -1057,6 +1068,8 @@ class WorkloadTracker(App):
         tasks = self._data.get("tasks", [])
         if self.filter_role != "all":
             tasks = [t for t in tasks if t.get("role_id") == self.filter_role]
+        if not self.show_done:
+            tasks = [t for t in tasks if t.get("status") != "done"]
         return tasks
 
     def _selected_task(self) -> Optional[dict]:
@@ -1236,6 +1249,12 @@ class WorkloadTracker(App):
             pass
         self._populate_table()
 
+    def action_toggle_show_done(self):
+        self.show_done = not self.show_done
+        self._populate_table()
+        status = "shown" if self.show_done else "hidden"
+        self.notify(f"Done tasks {status}", severity="information")
+
     def action_new_task(self):
         roles = get_roles(self._data)
         self.push_screen(TaskModal(roles=roles), self._on_task_saved)
@@ -1249,6 +1268,11 @@ class WorkloadTracker(App):
     def _on_task_saved(self, result: Optional[dict]):
         if not result:
             return
+
+        # Check if title changed and task has GitHub issue
+        title_changed = result.pop("_title_changed", False)
+        old_title = result.pop("_old_title", None)
+
         tasks = self._data["tasks"]
         existing = next((i for i, t in enumerate(tasks) if t["id"] == result["id"]), None)
         if existing is not None:
@@ -1256,9 +1280,27 @@ class WorkloadTracker(App):
         else:
             tasks.insert(0, result)
         save_data(self._data)
+
+        # Update GitHub issue title if needed
+        if title_changed and result.get("github_issue"):
+            self._update_github_issue_title(result)
+
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
+
+    @work(thread=True)
+    def _update_github_issue_title(self, task: dict):
+        """Update GitHub issue title in background thread."""
+        from wt import update_issue_title
+        if update_issue_title(task["github_issue"], task["title"]):
+            self.call_from_thread(
+                self.notify, f"Updated GitHub issue: {task['github_issue']}", severity="information"
+            )
+        else:
+            self.call_from_thread(
+                self.notify, "Failed to update GitHub issue title", severity="warning"
+            )
 
     def action_delete_task(self):
         task = self._selected_task()
@@ -1470,7 +1512,14 @@ class WorkloadTracker(App):
                 total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
                 hours = round(total_mins / 60)
                 add_to_project_and_update(task["github_issue"], hours, self._data)
-                self.call_from_thread(self.notify, f"Updated project (Hours: {hours})", severity="information")
+
+                # Set activity if role has one configured
+                activity = get_role_activity(task, self._data)
+                if activity:
+                    update_project_activity(task["github_issue"], activity, self._data)
+                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}, Activity: {activity})", severity="information")
+                else:
+                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours})", severity="information")
             except Exception as e:
                 self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
 

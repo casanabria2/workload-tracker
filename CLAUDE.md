@@ -25,10 +25,10 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, status, roles, arc, tabs, presence, config.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, tabs, presence, config.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 
 ### Data Model
@@ -73,7 +73,8 @@ Arc browser integration: Tasks can have associated Arc folders. When enabled, th
 
 - **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`.
 - **Statuses**: `todo`, `inprogress`, `done`
-- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all
+- Done tasks are hidden by default in all list views (CLI, TUI, MCP)
+- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks (TUI)
 
 ### Key Patterns
 
@@ -185,6 +186,11 @@ Config values in `~/.workload_tracker.json`:
 **MCP Usage:**
 
 ```python
+# List tasks (done tasks hidden by default)
+list_tasks()                         # Active tasks only
+list_tasks(include_done=True)        # Include done tasks
+list_tasks(status="done")            # Only done tasks
+
 # Close a task (prompts if issue creation needed in CLI/TUI)
 set_task_status("My task", "done")
 
@@ -206,6 +212,7 @@ gh issue create -R owner/repo --title "Title" --body "Body" --assignee @me
 gh issue view 123 -R owner/repo --json number,state,assignees
 gh issue edit 123 -R owner/repo --add-assignee @me  # Idempotent, won't duplicate
 gh issue close 123 -R owner/repo
+gh issue edit 123 -R owner/repo --title "New title"  # Update title
 gh issue delete 123 -R owner/repo --yes  # Permanent deletion (admin only)
 ```
 
@@ -235,11 +242,26 @@ gh project item-edit --project-id PVT_xxx --id PVTI_xxx --field-id PVTF_yyy --nu
 - Project number (e.g., 123) vs project ID (e.g., PVT_xxx) are different things
 - `--add-assignee @me` is idempotent - safe to call even if already assigned
 
+### Renaming Tasks
+
+Tasks can be renamed via CLI, TUI, or MCP. When a task has a linked GitHub issue, renaming automatically updates the issue title:
+
+```bash
+wt rename "old task name" "new task name"
+# Also updates the linked GitHub issue title if present
+```
+
+**MCP:**
+```python
+rename_task("old name", "new name")  # Updates GitHub issue title if linked
+```
+
+**TUI:** Press `e` on a task to edit. Changes to the title are synced to GitHub.
+
 ## Known Limitations
 
 - TUI reads `active_timer` on launch but timer display may need manual refresh to start ticking
 - Stream Deck `/filter/<role>` endpoint doesn't sync to TUI (separate processes)
-- No `wt edit` command for tasks yet (use TUI for editing task title/description/role)
 - No export/report functionality
 - Arc integration requires Arc to be quit for folder changes
 - Arc Sync may interfere with sidebar JSON modifications
