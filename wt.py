@@ -510,7 +510,28 @@ def ensure_issue_assigned(issue_ref: str) -> bool:
     return result.returncode == 0
 
 
-def close_task(task: dict, data: dict, save_callback, prompt_callback=None) -> dict:
+def issue_has_comments(issue_ref: str) -> bool:
+    """Check if a GitHub issue has any comments."""
+    result = subprocess.run(
+        ["gh", "issue", "view", *gh_issue_args(issue_ref), "--json", "comments"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return True  # Assume has comments on error to avoid blocking
+    data = json.loads(result.stdout)
+    return len(data.get("comments", [])) > 0
+
+
+def add_issue_comment(issue_ref: str, comment: str) -> bool:
+    """Add a comment to a GitHub issue. Returns True on success."""
+    result = subprocess.run(
+        ["gh", "issue", "comment", *gh_issue_args(issue_ref), "--body", comment],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
+def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comment_callback=None) -> dict:
     """
     Full task closing workflow.
 
@@ -519,9 +540,10 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None) -> d
         data: The full data dict
         save_callback: Function to call to save data
         prompt_callback: Optional function(msg) -> bool to prompt user for confirmation
+        comment_callback: Optional function(msg) -> str|None to get closing comment from user
 
     Returns:
-        Dict with results: {success, issue_created, issue_closed, project_updated, skipped_github, error}
+        Dict with results: {success, issue_created, issue_closed, project_updated, skipped_github, comment_added, error}
     """
     result = {
         "success": False,
@@ -529,6 +551,7 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None) -> d
         "issue_closed": False,
         "project_updated": False,
         "skipped_github": False,
+        "comment_added": False,
         "error": None
     }
 
@@ -580,7 +603,16 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None) -> d
             # Project update is non-fatal - still mark task as done
             result["error"] = f"Project update failed: {e}"
 
-    # 4. Close the GitHub issue
+    # 4. Check for comments and prompt for closing comment if none
+    if comment_callback and not issue_has_comments(task["github_issue"]):
+        comment = comment_callback(
+            f"Issue {task['github_issue']} has no comments. Add a closing comment?"
+        )
+        if comment:
+            if add_issue_comment(task["github_issue"], comment):
+                result["comment_added"] = True
+
+    # 5. Close the GitHub issue
     if close_github_issue(task["github_issue"]):
         result["issue_closed"] = True
 
@@ -1087,7 +1119,16 @@ def cmd_done(args):
             print()
             return False
 
-    result = close_task(task, data, save, prompt_callback=prompt_cb)
+    def comment_cb(msg):
+        try:
+            print(f"{msg}")
+            comment = input("Comment (or Enter to skip): ").strip()
+            return comment if comment else None
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+    result = close_task(task, data, save, prompt_callback=prompt_cb, comment_callback=comment_cb)
 
     if result["success"]:
         print(c(f"✓ Closed: {task['title']}", "green"))
@@ -1096,6 +1137,8 @@ def cmd_done(args):
         else:
             if result["issue_created"]:
                 print(c(f"  Created issue: {task['github_issue']}", "dim"))
+            if result.get("comment_added"):
+                print(c(f"  Added closing comment", "dim"))
             if result["issue_closed"]:
                 print(c(f"  Closed issue: {task['github_issue']}", "dim"))
             if result["project_updated"]:
