@@ -34,7 +34,7 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
-from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue
+from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -1412,6 +1412,9 @@ class WorkloadTracker(App):
             task["status"] = new_status
             save_data(self._data)
             self._populate_table()
+            # Sync status to GitHub project if task has a linked issue
+            if task.get("github_issue"):
+                self._sync_project_status_async(task, new_status)
 
     def _close_task_with_workflow(self, task: dict):
         """Handle the task closing workflow with GitHub integration."""
@@ -1505,6 +1508,13 @@ class WorkloadTracker(App):
             self.notify("Arc folder archived. Restart Arc to apply.", severity="information")
         except ImportError:
             pass
+
+    @work(thread=True)
+    def _sync_project_status_async(self, task: dict, status: str):
+        """Sync task status to GitHub project in background thread."""
+        if sync_project_status(task["github_issue"], status, self._data):
+            status_label = {"todo": "Todo", "inprogress": "In Progress", "done": "Done"}.get(status, status)
+            self.call_from_thread(self.notify, f"Project status: {status_label}", severity="information")
 
 
 if __name__ == "__main__":

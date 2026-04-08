@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from wt import sync_project_status
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -667,7 +668,13 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
     task["status"] = status
     save(data)
 
-    return f"Changed '{task['title']}' from {STATUS_LABELS[old_status]} to {STATUS_LABELS[status]}"
+    # Sync status to GitHub project if task has a linked issue
+    result_msg = f"Changed '{task['title']}' from {STATUS_LABELS[old_status]} to {STATUS_LABELS[status]}"
+    if task.get("github_issue"):
+        if sync_project_status(task["github_issue"], status, data):
+            result_msg += f" (project synced)"
+
+    return result_msg
 
 
 def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:

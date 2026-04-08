@@ -262,17 +262,26 @@ def create_github_issue(task: dict, repo: str) -> str:
         raise Exception(f"Could not parse issue URL: {url}")
 
 
-def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
-    """Add issue to GitHub project and set Status=Done, add hours to Project Hours.
+# Map workload tracker status to GitHub project status
+PROJECT_STATUS_MAP = {
+    "todo": "Todo",
+    "inprogress": "In Progress",
+    "done": "Done",
+}
 
-    Returns dict with item_id and success status.
+
+def get_project_info(data: dict) -> dict:
+    """Get project ID and field information.
+
+    Returns dict with project_id, status_field, hours_field, status_options.
+    Raises Exception if project not configured or fields missing.
     """
     config = data.get("config", {})
     owner = config.get("github_project_owner", "grafana")
     project_num = config.get("github_project_number")
 
     if not project_num:
-        raise Exception("github_project_number not configured. Set with: wt config github_project_number <number>")
+        raise Exception("github_project_number not configured")
 
     # Get project info (need full project ID for item-edit)
     project_result = subprocess.run([
@@ -304,20 +313,32 @@ def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
     if not status_field.get("id"):
         raise Exception("Project missing 'Status' field")
 
-    # Find "Done" option ID for Status field
-    done_option_id = None
+    # Build status options map
+    status_options = {}
     for opt in status_field.get("options", []):
-        if opt.get("name") == "Done":
-            done_option_id = opt.get("id")
-            break
+        status_options[opt.get("name")] = opt.get("id")
 
-    if not done_option_id:
-        raise Exception("Status field missing 'Done' option")
+    return {
+        "owner": owner,
+        "project_num": project_num,
+        "project_id": project_id,
+        "status_field": status_field,
+        "hours_field": hours_field,
+        "status_options": status_options,
+    }
 
-    # Convert issue ref to URL
+
+def add_issue_to_project(issue_ref: str, data: dict) -> str:
+    """Add issue to project and return item ID. Idempotent - returns existing item if already added."""
+    config = data.get("config", {})
+    owner = config.get("github_project_owner", "grafana")
+    project_num = config.get("github_project_number")
+
+    if not project_num:
+        raise Exception("github_project_number not configured")
+
     issue_url = f"https://github.com/{issue_ref.replace('#', '/issues/')}"
 
-    # Add to project (returns item ID)
     result = subprocess.run([
         "gh", "project", "item-add", str(project_num),
         "--owner", owner, "--url", issue_url, "--format", "json"
@@ -332,32 +353,90 @@ def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
     if not item_id:
         raise Exception("No item ID returned from project")
 
-    # Update Status field to "Done"
-    status_result = subprocess.run([
-        "gh", "project", "item-edit",
-        "--project-id", project_id,
-        "--id", item_id,
-        "--field-id", status_field["id"],
-        "--single-select-option-id", done_option_id
-    ], capture_output=True, text=True)
+    return item_id
 
-    if status_result.returncode != 0:
-        raise Exception(f"Failed to set Status: {status_result.stderr}")
 
-    # Update Project Hours field (if it exists)
-    if hours_field.get("id"):
-        hours_result = subprocess.run([
+def sync_project_status(issue_ref: str, status: str, data: dict) -> bool:
+    """Sync task status to GitHub project. Adds issue to project if not already there.
+
+    Args:
+        issue_ref: GitHub issue reference (owner/repo#number)
+        status: Workload tracker status (todo, inprogress, done)
+        data: Full data dict with config
+
+    Returns True on success, False if project not configured.
+    """
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False  # No project configured, skip silently
+
+    project_status = PROJECT_STATUS_MAP.get(status)
+    if not project_status:
+        return False  # Unknown status
+
+    try:
+        project_info = get_project_info(data)
+        item_id = add_issue_to_project(issue_ref, data)
+
+        option_id = project_info["status_options"].get(project_status)
+        if not option_id:
+            return False  # Status option not found in project
+
+        result = subprocess.run([
             "gh", "project", "item-edit",
-            "--project-id", project_id,
+            "--project-id", project_info["project_id"],
+            "--id", item_id,
+            "--field-id", project_info["status_field"]["id"],
+            "--single-select-option-id", option_id
+        ], capture_output=True, text=True)
+
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def update_project_hours(issue_ref: str, hours: int, data: dict) -> bool:
+    """Update Hours field for an issue in the project.
+
+    Returns True on success, False if project not configured or field missing.
+    """
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False
+
+    try:
+        project_info = get_project_info(data)
+        item_id = add_issue_to_project(issue_ref, data)
+
+        hours_field = project_info.get("hours_field", {})
+        if not hours_field.get("id"):
+            return False  # No Hours field
+
+        result = subprocess.run([
+            "gh", "project", "item-edit",
+            "--project-id", project_info["project_id"],
             "--id", item_id,
             "--field-id", hours_field["id"],
             "--number", str(hours)
         ], capture_output=True, text=True)
 
-        if hours_result.returncode != 0:
-            raise Exception(f"Failed to set Project Hours: {hours_result.stderr}")
+        return result.returncode == 0
+    except Exception:
+        return False
 
-    return {"item_id": item_id, "success": True}
+
+def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
+    """Add issue to GitHub project and set Status=Done, add hours.
+
+    Returns dict with item_id and success status.
+    """
+    # Sync status to Done
+    sync_project_status(issue_ref, "done", data)
+
+    # Update hours
+    update_project_hours(issue_ref, hours, data)
+
+    return {"success": True}
 
 
 def close_github_issue(issue_ref: str) -> bool:
