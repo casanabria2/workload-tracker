@@ -501,6 +501,63 @@ class EditLogEntryModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Add Log Entry
+# ──────────────────────────────────────────────────────────
+
+class AddLogModal(ModalScreen):
+    """Modal for adding a new log entry."""
+    CSS = """
+    AddLogModal { align: center middle; }
+    #add-log-box {
+        width: 56;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #add-log-box Label { margin-bottom: 1; }
+    #add-log-box Input { margin-bottom: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="add-log-box"):
+            yield Label("[bold]Add Log Entry[/]")
+            yield Input(placeholder="Minutes", id="inp-add-mins", type="number")
+            yield Input(placeholder="Note (optional)", id="inp-add-note")
+            with Horizontal():
+                yield Button("Add  [enter]", variant="primary", id="btn-add-log")
+                yield Button("Cancel  [esc]", id="btn-cancel-log")
+
+    def on_mount(self):
+        self.query_one("#inp-add-mins").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "enter":
+            self._add()
+
+    @on(Button.Pressed, "#btn-add-log")
+    def add(self):
+        self._add()
+
+    @on(Button.Pressed, "#btn-cancel-log")
+    def cancel(self):
+        self.dismiss(None)
+
+    def _add(self):
+        try:
+            mins = float(self.query_one("#inp-add-mins").value)
+        except ValueError:
+            self.query_one("#inp-add-mins").focus()
+            return
+        if mins <= 0:
+            return
+        note = self.query_one("#inp-add-note").value.strip() or "Manual entry"
+        self.dismiss({"minutes": mins, "note": note})
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Split Log Entry
 # ──────────────────────────────────────────────────────────
 
@@ -625,6 +682,14 @@ class ConfirmDeleteLogModal(ModalScreen):
 
 class EditLogsModal(ModalScreen):
     """Full log management modal with add, edit, delete, split, merge."""
+    BINDINGS = [
+        Binding("a", "add_log", "Add log", priority=True),
+        Binding("e", "edit_log", "Edit", priority=True),
+        Binding("d", "delete_log", "Delete", priority=True),
+        Binding("s", "split_log", "Split", priority=True),
+        Binding("m", "merge_log", "Merge", priority=True),
+        Binding("escape", "close_modal", "Close", priority=True),
+    ]
     CSS = """
     EditLogsModal { align: center middle; }
     #logs-modal-box {
@@ -639,8 +704,6 @@ class EditLogsModal(ModalScreen):
     #logs-table { height: 20; margin-bottom: 1; }
     #logs-actions { margin-bottom: 1; }
     #logs-help { color: $text-muted; }
-    .add-section { margin-bottom: 1; }
-    .add-section Input { width: 20; margin-right: 1; }
     """
 
     def __init__(self, task_dict: dict, data: dict, save_callback):
@@ -656,11 +719,8 @@ class EditLogsModal(ModalScreen):
             yield Label(f"[bold]Time Logs — {self._task_dict['title']}[/]")
             yield Label(f"Total: {fmt_mins(total)}")
             yield DataTable(id="logs-table", cursor_type="row", zebra_stripes=True)
-            with Horizontal(classes="add-section"):
-                yield Input(placeholder="Minutes", id="inp-add-mins", type="number")
-                yield Input(placeholder="Note (optional)", id="inp-add-note")
-                yield Button("Add  [a]", variant="primary", id="btn-add-log")
             with Horizontal(id="logs-actions"):
+                yield Button("Add  [a]", variant="primary", id="btn-add-log")
                 yield Button("Edit  [e]", id="btn-edit")
                 yield Button("Delete  [d]", variant="error", id="btn-delete")
                 yield Button("Split  [s]", id="btn-split-log")
@@ -706,19 +766,25 @@ class EditLogsModal(ModalScreen):
         except Exception:
             return None
 
-    def on_key(self, event):
-        if event.key == "escape":
-            self.dismiss(True)  # True indicates logs may have changed
-        elif event.key == "a":
-            self._add_log()
-        elif event.key == "e":
-            self._edit_log()
-        elif event.key == "d":
-            self._delete_log()
-        elif event.key == "s":
-            self._split_log()
-        elif event.key == "m":
-            self._start_merge()
+    def on_key(self, event) -> None:
+        """Handle keys before they reach child widgets."""
+        # Let inputs handle their own keys
+        focused = self.app.focused
+        if isinstance(focused, Input):
+            return
+
+        key_actions = {
+            "a": self._add_log,
+            "e": self._edit_log,
+            "d": self._delete_log,
+            "s": self._split_log,
+            "m": self._start_merge,
+            "escape": lambda: self.dismiss(True),
+        }
+        if event.key in key_actions:
+            event.stop()
+            event.prevent_default()
+            key_actions[event.key]()
 
     @on(Button.Pressed, "#btn-add-log")
     def add_btn(self):
@@ -745,21 +811,24 @@ class EditLogsModal(ModalScreen):
         self.dismiss(True)
 
     def _add_log(self):
-        try:
-            mins = float(self.query_one("#inp-add-mins").value)
-        except ValueError:
-            self.query_one("#inp-add-mins").focus()
+        self.app.push_screen(
+            AddLogModal(),
+            self._on_add_done
+        )
+
+    def _on_add_done(self, result: Optional[dict]):
+        if not result:
             return
-        if mins <= 0:
-            return
-        note = self.query_one("#inp-add-note").value.strip() or "Manual entry"
-        log = {"id": uid(), "minutes": mins, "note": note, "at": time.time()}
+        log = {
+            "id": uid(),
+            "minutes": result["minutes"],
+            "note": result["note"],
+            "at": time.time()
+        }
         self._task_dict.setdefault("logs", []).append(log)
         self._save(self._data)
         self._build_table()
         self._update_total()
-        self.query_one("#inp-add-mins").value = ""
-        self.query_one("#inp-add-note").value = ""
 
     def _update_total(self):
         total = sum(l.get("minutes", 0) for l in self._task_dict.get("logs", []))
