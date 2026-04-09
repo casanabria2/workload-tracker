@@ -179,12 +179,12 @@ def has_notes(task_id: str) -> bool:
     return p.exists() and p.stat().st_size > 0
 
 
-def normalize_issue_ref(issue_ref: str, data: dict) -> str:
+def normalize_issue_ref(issue_ref: str, data: dict, task: dict = None) -> str:
     """Normalize issue reference, using default repo for bare numbers.
 
     Handles:
-      - "262" -> "owner/repo#262" (uses config github_repo)
-      - "#262" -> "owner/repo#262" (uses config github_repo)
+      - "262" -> "owner/repo#262" (uses task's role repo, then config github_repo)
+      - "#262" -> "owner/repo#262" (uses task's role repo, then config github_repo)
       - "owner/repo#262" -> "owner/repo#262"
       - "https://github.com/owner/repo/issues/262" -> "owner/repo#262"
     """
@@ -198,7 +198,12 @@ def normalize_issue_ref(issue_ref: str, data: dict) -> str:
     # Handle bare number or #number
     bare_match = re.match(r'^#?(\d+)$', issue_ref)
     if bare_match:
-        repo = data.get("config", {}).get("github_repo")
+        # Try task's role repo first, then global config
+        repo = None
+        if task:
+            repo = get_role_repo(task, data)
+        if not repo:
+            repo = data.get("config", {}).get("github_repo")
         if not repo:
             print(c("Issue number requires a default repo.", "red"))
             print("Set with: wt config github-repo owner/repo")
@@ -1414,10 +1419,11 @@ def cmd_link(args):
         sys.exit(1)
 
     data = load()
-    # Issue ref is the last argument
-    issue_ref = normalize_issue_ref(args[-1], data)
+    # Resolve task first so we can use its role repo for bare issue numbers
     query = " ".join(args[:-1])
     task = resolve_task(data, query)
+    # Issue ref is the last argument - use task's role repo if available
+    issue_ref = normalize_issue_ref(args[-1], data, task)
 
     # Validate the issue exists
     result = subprocess.run(
