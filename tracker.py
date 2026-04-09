@@ -28,8 +28,8 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label,
-    Select, Static, TabbedContent, TabPane, TextArea
+    Button, Checkbox, DataTable, Footer, Header, Input, Label,
+    Select, Static, Switch, TabbedContent, TabPane, TextArea
 )
 from textual.reactive import reactive
 
@@ -127,6 +127,8 @@ class TaskModal(ModalScreen):
     }
     #modal-box Label { margin-bottom: 1; }
     #modal-box Input, #modal-box Select { margin-bottom: 1; }
+    #modal-box Horizontal { margin-bottom: 1; height: auto; }
+    #modal-box Switch { margin-right: 1; }
     #modal-actions { margin-top: 1; }
     """
 
@@ -134,6 +136,7 @@ class TaskModal(ModalScreen):
         super().__init__()
         self._task_data = task_data
         self._roles = roles or []
+        self._is_new = task_data is None
 
     def compose(self) -> ComposeResult:
         t = self._task_data or {}
@@ -146,6 +149,10 @@ class TaskModal(ModalScreen):
             yield Input(value=t.get("description", ""), placeholder="Description (optional)", id="inp-desc")
             yield Select(role_options, value=t.get("role_id", default_role), id="sel-role", prompt="Select role")
             yield Select(status_options, value=t.get("status", "todo"), id="sel-status", prompt="Select status")
+            if self._is_new:
+                with Horizontal():
+                    yield Switch(value=False, id="chk-github")
+                    yield Label("Create GitHub issue")
             with Horizontal(id="modal-actions"):
                 yield Button("Save  [s]", variant="primary", id="btn-save")
                 yield Button("Cancel  [esc]", id="btn-cancel")
@@ -156,7 +163,7 @@ class TaskModal(ModalScreen):
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(None)
-        elif event.key == "s" and not isinstance(self.focused, Input):
+        elif event.key == "s" and not isinstance(self.focused, (Input, Switch)):
             self._save()
 
     @on(Button.Pressed, "#btn-save")
@@ -193,6 +200,11 @@ class TaskModal(ModalScreen):
             if self._task_data.get("title") != title:
                 result["_title_changed"] = True
                 result["_old_title"] = self._task_data.get("title")
+        # Check if user wants to create GitHub issue (new tasks only)
+        if self._is_new:
+            switch = self.query_one("#chk-github", Switch)
+            if switch.value:
+                result["_create_github_issue"] = True
         self.dismiss(result)
 
 
@@ -1341,9 +1353,11 @@ class WorkloadTracker(App):
         # Check if title changed and task has GitHub issue
         title_changed = result.pop("_title_changed", False)
         old_title = result.pop("_old_title", None)
+        create_issue = result.pop("_create_github_issue", False)
 
         tasks = self._data["tasks"]
         existing = next((i for i, t in enumerate(tasks) if t["id"] == result["id"]), None)
+        is_new = existing is None
         if existing is not None:
             tasks[existing] = result
         else:
@@ -1353,6 +1367,10 @@ class WorkloadTracker(App):
         # Update GitHub issue title if needed
         if title_changed and result.get("github_issue"):
             self._update_github_issue_title(result)
+
+        # Create GitHub issue for new task if requested
+        if is_new and create_issue:
+            self._create_github_issue_for_task(result)
 
         self._populate_table()
         self._refresh_sidebar()
@@ -1369,6 +1387,27 @@ class WorkloadTracker(App):
         else:
             self.call_from_thread(
                 self.notify, "Failed to update GitHub issue title", severity="warning"
+            )
+
+    @work(thread=True)
+    def _create_github_issue_for_task(self, task: dict):
+        """Create GitHub issue for a new task in background thread."""
+        repo = get_role_repo(task, self._data)
+        if not repo:
+            self.call_from_thread(
+                self.notify, "No GitHub repo configured for this role", severity="warning"
+            )
+            return
+        try:
+            issue_ref = create_github_issue(task, repo)
+            task["github_issue"] = issue_ref
+            save_data(self._data)
+            self.call_from_thread(
+                self.notify, f"Created issue: {issue_ref}", severity="information"
+            )
+        except Exception as e:
+            self.call_from_thread(
+                self.notify, f"Failed to create issue: {e}", severity="error"
             )
 
     def action_delete_task(self):
