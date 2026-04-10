@@ -42,6 +42,7 @@ Usage:
     wt roles delete <id>              — Delete a role
     wt roles set-repo <id> [repo]     — Set/clear GitHub repo for a role
     wt roles set-activity <id> [act]  — Set/clear GitHub Project activity for a role
+    wt roles set-type <id> [type]     — Set/clear GitHub Project type for a role
 
     wt arc setup                 — Set up Arc browser integration
     wt arc status                — Show Arc integration status
@@ -316,6 +317,7 @@ def get_project_info(data: dict) -> dict:
     status_field = fields.get("Status", {})
     hours_field = fields.get("Hours", {})
     activity_field = fields.get("Activity", {})
+    type_field = fields.get("Type", {})
 
     if not status_field.get("id"):
         raise Exception("Project missing 'Status' field")
@@ -330,6 +332,11 @@ def get_project_info(data: dict) -> dict:
     for opt in activity_field.get("options", []):
         activity_options[opt.get("name")] = opt.get("id")
 
+    # Build type options map
+    type_options = {}
+    for opt in type_field.get("options", []):
+        type_options[opt.get("name")] = opt.get("id")
+
     return {
         "owner": owner,
         "project_num": project_num,
@@ -337,8 +344,10 @@ def get_project_info(data: dict) -> dict:
         "status_field": status_field,
         "hours_field": hours_field,
         "activity_field": activity_field,
+        "type_field": type_field,
         "status_options": status_options,
         "activity_options": activity_options,
+        "type_options": type_options,
     }
 
 
@@ -416,6 +425,13 @@ def get_role_activity(task: dict, data: dict) -> str | None:
     return role.get("activity") if role else None
 
 
+def get_role_type(task: dict, data: dict) -> str | None:
+    """Get the GitHub Project type for a task's role. Returns None if not configured."""
+    role_id = task.get("role_id", "other")
+    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
+    return role.get("type") if role else None
+
+
 def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
     """Update Activity field for an issue in the project.
 
@@ -442,6 +458,40 @@ def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
             "--project-id", project_info["project_id"],
             "--id", item_id,
             "--field-id", activity_field["id"],
+            "--single-select-option-id", option_id
+        ], capture_output=True, text=True)
+
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def update_project_type(issue_ref: str, type_val: str, data: dict) -> bool:
+    """Update Type field for an issue in the project.
+
+    Returns True on success, False if project not configured or field/option missing.
+    """
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False
+
+    try:
+        project_info = get_project_info(data)
+        item_id = add_issue_to_project(issue_ref, data)
+
+        type_field = project_info.get("type_field", {})
+        if not type_field.get("id"):
+            return False  # No Type field
+
+        option_id = project_info["type_options"].get(type_val)
+        if not option_id:
+            return False  # Type option not found
+
+        result = subprocess.run([
+            "gh", "project", "item-edit",
+            "--project-id", project_info["project_id"],
+            "--id", item_id,
+            "--field-id", type_field["id"],
             "--single-select-option-id", option_id
         ], capture_output=True, text=True)
 
@@ -613,6 +663,11 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             activity = get_role_activity(task, data)
             if activity:
                 update_project_activity(task["github_issue"], activity, data)
+
+            # Set type if role has one configured
+            type_val = get_role_type(task, data)
+            if type_val:
+                update_project_type(task["github_issue"], type_val, data)
         except Exception as e:
             # Project update is non-fatal - still mark task as done
             result["error"] = f"Project update failed: {e}"
@@ -1402,9 +1457,35 @@ def cmd_roles(args):
             save(data)
             print(c(f"✓ Set activity for {role_id}: {activity}", "green"))
 
+    elif subcmd == "set-type":
+        if len(args) < 2:
+            print("Usage: wt roles set-type <id> [type]")
+            print("  Set a GitHub Project type for a role")
+            print("  Omit type to clear the setting")
+            sys.exit(1)
+        role_id = args[1].lower()
+
+        role = next((r for r in data["roles"] if r["id"] == role_id), None)
+        if not role:
+            print(c(f"Role '{role_id}' not found.", "red")); sys.exit(1)
+
+        if len(args) < 3:
+            # Clear the type
+            if "type" in role:
+                del role["type"]
+                save(data)
+                print(c(f"✓ Cleared type for role: {role_id}", "yellow"))
+            else:
+                print(c(f"Role '{role_id}' has no type set.", "dim"))
+        else:
+            type_val = " ".join(args[2:])  # Allow multi-word types
+            role["type"] = type_val
+            save(data)
+            print(c(f"✓ Set type for {role_id}: {type_val}", "green"))
+
     else:
         print(c(f"Unknown roles subcommand: {subcmd}", "red"))
-        print("Usage: wt roles [add|update|delete|set-repo|set-activity] ...")
+        print("Usage: wt roles [add|update|delete|set-repo|set-activity|set-type] ...")
         sys.exit(1)
 
 
