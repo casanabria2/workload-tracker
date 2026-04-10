@@ -1496,14 +1496,20 @@ class WorkloadTracker(App):
             pass
 
     def _arc_tab_cleanup(self, task: dict):
-        """Arc integration: show tab cleanup modal if enabled."""
+        """Arc integration: show tab cleanup modal if enabled (runs in background)."""
         if not self._data.get("config", {}).get("tab_cleanup_enabled"):
             return
+        # Run classification in background to avoid blocking UI
+        self._arc_tab_cleanup_worker(task)
+
+    @work(thread=True)
+    def _arc_tab_cleanup_worker(self, task: dict):
+        """Background worker for tab classification."""
         try:
             from arc_browser import TaskTabManager
             manager = TaskTabManager(self._data)
 
-            # Get tabs and classify
+            # Get tabs and classify (this makes API call)
             tabs = manager.applescript.get_all_tabs()
             if not tabs:
                 return
@@ -1516,12 +1522,23 @@ class WorkloadTracker(App):
                     {"url": c.tab.url, "title": c.tab.title, "reason": c.reason}
                     for c in unrelated
                 ]
-                self.push_screen(
-                    TabCleanupModal(unrelated_data, task["title"]),
-                    lambda tabs_to_close: self._on_tabs_cleanup(tabs_to_close, manager)
+                # Show modal on main thread
+                self.call_from_thread(
+                    self._show_tab_cleanup_modal, unrelated_data, task["title"], manager
                 )
         except ImportError:
             pass
+        except Exception as e:
+            self.call_from_thread(
+                self.notify, f"Tab cleanup failed: {e}", severity="warning"
+            )
+
+    def _show_tab_cleanup_modal(self, unrelated_data: list, task_title: str, manager):
+        """Show the tab cleanup modal (called from main thread)."""
+        self.push_screen(
+            TabCleanupModal(unrelated_data, task_title),
+            lambda tabs_to_close: self._on_tabs_cleanup(tabs_to_close, manager)
+        )
 
     def _on_tabs_cleanup(self, tabs_to_close: list, manager):
         """Callback when user selects tabs to close."""
