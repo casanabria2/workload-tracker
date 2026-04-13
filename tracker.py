@@ -10,10 +10,17 @@ Keyboard shortcuts:
   t        — Toggle timer on selected task
   l        — Manage time logs (add/edit/delete/split/merge)
   s        — Cycle status of selected task
+  c        — Import from Google Calendar
+  a        — Toggle showing done tasks
   1-4      — Filter by role (1=DemoKit, 2=Demos, 3=Strategic, 4=Other, 0=All)
   tab      — Switch between Task board / Overview panels
   ↑↓       — Navigate tasks
   q / esc  — Quit / close modal
+
+Notes column indicators:
+  C        — Imported from calendar
+  #        — Linked to GitHub issue
+  +        — Has local notes
 """
 
 import json
@@ -34,7 +41,7 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
-from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status, get_role_activity, update_project_activity
+from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status, get_role_activity, update_project_activity, get_calendar_events, get_gcal_service, GCAL_CREDENTIALS_FILE
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -989,6 +996,320 @@ class EditLogsModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Calendar Time Confirmation
+# ──────────────────────────────────────────────────────────
+
+class CalendarTimeModal(ModalScreen):
+    """Modal to confirm or adjust time when importing a calendar event."""
+    CSS = """
+    CalendarTimeModal { align: center middle; }
+    #time-modal-box {
+        width: 50;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #time-modal-box Label { margin-bottom: 1; }
+    #time-input { width: 15; margin-bottom: 1; }
+    #time-actions { margin-top: 1; }
+    """
+
+    def __init__(self, event: dict):
+        super().__init__()
+        self._event = event
+        self._duration = event["duration_mins"]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="time-modal-box"):
+            yield Label(f"[bold]{self._event['title']}[/]")
+            yield Label(f"Duration: {fmt_mins(self._duration)}")
+            yield Label("")
+            yield Label("Log time (minutes):")
+            yield Input(value=str(int(self._duration)), id="time-input", type="integer")
+            with Horizontal(id="time-actions"):
+                yield Button("Confirm", variant="primary", id="btn-confirm")
+                yield Button("Cancel", id="btn-cancel")
+
+    def on_mount(self):
+        self.query_one("#time-input", Input).focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-confirm")
+    def on_confirm(self):
+        self._do_confirm()
+
+    @on(Button.Pressed, "#btn-cancel")
+    def on_cancel(self):
+        self.dismiss(None)
+
+    @on(Input.Submitted, "#time-input")
+    def on_input_submitted(self):
+        self._do_confirm()
+
+    def _do_confirm(self):
+        try:
+            time_input = self.query_one("#time-input", Input)
+            minutes = float(time_input.value) if time_input.value else self._duration
+            if minutes <= 0:
+                self.notify("Time must be greater than 0", severity="warning")
+                return
+            self.dismiss(minutes)
+        except ValueError:
+            self.notify("Invalid time value", severity="warning")
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Calendar Import
+# ──────────────────────────────────────────────────────────
+
+class CalendarModal(ModalScreen):
+    """Modal to list and import calendar events as tasks."""
+    BINDINGS = [
+        Binding("i", "import_event", "Import", priority=True),
+        Binding("d", "delete_event", "Delete", priority=True),
+        Binding("escape", "close_modal", "Close", priority=True),
+    ]
+    CSS = """
+    CalendarModal { align: center middle; }
+    #calendar-modal-box {
+        width: 90;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #calendar-modal-box Label { margin-bottom: 1; }
+    #calendar-table { height: 15; margin-bottom: 1; }
+    #calendar-actions { margin-bottom: 1; }
+    #calendar-help { color: $text-muted; }
+    #calendar-error { color: $error; margin-bottom: 1; }
+    #role-select { width: 30; margin-bottom: 1; }
+    #days-input { width: 10; }
+    """
+
+    def __init__(self, data: dict, save_callback):
+        super().__init__()
+        self._data = data
+        self._save = save_callback
+        self._events = []
+        self._days_back = 1
+
+    def compose(self) -> ComposeResult:
+        roles = get_roles(self._data)
+        with Container(id="calendar-modal-box"):
+            yield Label("[bold]Import from Google Calendar[/]")
+            yield Label("", id="calendar-error")
+            with Horizontal():
+                yield Label("Role: ")
+                yield Select(
+                    [(r["label"], r["id"]) for r in roles],
+                    value=roles[0]["id"] if roles else "other",
+                    id="role-select"
+                )
+            with Horizontal():
+                yield Label("Days back: ")
+                yield Input(value="1", id="days-input", type="integer")
+                yield Button("Refresh", id="btn-refresh", variant="default")
+            yield DataTable(id="calendar-table", cursor_type="row", zebra_stripes=True)
+            with Horizontal(id="calendar-actions"):
+                yield Button("Import  [i]", variant="primary", id="btn-import")
+                yield Button("Delete  [d]", variant="error", id="btn-delete")
+                yield Button("Close  [Esc]", id="btn-close")
+            yield Label("[dim]\\[i] Import event  \\[d] Delete imported task  ✓ = already imported[/]", id="calendar-help")
+
+    def on_mount(self):
+        self._load_events()
+        table = self.query_one("#calendar-table", DataTable)
+        table.focus()
+
+    def _load_events(self):
+        """Load calendar events and populate the table."""
+        error_label = self.query_one("#calendar-error", Label)
+        table = self.query_one("#calendar-table", DataTable)
+
+        # Preserve cursor position
+        selected_key = None
+        try:
+            if table.cursor_row is not None and table.row_count > 0:
+                selected_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            pass
+
+        # Check if calendar is configured
+        service = get_gcal_service()
+        if not service:
+            if not GCAL_CREDENTIALS_FILE.exists():
+                error_label.update("[red]Calendar not configured. Run 'wt calendar setup' first.[/]")
+            else:
+                error_label.update("[red]Calendar authentication failed.[/]")
+            return
+
+        error_label.update("")
+
+        # Get days back from input
+        try:
+            days_input = self.query_one("#days-input", Input)
+            self._days_back = int(days_input.value) if days_input.value else 1
+        except (ValueError, Exception):
+            self._days_back = 1
+
+        # Get calendar ID from config
+        config = self._data.get("config", {})
+        calendar_id = config.get("calendar_id", "primary")
+
+        # Fetch events
+        self._events = get_calendar_events(days_back=self._days_back, calendar_id=calendar_id)
+
+        # Get already imported UIDs
+        imported_uids = {t.get("calendar_event_uid") for t in self._data.get("tasks", [])}
+
+        # Build table
+        table.clear(columns=True)
+        table.add_columns("", "Date", "Time", "Duration", "Title")
+
+        for event in self._events:
+            is_imported = event["uid"] in imported_uids
+            status = "✓" if is_imported else " "
+            start_dt = datetime.fromtimestamp(event["start_date"])
+            date_str = start_dt.strftime("%m/%d")
+            time_str = start_dt.strftime("%H:%M")
+            duration = fmt_mins(event["duration_mins"])
+            title = event["title"][:45]
+
+            table.add_row(status, date_str, time_str, duration, title, key=event["uid"])
+
+        # Restore cursor position
+        if selected_key:
+            try:
+                for idx, row_key in enumerate(table.rows.keys()):
+                    if row_key.value == selected_key:
+                        table.cursor_coordinate = (idx, table.cursor_coordinate.column)
+                        break
+            except Exception:
+                pass
+
+    def _get_selected_event(self):
+        table = self.query_one("#calendar-table", DataTable)
+        if table.cursor_row is None or table.row_count == 0:
+            return None
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+            return next((e for e in self._events if e["uid"] == key), None)
+        except Exception:
+            return None
+
+    def action_import_event(self):
+        self._do_import()
+
+    def action_delete_event(self):
+        self._do_delete()
+
+    def action_close_modal(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-import")
+    def on_import(self):
+        self._do_import()
+
+    @on(Button.Pressed, "#btn-delete")
+    def on_delete(self):
+        self._do_delete()
+
+    @on(Button.Pressed, "#btn-close")
+    def on_close(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-refresh")
+    def on_refresh(self):
+        self._load_events()
+
+    def _do_delete(self):
+        """Delete the task that was imported from the selected calendar event."""
+        event = self._get_selected_event()
+        if not event:
+            self.notify("No event selected", severity="warning")
+            return
+
+        # Find the task with this calendar_event_uid
+        task = next((t for t in self._data.get("tasks", []) if t.get("calendar_event_uid") == event["uid"]), None)
+        if not task:
+            self.notify("Event not imported yet", severity="warning")
+            return
+
+        # Delete the task
+        self._data["tasks"] = [t for t in self._data["tasks"] if t["id"] != task["id"]]
+        self._save(self._data)
+
+        self.notify(f"Deleted: {task['title']}", severity="information")
+
+        # Refresh table to remove the checkmark
+        self._load_events()
+
+    def _do_import(self):
+        event = self._get_selected_event()
+        if not event:
+            self.notify("No event selected", severity="warning")
+            return
+
+        # Check if already imported
+        imported_uids = {t.get("calendar_event_uid") for t in self._data.get("tasks", [])}
+        if event["uid"] in imported_uids:
+            self.notify("Event already imported", severity="warning")
+            return
+
+        # Store event and role for the callback
+        role_select = self.query_one("#role-select", Select)
+        self._pending_import = {
+            "event": event,
+            "role_id": role_select.value,
+        }
+
+        # Show time confirmation modal
+        self.app.push_screen(CalendarTimeModal(event), self._on_time_confirmed)
+
+    def _on_time_confirmed(self, minutes: float | None):
+        """Callback after time confirmation modal."""
+        if minutes is None or not hasattr(self, '_pending_import'):
+            return
+
+        event = self._pending_import["event"]
+        role_id = self._pending_import["role_id"]
+        del self._pending_import
+
+        # Create task
+        task = {
+            "id": uid(),
+            "title": event["title"],
+            "description": event.get("notes", ""),
+            "role_id": role_id,
+            "status": "done",
+            "logs": [{
+                "id": uid(),
+                "minutes": round(minutes, 2),
+                "note": f"Calendar: {event['calendar_name']}",
+                "at": event["end_date"],
+                "started_at": event["start_date"],
+                "ended_at": event["end_date"],
+            }],
+            "created_at": time.time(),
+            "calendar_event_uid": event["uid"],
+        }
+
+        self._data["tasks"].insert(0, task)
+        self._save(self._data)
+
+        self.notify(f"Imported: {event['title']} ({fmt_mins(minutes)})", severity="information")
+
+        # Refresh table to show the checkmark
+        self._load_events()
+
+
+# ──────────────────────────────────────────────────────────
 # Main App
 # ──────────────────────────────────────────────────────────
 
@@ -1034,6 +1355,7 @@ class WorkloadTracker(App):
         Binding("t",   "toggle_timer","Timer"),
         Binding("l",   "log_time",    "Manage logs"),
         Binding("s",   "cycle_status","Cycle status"),
+        Binding("c",   "import_calendar", "Calendar"),
         Binding("a",   "toggle_show_done", "Show done"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
@@ -1117,8 +1439,10 @@ class WorkloadTracker(App):
                 self._data["active_timer"].get("task_id") == task["id"]
             )
             timer_dot = "▶" if is_running else " "
-            # Notes indicator: # for GitHub issue, + for local notes
-            if task.get("github_issue"):
+            # Notes indicator: # for GitHub issue, + for local notes, C for calendar
+            if task.get("calendar_event_uid"):
+                notes_icon = "C"
+            elif task.get("github_issue"):
                 notes_icon = "#"
             elif has_local_notes(task["id"]):
                 notes_icon = "+"
@@ -1339,6 +1663,15 @@ class WorkloadTracker(App):
     def action_new_task(self):
         roles = get_roles(self._data)
         self.push_screen(TaskModal(roles=roles), self._on_task_saved)
+
+    def action_import_calendar(self):
+        self.push_screen(CalendarModal(self._data, save_data), self._on_calendar_closed)
+
+    def _on_calendar_closed(self, result):
+        # Refresh UI after calendar modal closes (events may have been imported)
+        self._populate_table()
+        self._refresh_sidebar()
+        self._refresh_overview()
 
     def action_edit_task(self):
         task = self._selected_task()
