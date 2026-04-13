@@ -25,7 +25,7 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, tabs, presence, config.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, tabs, presence, config, calendar.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
@@ -34,7 +34,7 @@ Five single-file Python tools sharing one data file (`~/.workload_tracker.json`)
 ### Data Model
 
 Plain JSON with three top-level keys:
-- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`
+- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `calendar_event_uid`
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color, and optionally `github_repo`. Roles are user-configurable via `wt roles` commands.
 
@@ -132,6 +132,37 @@ Implementation:
 - `idle_detector.py` queries macOS `ioreg -c IOHIDSystem` for HIDIdleTime (nanoseconds since last input)
 - `tracker.py` checks idle time in the `_tick()` loop (runs every 1 second when timer active)
 - When idle exceeds threshold, timer auto-stops and logs time (optionally subtracting idle time)
+
+### Google Calendar Integration
+
+Import calendar events as tasks with automatic time logging.
+
+```bash
+wt calendar                  # List events from yesterday & today
+wt calendar 7                # List events from last 7 days
+wt calendar import <event>   # Import event as task (prompts for time)
+wt calendar setup            # Show setup instructions
+```
+
+**Setup**: Requires Google Calendar API credentials:
+1. Go to Google Cloud Console
+2. Enable Google Calendar API
+3. Create OAuth credentials (Desktop app)
+4. Save credentials to `~/.workload_tracker_gcal_credentials.json`
+5. First run opens browser for authorization
+
+**Configuration**:
+```bash
+wt config calendar_id your.email@gmail.com  # Use specific calendar (default: primary)
+```
+
+**Import flow**:
+1. Shows event details (title, time, duration)
+2. Prompts for role selection
+3. Prompts for time: `[Y/n/minutes]` - confirm, skip, or adjust duration
+4. Creates task with status "done" and logs time with original timestamps
+
+**Tracking**: Imported events store `calendar_event_uid` to prevent duplicate imports. Already-imported events show with ✓ in the list.
 - User receives a Textual notification in the TUI
 
 ### Task Closing Workflow with GitHub Project Integration
@@ -265,3 +296,70 @@ rename_task("old name", "new name")  # Updates GitHub issue title if linked
 - No export/report functionality
 - Arc integration requires Arc to be quit for folder changes
 - Arc Sync may interfere with sidebar JSON modifications
+
+## Zsh Autocompletion
+
+The `_wt` file provides zsh tab completion for the `wt` CLI. When adding new commands or subcommands, update this file to maintain autocompletion support.
+
+**File location:** `_wt` (symlinked to zsh site-functions)
+
+**Structure:**
+```zsh
+_wt() {
+    # 1. Define commands array with descriptions
+    commands=(
+        'calendar:Import tasks from Google Calendar'
+        'newcmd:Description of new command'
+    )
+
+    # 2. Handle command completion (CURRENT == 2)
+    if (( CURRENT == 2 )); then
+        _describe -t commands 'command' commands
+        return
+    fi
+
+    # 3. Handle subcommand/argument completion in case statement
+    case "${words[2]}" in
+        newcmd)
+            # Subcommand completion at position 3
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('sub1:Description' 'sub2:Description')
+                _describe -t subcommands 'subcommand' subcommands
+            fi
+            ;;
+    esac
+}
+```
+
+**Key patterns:**
+
+- `compadd "${array[@]}"` — Add completions (zsh auto-quotes spaces)
+- `compadd -Q "${array[@]}"` — Add completions without zsh quoting
+- `_describe -t tag 'description' array` — Show completions with descriptions
+- `CURRENT` — Current word position (2=command, 3=first arg, etc.)
+- `${words[2]}` — The command being completed
+
+**Dynamic completions (e.g., task names):**
+```zsh
+tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+compadd "${tasks[@]}"
+```
+
+**Using venv Python** (for commands needing extra packages):
+```zsh
+local wt_dir="${0:A:h}"
+local venv_python="${wt_dir}/venv/bin/python"
+[[ -x "$venv_python" ]] || venv_python="python3"
+```
+
+**After modifying `_wt`:** User must reload completions:
+```bash
+rm -f ~/.zcompdump* && exec zsh
+```

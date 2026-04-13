@@ -44,6 +44,11 @@ Usage:
     wt roles set-activity <id> [act]  — Set/clear GitHub Project activity for a role
     wt roles set-type <id> [type]     — Set/clear GitHub Project type for a role
 
+    wt calendar                  — List events from yesterday & today
+    wt calendar <days>           — List events from last N days
+    wt calendar import <event>   — Import event as task (prompts for time)
+    wt calendar setup            — Show Google Calendar setup instructions
+
     wt arc setup                 — Set up Arc browser integration
     wt arc status                — Show Arc integration status
     wt arc sync                  — Sync folders with current roles/tasks
@@ -61,7 +66,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -2166,6 +2171,360 @@ def cmd_arc(args):
         sys.exit(1)
 
 
+# ── Google Calendar Integration ───────────────────────────
+
+GCAL_CREDENTIALS_FILE = Path.home() / ".workload_tracker_gcal_credentials.json"
+GCAL_TOKEN_FILE = Path.home() / ".workload_tracker_gcal_token.json"
+
+
+def get_gcal_service():
+    """Get authenticated Google Calendar service.
+
+    Returns the service object or None if not authenticated.
+    """
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError:
+        print(c("Google Calendar API not installed.", "red"))
+        print("Install with: pip install google-api-python-client google-auth-oauthlib")
+        return None
+
+    SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+    creds = None
+
+    # Load existing token
+    if GCAL_TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(GCAL_TOKEN_FILE), SCOPES)
+
+    # Refresh or get new credentials
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not GCAL_CREDENTIALS_FILE.exists():
+                print(c("Google Calendar credentials not found.", "red"))
+                print()
+                print("Setup instructions:")
+                print("  1. Go to https://console.cloud.google.com/")
+                print("  2. Create a project (or select existing)")
+                print("  3. Enable 'Google Calendar API'")
+                print("  4. Go to 'Credentials' > 'Create Credentials' > 'OAuth client ID'")
+                print("  5. Choose 'Desktop app' as application type")
+                print("  6. Download JSON and save to:")
+                print(f"     {GCAL_CREDENTIALS_FILE}")
+                print()
+                print("First run will open browser for authorization.")
+                return None
+
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(GCAL_CREDENTIALS_FILE), SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        # Save token for next time
+        GCAL_TOKEN_FILE.write_text(creds.to_json())
+
+    return build('calendar', 'v3', credentials=creds)
+
+
+def get_calendar_events(days_back: int = 1, calendar_id: str = "primary") -> list[dict]:
+    """Get events from Google Calendar for the specified date range.
+
+    Args:
+        days_back: Number of days to look back (default 1 = yesterday + today)
+        calendar_id: Google Calendar ID (default "primary", or email like "user@domain.com")
+
+    Returns list of event dicts: {title, start_date, end_date, calendar_name, notes, duration_mins, uid}
+    """
+    service = get_gcal_service()
+    if not service:
+        return []
+
+    # Calculate time range
+    now = datetime.now()
+    start_date = (now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    # Convert to RFC3339 format
+    start_str = start_date.isoformat() + 'Z'
+    end_str = end_date.isoformat() + 'Z'
+
+    try:
+        events_result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start_str,
+            timeMax=end_str,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+    except Exception as e:
+        print(c(f"Error fetching calendar: {e}", "red"))
+        return []
+
+    events = []
+    for item in events_result.get('items', []):
+        # Skip all-day events (they have 'date' instead of 'dateTime')
+        start_info = item.get('start', {})
+        end_info = item.get('end', {})
+
+        if 'dateTime' not in start_info:
+            continue  # Skip all-day events
+
+        # Parse timestamps
+        start_dt_str = start_info.get('dateTime', '')
+        end_dt_str = end_info.get('dateTime', '')
+
+        try:
+            # Handle timezone-aware ISO format
+            start_dt = datetime.fromisoformat(start_dt_str.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end_dt_str.replace('Z', '+00:00'))
+
+            # Convert to Unix timestamps
+            start_ts = start_dt.timestamp()
+            end_ts = end_dt.timestamp()
+            duration_mins = (end_ts - start_ts) / 60
+        except (ValueError, TypeError):
+            continue
+
+        events.append({
+            "title": item.get('summary', '(No title)'),
+            "start_date": start_ts,
+            "end_date": end_ts,
+            "calendar_name": calendar_id,
+            "duration_mins": duration_mins,
+            "uid": item.get('id', ''),
+            "notes": item.get('description', ''),
+        })
+
+    return events
+
+
+def cmd_calendar(args):
+    """Import tasks from Google Calendar events."""
+    data = load()
+    config = data.get("config", {})
+
+    # Get calendar ID from config (default to primary)
+    calendar_id = config.get("calendar_id", "primary")
+
+    # Check for subcommand
+    if args and args[0].lower() == "setup":
+        # Show setup instructions
+        print(c("\n  Google Calendar Setup\n", "bold"))
+        print("  1. Go to https://console.cloud.google.com/")
+        print("  2. Create a project (or select existing)")
+        print("  3. Enable 'Google Calendar API'")
+        print("  4. Go to 'Credentials' > 'Create Credentials' > 'OAuth client ID'")
+        print("  5. Choose 'Desktop app' as application type")
+        print("  6. Download JSON and save to:")
+        print(c(f"     {GCAL_CREDENTIALS_FILE}", "cyan"))
+        print()
+        print("  7. Run 'wt calendar' - it will open browser for authorization")
+        print()
+        print("  Optional: Set a specific calendar ID:")
+        print("    wt config calendar_id your.email@gmail.com")
+        print()
+        print(f"  Current calendar: {c(calendar_id, 'cyan')}")
+        print(f"  Credentials file: {'Found' if GCAL_CREDENTIALS_FILE.exists() else c('Not found', 'red')}")
+        print(f"  Token file: {'Found' if GCAL_TOKEN_FILE.exists() else 'Not found'}")
+        print()
+        return
+
+    if args and args[0].lower() == "import":
+        # Import mode: wt calendar import <event-title>
+        if len(args) < 2:
+            print("Usage: wt calendar import <event-title>")
+            sys.exit(1)
+
+        query = " ".join(args[1:])
+
+        # Get events to find a match
+        events = get_calendar_events(days_back=7, calendar_id=calendar_id)  # Search wider range for import
+
+        # Check which events are already imported
+        imported_uids = {t.get("calendar_event_uid") for t in data.get("tasks", [])}
+
+        # Find matching event (case-insensitive partial match)
+        q = query.lower()
+        matches = [e for e in events if q in e["title"].lower() and e["uid"] not in imported_uids]
+
+        if not matches:
+            # Check if it was already imported
+            already = [e for e in events if q in e["title"].lower() and e["uid"] in imported_uids]
+            if already:
+                print(c(f"Event '{already[0]['title']}' was already imported.", "yellow"))
+            else:
+                print(c(f"No matching event found for '{query}'", "red"))
+            sys.exit(1)
+
+        if len(matches) > 1:
+            print(c("Multiple matches found:", "yellow"))
+            for e in matches:
+                start = datetime.fromtimestamp(e["start_date"])
+                print(f"  {start.strftime('%m/%d %H:%M')}  {e['title']} ({fmt_mins(e['duration_mins'])})")
+            print(c("Be more specific.", "dim"))
+            sys.exit(1)
+
+        event = matches[0]
+
+        # Show event details
+        start_dt = datetime.fromtimestamp(event["start_date"])
+        end_dt = datetime.fromtimestamp(event["end_date"])
+        print(c(f"\n  Event: {event['title']}", "bold"))
+        print(f"  Date:     {start_dt.strftime('%Y-%m-%d')}")
+        print(f"  Time:     {start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}")
+        print(f"  Duration: {fmt_mins(event['duration_mins'])}")
+        print(f"  Calendar: {event['calendar_name']}")
+        print()
+
+        # Prompt for role
+        roles = data.get("roles", [])
+        print(c("  Select role:", "bold"))
+        for i, r in enumerate(roles, 1):
+            print(f"    {i}. {r['label']} ({r['id']})")
+        print()
+
+        try:
+            role_choice = input(f"  Role (1-{len(roles)}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        role_id = "other"
+        if role_choice:
+            try:
+                role_idx = int(role_choice) - 1
+                if 0 <= role_idx < len(roles):
+                    role_id = roles[role_idx]["id"]
+            except ValueError:
+                pass
+
+        # Prompt for time logging
+        duration = event["duration_mins"]
+        print()
+        print(f"  Log {fmt_mins(duration)} of time?")
+        try:
+            time_choice = input("  [Y/n/minutes]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        log_minutes = None
+        if time_choice == "" or time_choice == "y":
+            log_minutes = duration
+        elif time_choice != "n":
+            try:
+                log_minutes = float(time_choice)
+            except ValueError:
+                print(c("Invalid input, logging full duration.", "yellow"))
+                log_minutes = duration
+
+        # Create task
+        task = {
+            "id": uid(),
+            "title": event["title"],
+            "description": event.get("notes", ""),
+            "role_id": role_id,
+            "status": "done",  # Calendar events are typically already completed
+            "logs": [],
+            "created_at": time.time(),
+            "calendar_event_uid": event["uid"],
+        }
+
+        # Add time log if requested
+        if log_minutes and log_minutes > 0:
+            task["logs"].append({
+                "id": uid(),
+                "minutes": round(log_minutes, 2),
+                "note": f"From calendar: {event['calendar_name']}",
+                "at": event["end_date"],
+                "started_at": event["start_date"],
+                "ended_at": event["end_date"],
+            })
+
+        data["tasks"].insert(0, task)
+        save(data)
+
+        role_label = get_roles(data).get(role_id, role_id)
+        print(c(f"\n✓ Created: {task['title']}", "green"))
+        print(f"  [{role_label}] [Done]")
+        if log_minutes:
+            print(c(f"  Logged: {fmt_mins(log_minutes)}", "dim"))
+        print(c(f"  id: {task['id']}", "dim"))
+        return
+
+    # List mode: wt calendar [days]
+    days_back = 1  # Default: yesterday and today
+    if args:
+        try:
+            days_back = int(args[0])
+        except ValueError:
+            print(c(f"Invalid number of days: {args[0]}", "red"))
+            sys.exit(1)
+
+    events = get_calendar_events(days_back=days_back, calendar_id=calendar_id)
+
+    if not events:
+        print(c("No calendar events found.", "dim"))
+        print(c(f"  (Calendar: {calendar_id})", "dim"))
+        return
+
+    # Check which events are already imported
+    imported_uids = {t.get("calendar_event_uid") for t in data.get("tasks", [])}
+
+    # Group events by date
+    events_by_date = {}
+    for e in events:
+        date_key = datetime.fromtimestamp(e["start_date"]).strftime("%Y-%m-%d")
+        events_by_date.setdefault(date_key, []).append(e)
+
+    print(c(f"\n  Calendar events (past {days_back} day{'s' if days_back != 1 else ''}):\n", "bold"))
+
+    for date_key in sorted(events_by_date.keys(), reverse=True):
+        date_dt = datetime.strptime(date_key, "%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if date_key == today:
+            date_label = "Today"
+        elif date_key == yesterday:
+            date_label = "Yesterday"
+        else:
+            date_label = date_dt.strftime("%A, %b %d")
+
+        print(c(f"  {date_label}", "cyan", "bold"))
+
+        for e in events_by_date[date_key]:
+            start_time = datetime.fromtimestamp(e["start_date"]).strftime("%H:%M")
+            imported = e["uid"] in imported_uids
+
+            if imported:
+                status = c("✓", "green")
+                title_fmt = c(e["title"][:45], "dim")
+            else:
+                status = " "
+                title_fmt = e["title"][:45]
+
+            duration = fmt_mins(e["duration_mins"])
+            cal_name = c(f"[{e['calendar_name'][:15]}]", "dim")
+
+            print(f"  {status} {start_time}  {title_fmt:<47} {duration:>7}  {cal_name}")
+
+        print()
+
+    # Show help
+    not_imported = len([e for e in events if e["uid"] not in imported_uids])
+    if not_imported > 0:
+        print(c(f"  {not_imported} events available to import.", "dim"))
+        print(c("  Use: wt calendar import <event-title>", "dim"))
+    else:
+        print(c("  All events have been imported.", "dim"))
+    print()
+
+
 def cmd_tabs(args):
     """List or manage tabs for the current task."""
     try:
@@ -2291,6 +2650,8 @@ COMMANDS = {
     "roles": cmd_roles,
     "arc": cmd_arc,
     "tabs": cmd_tabs,
+    "calendar": cmd_calendar,
+    "cal": cmd_calendar,
 }
 
 

@@ -33,6 +33,18 @@ _wt() {
         'status:Show time summary'
         'config:View or set configuration'
         'roles:Manage roles'
+        'calendar:Import tasks from Google Calendar'
+        'cal:Import tasks from Google Calendar'
+        'arc:Arc browser integration'
+        'tabs:Manage task tabs'
+        'presence:Presence detection settings'
+        'rename:Rename a task'
+        'mv:Rename a task'
+        'logs:Show time logs for a task'
+        'edit-log:Edit a log entry'
+        'delete-log:Delete a log entry'
+        'split-log:Split a log entry'
+        'merge-logs:Merge two log entries'
     )
 
     if (( CURRENT == 2 )); then
@@ -88,17 +100,103 @@ for t in data.get('tasks', []):
         roles)
             if (( CURRENT == 3 )); then
                 local -a subcommands
-                subcommands=('add:Add a new role' 'update:Update role label' 'delete:Delete a role')
+                subcommands=('add:Add a new role' 'update:Update role label' 'delete:Delete a role' 'set-repo:Set GitHub repo for role' 'set-activity:Set activity for role' 'set-type:Set type for role')
                 _describe -t subcommands 'roles subcommand' subcommands
             elif (( CURRENT == 4 )); then
                 case "${words[3]}" in
-                    update|delete|del|rm)
+                    update|delete|del|rm|set-repo|set-activity|set-type)
                         local -a roles
                         roles=("${(@f)$(_wt_get_roles)}")
                         compadd "${roles[@]}"
                         ;;
                 esac
             fi
+            ;;
+        calendar|cal)
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('setup:Show setup instructions' 'import:Import a calendar event as task')
+                _describe -t subcommands 'calendar subcommand' subcommands
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    import)
+                        # Show recent calendar event titles
+                        local -a events
+                        local wt_dir="${0:A:h}"
+                        local venv_python="${wt_dir}/venv/bin/python"
+                        [[ -x "$venv_python" ]] || venv_python="python3"
+                        events=("${(@f)$($venv_python -c "
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+
+# Load config for calendar_id
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+calendar_id = data.get('config', {}).get('calendar_id', 'primary')
+imported_uids = {t.get('calendar_event_uid') for t in data.get('tasks', [])}
+
+# Try to get events from Google Calendar
+try:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    token_file = Path.home() / '.workload_tracker_gcal_token.json'
+    if token_file.exists():
+        creds = Credentials.from_authorized_user_file(str(token_file))
+        service = build('calendar', 'v3', credentials=creds)
+
+        now = datetime.now()
+        start = (now - timedelta(days=7)).isoformat() + 'Z'
+        end = now.replace(hour=23, minute=59).isoformat() + 'Z'
+
+        result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start, timeMax=end,
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+
+        for item in result.get('items', []):
+            if 'dateTime' in item.get('start', {}) and item.get('id') not in imported_uids:
+                print(item.get('summary', ''))
+except:
+    pass
+" 2>/dev/null)}")
+                        compadd "${events[@]}"
+                        ;;
+                esac
+            fi
+            ;;
+        arc)
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('setup:Set up Arc integration' 'status:Show Arc status' 'sync:Sync folders' 'spaces:List Arc spaces' 'link:Link to existing space')
+                _describe -t subcommands 'arc subcommand' subcommands
+            fi
+            ;;
+        tabs)
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('list:List tabs in current task folder' 'cleanup:Clean up unrelated tabs' 'restore:Restore archived tabs')
+                _describe -t subcommands 'tabs subcommand' subcommands
+            fi
+            ;;
+        presence)
+            if (( CURRENT == 3 )); then
+                local -a options
+                options=('on:Enable presence detection' 'off:Disable presence detection')
+                _describe -t options 'presence option' options
+            fi
+            ;;
+        rename|mv|logs|edit-log|delete-log|split-log|merge-logs)
+            local -a tasks
+            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+            compadd -Q "${tasks[@]}"
             ;;
     esac
 }
