@@ -1694,7 +1694,29 @@ class WorkloadTracker(App):
         self._build_table()
         self._refresh_sidebar()
         self._refresh_overview()
+        self._focus_running_task()
         self.set_interval(1, self._tick)
+
+    def _focus_running_task(self):
+        """Focus on the currently running task, or the first task if none running."""
+        table = self.query_one("#task-table", DataTable)
+        if table.row_count == 0:
+            return
+
+        # Check if there's an active timer
+        active_timer = self._data.get("active_timer")
+        if active_timer:
+            task_id = active_timer.get("task_id")
+            # Find the row with this task
+            for idx, row_key in enumerate(table.rows.keys()):
+                if row_key.value == task_id:
+                    table.cursor_coordinate = (idx, 0)
+                    table.focus()
+                    return
+
+        # No running task or not found, focus on first row
+        table.cursor_coordinate = (0, 0)
+        table.focus()
 
     # ── Table ──────────────────────────────────────────────
 
