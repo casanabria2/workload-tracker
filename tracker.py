@@ -10,6 +10,8 @@ Keyboard shortcuts:
   t        — Toggle timer on selected task
   l        — Manage time logs (add/edit/delete/split/merge)
   s        — Cycle status of selected task
+  g        — Create and link GitHub issue
+  o        — Open linked GitHub issue in browser
   c        — Import from Google Calendar
   a        — Toggle showing done tasks
   1-4      — Filter by role (1=DemoKit, 2=Demos, 3=Strategic, 4=Other, 0=All)
@@ -25,6 +27,7 @@ Notes column indicators:
 
 import json
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -41,7 +44,13 @@ from textual.widgets import (
 from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
-from wt import get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, sync_project_status, get_role_activity, update_project_activity, get_calendar_events, get_gcal_service, GCAL_CREDENTIALS_FILE
+from wt import (
+    get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue,
+    sync_project_status, get_role_activity, update_project_activity, get_calendar_events,
+    get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
+    task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
+    get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint
+)
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -87,6 +96,19 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
+    """Save data to disk, preserving roles and config from disk if modified externally."""
+    # Reload roles and config from disk to preserve external changes (e.g., from CLI)
+    if DATA_FILE.exists():
+        try:
+            disk_data = json.loads(DATA_FILE.read_text())
+            # Preserve roles from disk (CLI may have modified them)
+            if "roles" in disk_data:
+                data["roles"] = disk_data["roles"]
+            # Preserve config from disk
+            if "config" in disk_data:
+                data["config"] = disk_data["config"]
+        except Exception:
+            pass  # If we can't read, just save what we have
     DATA_FILE.write_text(json.dumps(data, indent=2))
 
 
@@ -316,7 +338,7 @@ class ConfirmCreateIssueModal(ModalScreen):
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(False)
-        elif event.key == "y":
+        elif event.key in ("y", "enter"):
             self.dismiss(True)
 
     @on(Button.Pressed, "#btn-create")
@@ -324,6 +346,258 @@ class ConfirmCreateIssueModal(ModalScreen):
         self.dismiss(True)
 
     @on(Button.Pressed, "#btn-cancel-issue")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Create GitHub Issue
+# ──────────────────────────────────────────────────────────
+
+class CreateIssueModal(ModalScreen):
+    """Modal to confirm creating a GitHub issue."""
+    CSS = """
+    CreateIssueModal { align: center middle; }
+    #create-issue-box {
+        width: 65;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #create-issue-box Label { margin-bottom: 1; }
+    #create-issue-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, repo: str, logged_mins: float = 0,
+                 activity: str = None, sprint: str = None, status: str = "todo"):
+        super().__init__()
+        self._task_title = task_title
+        self._repo = repo
+        self._logged_mins = logged_mins
+        self._activity = activity
+        self._sprint = sprint
+        self._status = status
+
+    def compose(self) -> ComposeResult:
+        hours = mins_to_quarter_hours(self._logged_mins) if self._logged_mins > 0 else 0
+        with Container(id="create-issue-box"):
+            yield Label("[bold]Create GitHub Issue[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label(f"Repo: [cyan]{self._repo}[/]")
+            yield Label("")
+            yield Label("[bold]Project fields:[/]")
+            yield Label(f"  Status: [cyan]{self._status}[/]")
+            if self._activity:
+                yield Label(f"  Activity: [cyan]{self._activity}[/]")
+            if self._sprint:
+                yield Label(f"  Sprint: [cyan]{self._sprint}[/]")
+            if self._logged_mins > 0:
+                yield Label(f"  Hours: [green]{hours}h[/] ({fmt_mins(self._logged_mins)})")
+            yield Label("")
+            with Horizontal(id="create-issue-actions"):
+                yield Button("Create  [y]", variant="primary", id="btn-create-issue")
+                yield Button("Cancel  [esc]", id="btn-cancel-create")
+
+    def on_mount(self):
+        self.query_one("#btn-create-issue").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key in ("y", "enter"):
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-create-issue")
+    def create(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-create")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Sync GitHub Issue to Project
+# ──────────────────────────────────────────────────────────
+
+class SyncIssueModal(ModalScreen):
+    """Modal to confirm syncing project fields for an existing issue."""
+    CSS = """
+    SyncIssueModal { align: center middle; }
+    #sync-issue-box {
+        width: 65;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #sync-issue-box Label { margin-bottom: 1; }
+    #sync-issue-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, issue_ref: str, status: str,
+                 activity: str = None, sprint: str = None, hours: float = 0):
+        super().__init__()
+        self._task_title = task_title
+        self._issue_ref = issue_ref
+        self._status = status
+        self._activity = activity
+        self._sprint = sprint
+        self._hours = hours
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sync-issue-box"):
+            yield Label("[bold]Sync Project Fields[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label(f"Issue: [cyan]{self._issue_ref}[/]")
+            yield Label("")
+            yield Label("[bold]Will update:[/]")
+            yield Label(f"  Status: [cyan]{self._status}[/]")
+            if self._activity:
+                yield Label(f"  Activity: [cyan]{self._activity}[/]")
+            if self._sprint:
+                yield Label(f"  Sprint: [cyan]{self._sprint}[/]")
+            if self._hours > 0:
+                yield Label(f"  Hours: [green]{self._hours}h[/]")
+            yield Label("")
+            with Horizontal(id="sync-issue-actions"):
+                yield Button("Sync  [y]", variant="primary", id="btn-sync-issue")
+                yield Button("Cancel  [esc]", id="btn-cancel-sync")
+
+    def on_mount(self):
+        self.query_one("#btn-sync-issue").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key in ("y", "enter"):
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-sync-issue")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-sync")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Close Task (with hours comparison)
+# ──────────────────────────────────────────────────────────
+
+class ConfirmCloseTaskModal(ModalScreen):
+    """Modal to confirm closing a task, showing local vs GH hours."""
+    CSS = """
+    ConfirmCloseTaskModal { align: center middle; }
+    #close-task-box {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #close-task-box Label { margin-bottom: 1; }
+    #close-task-actions { margin-top: 1; }
+    .hours-row { margin-bottom: 1; }
+    """
+
+    def __init__(self, task_title: str, local_mins: float, gh_hours: float | None):
+        super().__init__()
+        self._task_title = task_title
+        self._local_mins = local_mins
+        self._gh_hours = gh_hours
+
+    def compose(self) -> ComposeResult:
+        local_hours = mins_to_quarter_hours(self._local_mins) if self._local_mins > 0 else 0
+        with Container(id="close-task-box"):
+            yield Label("[bold]Close Task?[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label("")
+            yield Label(f"[bold]Local logged:[/] {fmt_mins(self._local_mins)} → [green]{local_hours}h[/]", classes="hours-row")
+            if self._gh_hours is not None:
+                yield Label(f"[bold]GitHub project:[/] [cyan]{self._gh_hours}h[/]", classes="hours-row")
+                if local_hours != self._gh_hours:
+                    yield Label(f"[yellow]Hours will be updated to {local_hours}h[/]")
+            else:
+                yield Label("[dim]Not in GitHub project yet[/]", classes="hours-row")
+            yield Label("")
+            with Horizontal(id="close-task-actions"):
+                yield Button("Close Task  [y]", variant="primary", id="btn-close-task")
+                yield Button("Cancel  [esc]", id="btn-cancel-close")
+
+    def on_mount(self):
+        self.query_one("#btn-close-task").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key in ("y", "enter"):
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-close-task")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-close")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Close (No GitHub)
+# ──────────────────────────────────────────────────────────
+
+class ConfirmCloseNoGitHubModal(ModalScreen):
+    """Modal to confirm closing a task without GitHub integration."""
+    CSS = """
+    ConfirmCloseNoGitHubModal { align: center middle; }
+    #close-no-gh-box {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: tall $warning;
+        padding: 1 2;
+    }
+    #close-no-gh-box Label { margin-bottom: 1; }
+    #close-no-gh-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, logged_mins: float):
+        super().__init__()
+        self._task_title = task_title
+        self._logged_mins = logged_mins
+
+    def compose(self) -> ComposeResult:
+        with Container(id="close-no-gh-box"):
+            yield Label("[bold yellow]Close Without GitHub?[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label("")
+            yield Label(f"[bold]Logged:[/] {fmt_mins(self._logged_mins)}")
+            yield Label("")
+            yield Label("[yellow]No GitHub issue linked.[/]")
+            yield Label("[yellow]No repo configured for this role.[/]")
+            yield Label("[dim]Time will only be recorded locally.[/]")
+            yield Label("")
+            with Horizontal(id="close-no-gh-actions"):
+                yield Button("Close Anyway  [y]", variant="warning", id="btn-close-no-gh")
+                yield Button("Cancel  [esc]", id="btn-cancel-no-gh")
+
+    def on_mount(self):
+        self.query_one("#btn-close-no-gh").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key in ("y", "enter"):
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-close-no-gh")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-no-gh")
     def cancel(self):
         self.dismiss(False)
 
@@ -366,7 +640,7 @@ class ConfirmDeleteModal(ModalScreen):
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(False)
-        elif event.key == "y":
+        elif event.key in ("y", "enter"):
             self.dismiss(True)
 
     @on(Button.Pressed, "#btn-confirm")
@@ -683,7 +957,7 @@ class ConfirmDeleteLogModal(ModalScreen):
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(False)
-        elif event.key == "y":
+        elif event.key in ("y", "enter"):
             self.dismiss(True)
 
     @on(Button.Pressed, "#btn-confirm-del")
@@ -1355,6 +1629,8 @@ class WorkloadTracker(App):
         Binding("t",   "toggle_timer","Timer"),
         Binding("l",   "log_time",    "Manage logs"),
         Binding("s",   "cycle_status","Cycle status"),
+        Binding("g",   "link_github", "GitHub"),
+        Binding("o",   "open_github", "Open issue"),
         Binding("c",   "import_calendar", "Calendar"),
         Binding("a",   "toggle_show_done", "Show done"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
@@ -1382,6 +1658,9 @@ class WorkloadTracker(App):
         yield Header(show_clock=True)
         with Horizontal(id="main"):
             with Vertical(id="sidebar"):
+                yield Label("TODAY'S WORK")
+                yield Static(id="sidebar-today")
+                yield Label("─" * 20)
                 yield Label("TIME BY ROLE")
                 yield Static(id="sidebar-stats")
                 yield Label("─" * 20)
@@ -1492,6 +1771,22 @@ class WorkloadTracker(App):
     # ── Sidebar & Overview ────────────────────────────────
 
     def _refresh_sidebar(self):
+        # Today's work section
+        today_work = self._get_today_work()
+        today_total = sum(mins for _, mins, _ in today_work)
+        today_lines = []
+        if today_work:
+            today_lines.append(f"[bold]{fmt_mins(today_total)}[/] total\n")
+            for title, mins, is_running in today_work[:6]:  # Show top 6
+                prefix = "[green]▶[/] " if is_running else "  "
+                today_lines.append(f"{prefix}{title[:16]}\n    {fmt_mins(mins)}")
+            if len(today_work) > 6:
+                today_lines.append(f"\n  [dim]+{len(today_work) - 6} more...[/]")
+        else:
+            today_lines.append("[dim]No work logged today[/]")
+        self.query_one("#sidebar-today", Static).update("\n".join(today_lines))
+
+        # Time by role section
         by_role = self._mins_by_role()
         total = sum(by_role.values())
         roles = get_roles(self._data)
@@ -1552,6 +1847,37 @@ class WorkloadTracker(App):
     def _is_running(self, task: dict) -> bool:
         at = self._data.get("active_timer")
         return bool(at and at.get("task_id") == task["id"])
+
+    def _get_today_work(self) -> list[tuple[str, float, bool]]:
+        """Get tasks worked on today with their minutes logged today.
+
+        Returns list of (task_title, minutes_today, is_running) tuples.
+        """
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        active_timer = self._data.get("active_timer")
+        result = []
+
+        for task in self._data.get("tasks", []):
+            # Sum logs from today
+            today_mins = 0.0
+            for log in task.get("logs", []):
+                log_time = log.get("at", 0)
+                if log_time >= today_start:
+                    today_mins += log.get("minutes", 0)
+
+            # Add live timer if running and started today
+            is_running = self._is_running(task)
+            if is_running and active_timer:
+                started = active_timer.get("started_at", 0)
+                if started >= today_start:
+                    today_mins += (time.time() - started) / 60
+
+            if today_mins > 0:
+                result.append((task["title"], today_mins, is_running))
+
+        # Sort by minutes descending
+        result.sort(key=lambda x: x[1], reverse=True)
+        return result
 
     # ── Tick ──────────────────────────────────────────────
 
@@ -1615,6 +1941,10 @@ class WorkloadTracker(App):
         self._data["active_timer"] = None
         save_data(self._data)
 
+        # Sync hours to GitHub project if task has linked issue
+        if task.get("github_issue"):
+            self._sync_task_hours_async(task)
+
         # Notify user
         idle_mins = int(idle_seconds / 60)
         self.notify(
@@ -1622,6 +1952,18 @@ class WorkloadTracker(App):
             severity="warning",
             timeout=10
         )
+
+    @work(thread=True)
+    def _sync_task_hours_async(self, task: dict):
+        """Sync task hours to GitHub project in background thread."""
+        issue_ref = task.get("github_issue")
+        if not issue_ref:
+            return
+        if sync_project_hours(issue_ref, task, self._data, save_data):
+            hours = mins_to_quarter_hours(task_logged_mins(task))
+            self.call_from_thread(
+                self.notify, f"Synced {hours}h to {issue_ref}", severity="information"
+            )
 
     # ── Actions ───────────────────────────────────────────
 
@@ -1723,8 +2065,8 @@ class WorkloadTracker(App):
             )
 
     @work(thread=True)
-    def _create_github_issue_for_task(self, task: dict):
-        """Create GitHub issue for a new task in background thread."""
+    def _create_github_issue_for_task(self, task: dict, refresh_ui: bool = False):
+        """Create GitHub issue for a task and set up project fields in background thread."""
         repo = get_role_repo(task, self._data)
         if not repo:
             self.call_from_thread(
@@ -1732,16 +2074,126 @@ class WorkloadTracker(App):
             )
             return
         try:
+            # Create the issue
             issue_ref = create_github_issue(task, repo)
             task["github_issue"] = issue_ref
             save_data(self._data)
             self.call_from_thread(
                 self.notify, f"Created issue: {issue_ref}", severity="information"
             )
+
+            # Set up project fields (status, activity, sprint, hours)
+            result = setup_issue_in_project(issue_ref, task, self._data)
+            if result["success"]:
+                save_data(self._data)  # Save uploaded_at markers
+                hours = mins_to_quarter_hours(task_logged_mins(task))
+                self.call_from_thread(
+                    self.notify, f"Added to project: {hours}h", severity="information"
+                )
+            elif result["errors"]:
+                self.call_from_thread(
+                    self.notify, f"Project setup: {', '.join(result['errors'])}", severity="warning"
+                )
+
+            if refresh_ui:
+                self.call_from_thread(self._populate_table)
         except Exception as e:
             self.call_from_thread(
                 self.notify, f"Failed to create issue: {e}", severity="error"
             )
+
+    def action_link_github(self):
+        """Create and link a GitHub issue, or sync project fields if already linked."""
+        task = self._selected_task()
+        if not task:
+            return
+
+        if task.get("github_issue"):
+            # Issue exists - offer to sync project fields
+            self._sync_existing_issue(task)
+            return
+
+        repo = get_role_repo(task, self._data)
+        if not repo:
+            self.notify("No GitHub repo configured for this role", severity="warning")
+            return
+        # Show modal with project field preview
+        logged_mins = task_logged_mins(task)
+        activity = get_role_activity(task, self._data)
+        sprint = get_current_sprint(self._data)
+        sprint_title = sprint["title"] if sprint else None
+        status = task.get("status", "todo")
+        self.push_screen(
+            CreateIssueModal(task["title"], repo, logged_mins, activity, sprint_title, status),
+            lambda confirmed: self._on_create_issue_confirmed(task, confirmed)
+        )
+
+    def _sync_existing_issue(self, task: dict):
+        """Sync project fields for an existing GitHub issue."""
+        logged_mins = task_logged_mins(task)
+        activity = get_role_activity(task, self._data)
+        sprint = get_current_sprint(self._data)
+        sprint_title = sprint["title"] if sprint else None
+        status = task.get("status", "todo")
+        hours = mins_to_quarter_hours(logged_mins) if logged_mins > 0 else 0
+
+        self.push_screen(
+            SyncIssueModal(task["title"], task["github_issue"], status, activity, sprint_title, hours),
+            lambda confirmed: self._on_sync_issue_confirmed(task, confirmed)
+        )
+
+    def _on_sync_issue_confirmed(self, task: dict, confirmed: bool):
+        """Callback after sync confirmation."""
+        if not confirmed:
+            return
+        self._sync_issue_to_project(task)
+
+    @work(thread=True)
+    def _sync_issue_to_project(self, task: dict):
+        """Sync all project fields for an existing issue."""
+        issue_ref = task.get("github_issue")
+        if not issue_ref:
+            return
+
+        result = setup_issue_in_project(issue_ref, task, self._data)
+        if result["success"]:
+            save_data(self._data)
+            hours = mins_to_quarter_hours(task_logged_mins(task))
+            sprint = get_current_sprint(self._data)
+            sprint_title = sprint["title"] if sprint else "N/A"
+            self.call_from_thread(
+                self.notify, f"Synced to project: {hours}h, {sprint_title}", severity="information"
+            )
+            self.call_from_thread(self._populate_table)
+        else:
+            self.call_from_thread(
+                self.notify, f"Sync errors: {', '.join(result['errors'])}", severity="warning"
+            )
+
+    def _on_create_issue_confirmed(self, task: dict, confirmed: bool):
+        """Callback after issue creation confirmation."""
+        if not confirmed:
+            return  # User cancelled
+        self._create_github_issue_for_task(task, refresh_ui=True)
+
+    def action_open_github(self):
+        """Open the linked GitHub issue in the default browser."""
+        task = self._selected_task()
+        if not task:
+            return
+        issue_ref = task.get("github_issue")
+        if not issue_ref:
+            self.notify("No GitHub issue linked to this task", severity="warning")
+            return
+        # Parse issue_ref (e.g., "owner/repo#123") to URL
+        if "#" in issue_ref:
+            repo_part, issue_num = issue_ref.rsplit("#", 1)
+            url = f"https://github.com/{repo_part}/issues/{issue_num}"
+        else:
+            self.notify(f"Invalid issue reference: {issue_ref}", severity="error")
+            return
+        webbrowser.open(url)
+        self.notify(f"Opened: {issue_ref}", severity="information")
 
     def action_delete_task(self):
         task = self._selected_task()
@@ -1785,6 +2237,10 @@ class WorkloadTracker(App):
             self._data["active_timer"] = None
             save_data(self._data)
 
+            # Sync hours to GitHub project if task has linked issue
+            if task.get("github_issue"):
+                self._sync_task_hours_async(task)
+
             # Arc integration: tab cleanup
             self._arc_tab_cleanup(task)
         else:
@@ -1803,6 +2259,11 @@ class WorkloadTracker(App):
                             "started_at": started_at, "ended_at": ended_at
                         })
                     stopped_task = prev
+                    save_data(self._data)
+                    # Sync hours for the stopped task
+                    if prev.get("github_issue"):
+                        self._sync_task_hours_async(prev)
+
             self._data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
             save_data(self._data)
 
@@ -1921,24 +2382,77 @@ class WorkloadTracker(App):
         # Check if role has a GitHub repo
         repo = get_role_repo(task, self._data)
 
-        if not repo:
-            # No GitHub integration - just close
-            task["status"] = "done"
-            save_data(self._data)
-            self._populate_table()
-            self.notify(f"Closed: {task['title']}", severity="information")
-            self._arc_on_task_completed(task)
+        # If task already has a GitHub issue, always show confirmation and update project
+        if task.get("github_issue"):
+            self._fetch_gh_hours_and_confirm_close(task)
             return
 
-        # If task has no GitHub issue, prompt to create one
-        if not task.get("github_issue"):
+        # Task has no GitHub issue - check if role has a repo to create one
+        if repo:
+            # Prompt to create issue with project field preview
+            logged_mins = task_logged_mins(task)
+            activity = get_role_activity(task, self._data)
+            sprint = get_current_sprint(self._data)
+            sprint_title = sprint["title"] if sprint else None
             self.push_screen(
-                ConfirmCreateIssueModal(task["title"], repo),
-                lambda create: self._on_create_issue_response(task, repo, create)
+                CreateIssueModal(task["title"], repo, logged_mins, activity, sprint_title, "done"),
+                lambda confirmed: self._on_create_issue_for_close(task, repo, confirmed)
             )
         else:
-            # Has issue, proceed with closing
-            self._complete_close_workflow(task)
+            # No GitHub integration - confirm before closing
+            logged_mins = task_logged_mins(task)
+            self.push_screen(
+                ConfirmCloseNoGitHubModal(task["title"], logged_mins),
+                lambda confirmed: self._on_close_no_github_confirmed(task, confirmed)
+            )
+
+    def _on_close_no_github_confirmed(self, task: dict, confirmed: bool):
+        """Handle confirmation for closing task without GitHub integration."""
+        if not confirmed:
+            return
+        task["status"] = "done"
+        save_data(self._data)
+        self._populate_table()
+        self._refresh_sidebar()
+        self._refresh_overview()
+        self.notify(f"Closed: {task['title']}", severity="information")
+        self._arc_on_task_completed(task)
+
+    def _fetch_gh_hours_and_confirm_close(self, task: dict):
+        """Fetch GitHub hours in background, then show confirmation modal."""
+        self._fetch_gh_hours_worker(task)
+
+    @work(thread=True)
+    def _fetch_gh_hours_worker(self, task: dict):
+        """Fetch GitHub project hours in background."""
+        gh_hours = None
+        if task.get("github_issue"):
+            gh_hours = get_project_hours(task["github_issue"], self._data)
+
+        local_mins = task_logged_mins(task)
+        self.call_from_thread(self._show_close_confirmation, task, local_mins, gh_hours)
+
+    def _show_close_confirmation(self, task: dict, local_mins: float, gh_hours: float | None):
+        """Show the close confirmation modal with hours comparison."""
+        self.push_screen(
+            ConfirmCloseTaskModal(task["title"], local_mins, gh_hours),
+            lambda confirmed: self._on_close_confirmed(task, confirmed)
+        )
+
+    def _on_close_confirmed(self, task: dict, confirmed: bool):
+        """Handle close confirmation response."""
+        if not confirmed:
+            return
+        self._complete_close_workflow(task)
+
+    def _on_create_issue_for_close(self, task: dict, repo: str, confirmed: bool):
+        """Handle response from create issue modal during close workflow."""
+        if not confirmed:
+            self.notify("Task must have GitHub issue to close (role requires it)", severity="warning")
+            return
+
+        # Run blocking GitHub operations in a worker thread
+        self._run_close_workflow(task, repo, create_issue=True)
 
     def _on_create_issue_response(self, task: dict, repo: str, create: bool):
         """Handle response from create issue modal."""
@@ -1959,6 +2473,11 @@ class WorkloadTracker(App):
                 task["github_issue"] = issue_ref
                 save_data(self._data)
                 self.call_from_thread(self.notify, f"Created issue: {issue_ref}", severity="information")
+
+                # Set up project fields for new issue (status, activity, sprint, hours)
+                result = setup_issue_in_project(issue_ref, task, self._data)
+                if result["success"]:
+                    save_data(self._data)
             except Exception as e:
                 self.call_from_thread(self.notify, f"Failed to create issue: {e}", severity="error")
                 return
@@ -1967,17 +2486,22 @@ class WorkloadTracker(App):
         config = self._data.get("config", {})
         if config.get("github_project_number"):
             try:
-                total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
-                hours = round(total_mins / 60)
+                total_mins = task_logged_mins(task)
+                hours = mins_to_quarter_hours(total_mins)
                 add_to_project_and_update(task["github_issue"], hours, self._data)
+
+                # Mark logs as uploaded
+                from wt import mark_logs_uploaded
+                mark_logs_uploaded(task)
+                save_data(self._data)
 
                 # Set activity if role has one configured
                 activity = get_role_activity(task, self._data)
                 if activity:
                     update_project_activity(task["github_issue"], activity, self._data)
-                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}, Activity: {activity})", severity="information")
+                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Activity: {activity})", severity="information")
                 else:
-                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours})", severity="information")
+                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h)", severity="information")
             except Exception as e:
                 self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
 

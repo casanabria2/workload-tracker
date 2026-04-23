@@ -137,6 +137,49 @@ def task_logged_mins(task: dict) -> float:
     return sum(l.get("minutes", 0) for l in task.get("logs", []))
 
 
+def task_uploaded_mins(task: dict) -> float:
+    """Sum of minutes from logs that have been uploaded to GitHub."""
+    return sum(l.get("minutes", 0) for l in task.get("logs", []) if l.get("uploaded_at"))
+
+
+def task_pending_upload_mins(task: dict) -> float:
+    """Sum of minutes from logs that haven't been uploaded to GitHub."""
+    return sum(l.get("minutes", 0) for l in task.get("logs", []) if not l.get("uploaded_at"))
+
+
+def round_to_quarter_hours(mins: float) -> float:
+    """Round minutes up to nearest 15 minutes (0.25 hours).
+
+    Examples:
+        1 min -> 15 min (0.25 hours)
+        15 min -> 15 min (0.25 hours)
+        16 min -> 30 min (0.5 hours)
+        45 min -> 45 min (0.75 hours)
+        46 min -> 60 min (1 hour)
+    """
+    import math
+    quarters = math.ceil(mins / 15)
+    return quarters * 15
+
+
+def mins_to_quarter_hours(mins: float) -> float:
+    """Convert minutes to hours, rounded up to nearest 0.25."""
+    rounded_mins = round_to_quarter_hours(mins)
+    return rounded_mins / 60
+
+
+def mark_logs_uploaded(task: dict, up_to_time: float = None) -> int:
+    """Mark all unuploaded logs as uploaded. Returns count of logs marked."""
+    import time as _time
+    up_to_time = up_to_time or _time.time()
+    count = 0
+    for log in task.get("logs", []):
+        if not log.get("uploaded_at"):
+            log["uploaded_at"] = up_to_time
+            count += 1
+    return count
+
+
 def task_live_mins(task: dict, at) -> float:
     if at and at.get("task_id") == task["id"]:
         return (time.time() - at["started_at"]) / 60
@@ -285,7 +328,7 @@ PROJECT_STATUS_MAP = {
 def get_project_info(data: dict) -> dict:
     """Get project ID and field information.
 
-    Returns dict with project_id, status_field, hours_field, status_options.
+    Returns dict with project_id, status_field, hours_field, status_options, etc.
     Raises Exception if project not configured or fields missing.
     """
     config = data.get("config", {})
@@ -322,7 +365,7 @@ def get_project_info(data: dict) -> dict:
     status_field = fields.get("Status", {})
     hours_field = fields.get("Hours", {})
     activity_field = fields.get("Activity", {})
-    type_field = fields.get("Type", {})
+    sprint_field = fields.get("Sprint", {})
 
     if not status_field.get("id"):
         raise Exception("Project missing 'Status' field")
@@ -337,11 +380,6 @@ def get_project_info(data: dict) -> dict:
     for opt in activity_field.get("options", []):
         activity_options[opt.get("name")] = opt.get("id")
 
-    # Build type options map
-    type_options = {}
-    for opt in type_field.get("options", []):
-        type_options[opt.get("name")] = opt.get("id")
-
     return {
         "owner": owner,
         "project_num": project_num,
@@ -349,11 +387,104 @@ def get_project_info(data: dict) -> dict:
         "status_field": status_field,
         "hours_field": hours_field,
         "activity_field": activity_field,
-        "type_field": type_field,
+        "sprint_field": sprint_field,
         "status_options": status_options,
         "activity_options": activity_options,
-        "type_options": type_options,
     }
+
+
+def get_current_sprint(data: dict) -> dict | None:
+    """Get the current sprint iteration based on today's date.
+
+    Returns dict with id, title, startDate, duration or None if not found.
+    """
+    from datetime import datetime, timedelta
+
+    config = data.get("config", {})
+    owner = config.get("github_project_owner", "grafana")
+    project_num = config.get("github_project_number")
+
+    if not project_num:
+        return None
+
+    # Query sprint iterations via GraphQL
+    query = f'''query {{
+        organization(login: "{owner}") {{
+            projectV2(number: {project_num}) {{
+                field(name: "Sprint") {{
+                    ... on ProjectV2IterationField {{
+                        id
+                        name
+                        configuration {{
+                            iterations {{
+                                id
+                                title
+                                startDate
+                                duration
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}'''
+
+    result = subprocess.run([
+        "gh", "api", "graphql", "-f", f"query={query}"
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        response = json.loads(result.stdout)
+        field = response.get("data", {}).get("organization", {}).get("projectV2", {}).get("field", {})
+        iterations = field.get("configuration", {}).get("iterations", [])
+
+        today = datetime.now().date()
+
+        for iteration in iterations:
+            start_date = datetime.strptime(iteration["startDate"], "%Y-%m-%d").date()
+            end_date = start_date + timedelta(days=iteration["duration"])
+
+            if start_date <= today < end_date:
+                return {
+                    "id": iteration["id"],
+                    "title": iteration["title"],
+                    "startDate": iteration["startDate"],
+                    "duration": iteration["duration"],
+                    "field_id": field.get("id"),
+                }
+
+        return None
+    except Exception:
+        return None
+
+
+def update_project_sprint(issue_ref: str, sprint_id: str, sprint_field_id: str, data: dict) -> bool:
+    """Update Sprint field for an issue in the project.
+
+    Returns True on success, False if project not configured or field missing.
+    """
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False
+
+    try:
+        project_info = get_project_info(data)
+        item_id = add_issue_to_project(issue_ref, data)
+
+        result = subprocess.run([
+            "gh", "project", "item-edit",
+            "--project-id", project_info["project_id"],
+            "--id", item_id,
+            "--field-id", sprint_field_id,
+            "--iteration-id", sprint_id
+        ], capture_output=True, text=True)
+
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def add_issue_to_project(issue_ref: str, data: dict) -> str:
@@ -471,40 +602,6 @@ def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
         return False
 
 
-def update_project_type(issue_ref: str, type_val: str, data: dict) -> bool:
-    """Update Type field for an issue in the project.
-
-    Returns True on success, False if project not configured or field/option missing.
-    """
-    config = data.get("config", {})
-    if not config.get("github_project_number"):
-        return False
-
-    try:
-        project_info = get_project_info(data)
-        item_id = add_issue_to_project(issue_ref, data)
-
-        type_field = project_info.get("type_field", {})
-        if not type_field.get("id"):
-            return False  # No Type field
-
-        option_id = project_info["type_options"].get(type_val)
-        if not option_id:
-            return False  # Type option not found
-
-        result = subprocess.run([
-            "gh", "project", "item-edit",
-            "--project-id", project_info["project_id"],
-            "--id", item_id,
-            "--field-id", type_field["id"],
-            "--single-select-option-id", option_id
-        ], capture_output=True, text=True)
-
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
 def update_project_hours(issue_ref: str, hours: int, data: dict) -> bool:
     """Update Hours field for an issue in the project.
 
@@ -547,6 +644,164 @@ def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
     update_project_hours(issue_ref, hours, data)
 
     return {"success": True}
+
+
+def get_project_hours(issue_ref: str, data: dict) -> float | None:
+    """Get the current Hours value for an issue in the project.
+
+    Returns the hours value or None if not found/not in project.
+    """
+    config = data.get("config", {})
+    owner = config.get("github_project_owner", "grafana")
+    project_num = config.get("github_project_number")
+
+    if not project_num:
+        return None
+
+    # Convert to int for comparison (config may store as string)
+    try:
+        project_num_int = int(project_num)
+    except (ValueError, TypeError):
+        return None
+
+    try:
+        # Get issue's project items
+        issue_url = f"https://github.com/{issue_ref.replace('#', '/issues/')}"
+        query = f'''query {{
+            resource(url: "{issue_url}") {{
+                ... on Issue {{
+                    projectItems(first: 10) {{
+                        nodes {{
+                            project {{ number }}
+                            fieldValueByName(name: "Hours") {{
+                                ... on ProjectV2ItemFieldNumberValue {{
+                                    number
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}'''
+        result = subprocess.run([
+            "gh", "api", "graphql", "-f", f"query={query}"
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return None
+
+        response = json.loads(result.stdout)
+        items = response.get("data", {}).get("resource", {}).get("projectItems", {}).get("nodes", [])
+
+        for item in items:
+            if item.get("project", {}).get("number") == project_num_int:
+                field_value = item.get("fieldValueByName")
+                if field_value:
+                    return field_value.get("number", 0)
+                return 0
+
+        return None  # Issue not in project
+    except Exception:
+        return None
+
+
+def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
+    """Add issue to project and set up all fields (Status, Activity, Sprint, Hours).
+
+    Args:
+        issue_ref: GitHub issue reference (owner/repo#number)
+        task: Task dict with role_id, status, logs
+        data: Full data dict with config and roles
+
+    Returns dict with success status and any errors.
+    """
+    result = {"success": False, "errors": []}
+
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        result["errors"].append("Project not configured")
+        return result
+
+    try:
+        # Add to project (idempotent)
+        add_issue_to_project(issue_ref, data)
+
+        # Sync status
+        status = task.get("status", "todo")
+        if not sync_project_status(issue_ref, status, data):
+            result["errors"].append("Failed to set status")
+
+        # Set activity based on role
+        activity = get_role_activity(task, data)
+        if activity:
+            if not update_project_activity(issue_ref, activity, data):
+                result["errors"].append(f"Failed to set activity: {activity}")
+
+        # Set sprint to current sprint
+        current_sprint = get_current_sprint(data)
+        if current_sprint:
+            if not update_project_sprint(issue_ref, current_sprint["id"], current_sprint["field_id"], data):
+                result["errors"].append(f"Failed to set sprint: {current_sprint['title']}")
+
+        # Set hours (rounded to 0.25 hours)
+        total_mins = task_logged_mins(task)
+        if total_mins > 0:
+            hours = mins_to_quarter_hours(total_mins)
+            if not update_project_hours(issue_ref, hours, data):
+                result["errors"].append("Failed to set hours")
+            else:
+                # Mark logs as uploaded
+                mark_logs_uploaded(task)
+
+        result["success"] = len(result["errors"]) == 0
+        return result
+
+    except Exception as e:
+        result["errors"].append(str(e))
+        return result
+
+
+def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=None) -> bool:
+    """Sync task to GitHub project - updates Hours, Status, and Activity.
+
+    Calculates total logged time, rounds to nearest 0.25 hours, and updates project.
+    Also syncs Status and Activity fields.
+    Marks logs as uploaded after successful sync.
+
+    Returns True on success.
+    """
+    if not issue_ref:
+        return False
+
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False
+
+    success = True
+
+    # Sync status
+    status = task.get("status", "todo")
+    if not sync_project_status(issue_ref, status, data):
+        success = False
+
+    # Sync activity based on role
+    activity = get_role_activity(task, data)
+    if activity:
+        if not update_project_activity(issue_ref, activity, data):
+            success = False
+
+    # Sync hours
+    total_mins = task_logged_mins(task)
+    if total_mins > 0:
+        hours = mins_to_quarter_hours(total_mins)
+        if update_project_hours(issue_ref, hours, data):
+            mark_logs_uploaded(task)
+            if save_callback:
+                save_callback(data)
+        else:
+            success = False
+
+    return success
 
 
 def close_github_issue(issue_ref: str) -> bool:
