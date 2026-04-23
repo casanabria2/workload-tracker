@@ -148,7 +148,7 @@ class TaskModal(ModalScreen):
         align: center middle;
     }
     #modal-box {
-        width: 60;
+        width: 80;
         height: auto;
         background: $surface;
         border: tall $primary;
@@ -178,6 +178,7 @@ class TaskModal(ModalScreen):
             yield Input(value=t.get("description", ""), placeholder="Description (optional)", id="inp-desc")
             yield Select(role_options, value=t.get("role_id", default_role), id="sel-role", prompt="Select role")
             yield Select(status_options, value=t.get("status", "todo"), id="sel-status", prompt="Select status")
+            yield Input(value=t.get("local_folder", ""), placeholder="Local folder path (optional, e.g., ~/dev/myproject)", id="inp-local-folder")
             if self._is_new:
                 with Horizontal():
                     yield Switch(value=False, id="chk-github")
@@ -211,6 +212,7 @@ class TaskModal(ModalScreen):
         desc = self.query_one("#inp-desc").value.strip()
         role_id = self.query_one("#sel-role").value or "demokit"
         status = self.query_one("#sel-status").value or "todo"
+        local_folder = self.query_one("#inp-local-folder").value.strip()
         result = {
             "id": self._task_data["id"] if self._task_data else uid(),
             "title": title,
@@ -220,9 +222,17 @@ class TaskModal(ModalScreen):
             "logs": self._task_data.get("logs", []) if self._task_data else [],
             "created_at": self._task_data.get("created_at", time.time()) if self._task_data else time.time(),
         }
+        # Handle local folder - expand path and validate if provided
+        if local_folder:
+            from pathlib import Path
+            folder_path = Path(local_folder).expanduser()
+            if folder_path.exists() and folder_path.is_dir():
+                result["local_folder"] = str(folder_path.resolve())
+            else:
+                result["local_folder"] = local_folder  # Store as-is, will error on use
         # Preserve additional fields from existing task
         if self._task_data:
-            for key in ("github_issue", "arc_folder_id", "archived_tabs"):
+            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid"):
                 if key in self._task_data:
                     result[key] = self._task_data[key]
             # Track if title changed for GitHub issue update

@@ -177,11 +177,11 @@ except:
         iterm)
             if (( CURRENT == 3 )); then
                 local -a subcommands
-                subcommands=('setup:Enable iTerm integration' 'status:Show iTerm status' 'open:Open terminal for task' 'close:Close tmux session')
+                subcommands=('setup:Enable iTerm integration' 'status:Show iTerm status' 'open:Open terminal for task' 'close:Close tmux session' 'set-folder:Set local folder for task' 'clear-folder:Clear local folder')
                 _describe -t subcommands 'iterm subcommand' subcommands
             elif (( CURRENT == 4 )); then
                 case "${words[3]}" in
-                    open|close)
+                    open|close|set-folder|clear-folder)
                         local -a tasks
                         tasks=("${(@f)$(python3 -c "
 import json
@@ -191,6 +191,13 @@ for t in data.get('tasks', []):
     print(t['title'])
 " 2>/dev/null)}")
                         compadd -Q "${tasks[@]}"
+                        ;;
+                esac
+            elif (( CURRENT == 5 )); then
+                case "${words[3]}" in
+                    set-folder)
+                        # Complete directories
+                        _files -/
                         ;;
                 esac
             fi

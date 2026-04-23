@@ -51,10 +51,10 @@ class TmuxManager:
 
         Layout:
         ┌────────────────┬────────────────┐
-        │   Pane 0.0     │   Pane 0.1     │  ← 2/3 height
+        │   Pane 0       │   Pane 1       │  ← 2/3 height
         │  (top-left)    │  (top-right)   │
         ├────────────────┴────────────────┤
-        │         Pane 0.2                │  ← 1/3 height
+        │         Pane 2                  │  ← 1/3 height
         │        (bottom)                 │
         └─────────────────────────────────┘
 
@@ -62,39 +62,22 @@ class TmuxManager:
         """
         folder_str = str(folder)
 
-        # Create session with first pane (full screen)
+        # Use a single shell command to ensure atomicity and correct pane targeting
+        # This creates all panes and sets layout in one go
+        tmux_script = f'''
+            tmux new-session -d -s {name} -c "{folder_str}" && \
+            tmux split-window -h -t {name}:0.0 -c "{folder_str}" && \
+            tmux split-window -v -t {name}:0.0 -c "{folder_str}" && \
+            tmux select-layout -t {name} main-horizontal && \
+            tmux resize-pane -t {name}:0.2 -y 33% && \
+            tmux select-pane -t {name}:0.0
+        '''
+
         result = subprocess.run(
-            ["tmux", "new-session", "-d", "-s", name, "-c", folder_str],
+            ["bash", "-c", tmux_script],
             capture_output=True
         )
-        if result.returncode != 0:
-            return False
-
-        # Split vertically to create bottom pane (0.0=top, 0.1=bottom)
-        subprocess.run(
-            ["tmux", "split-window", "-v", "-t", f"{name}:0.0", "-c", folder_str],
-            capture_output=True
-        )
-
-        # Resize bottom pane to 33%
-        subprocess.run(
-            ["tmux", "resize-pane", "-t", f"{name}:0.1", "-y", "33%"],
-            capture_output=True
-        )
-
-        # Split top pane horizontally (0.0=top-left, 0.1=top-right, 0.2=bottom)
-        subprocess.run(
-            ["tmux", "split-window", "-h", "-t", f"{name}:0.0", "-c", folder_str],
-            capture_output=True
-        )
-
-        # Select top-left pane
-        subprocess.run(
-            ["tmux", "select-pane", "-t", f"{name}:0.0"],
-            capture_output=True
-        )
-
-        return True
+        return result.returncode == 0
 
     def kill_session(self, name: str) -> bool:
         """Kill a tmux session."""
@@ -157,16 +140,11 @@ class ItermAppleScript:
         return False
 
     def _position_window_with_hammerspoon(self):
-        """Position iTerm2 window to 1920x1080 on the left screen using Hammerspoon."""
-        # Find the leftmost screen and position window there
+        """Position iTerm2 window using Hammerspoon."""
         hs_command = '''
             local win = hs.application.get("iTerm2"):focusedWindow()
             if win then
-                local screens = hs.screen.allScreens()
-                table.sort(screens, function(a, b) return a:frame().x < b:frame().x end)
-                local leftScreen = screens[1]
-                local frame = leftScreen:frame()
-                win:setFrame({x=frame.x, y=frame.y, w=1920, h=1080})
+                win:setFrame({x=111, y=35, w=3440, h=1410})
             end
         '''
         subprocess.run(["hs", "-c", hs_command], capture_output=True)
@@ -293,13 +271,22 @@ class TaskTerminalManager:
         }
 
         try:
-            # Ensure folder exists (using full iCloud path internally)
-            folder = self.ensure_task_folder(task, save_callback)
-            results["folder_path"] = str(folder)
-            results["folder_created"] = not task.get("task_folder_path")
-
-            # Use symlink path for terminal (shorter prompt)
-            terminal_folder = self.get_terminal_path(folder)
+            # Check if task has a local folder set (e.g., git repo)
+            local_folder = task.get("local_folder")
+            if local_folder:
+                folder = Path(local_folder).expanduser()
+                if not folder.exists():
+                    results["error"] = f"Local folder does not exist: {local_folder}"
+                    return results
+                terminal_folder = folder
+                results["folder_path"] = str(folder)
+            else:
+                # Ensure folder exists (using full iCloud path internally)
+                folder = self.ensure_task_folder(task, save_callback)
+                results["folder_path"] = str(folder)
+                results["folder_created"] = not task.get("task_folder_path")
+                # Use symlink path for terminal (shorter prompt)
+                terminal_folder = self.get_terminal_path(folder)
 
             # Get or generate session name
             session_name = task.get("iterm_session_name")

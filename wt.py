@@ -56,6 +56,8 @@ Usage:
     wt iterm setup               — Enable iTerm2/tmux integration
     wt iterm open <task>         — Open iTerm2 terminal for a task
     wt iterm close <task>        — Close tmux session for a task
+    wt iterm set-folder <task> <path> — Set local folder for task
+    wt iterm clear-folder <task> — Clear local folder setting
     wt iterm status              — Show iTerm integration status
 
     wt tabs                      — List tabs in current task's folder
@@ -197,15 +199,34 @@ def resolve_task(data: dict, query: str):
     match = next((t for t in tasks if t["id"] == query), None)
     if match:
         return match
-    # Partial title match (case-insensitive)
+
     q = query.lower()
+
+    # Exact title match (case-insensitive)
+    exact_matches = [t for t in tasks if t["title"].lower() == q]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        # Prefer non-done tasks
+        active = [t for t in exact_matches if t.get("status") != "done"]
+        if len(active) == 1:
+            return active[0]
+
+    # Partial title match (case-insensitive)
     matches = [t for t in tasks if q in t["title"].lower()]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
+        # Prefer non-done tasks
+        active = [t for t in matches if t.get("status") != "done"]
+        if len(active) == 1:
+            return active[0]
+        # Still ambiguous - show options (prefer showing active tasks first)
+        display = active if active else matches
         print(c("Ambiguous match. Did you mean:", "yellow"))
-        for t in matches:
-            print(f"  {t['id']}  {t['title']}")
+        for t in display:
+            status = " [done]" if t.get("status") == "done" else ""
+            print(f"  {t['id']}  {t['title']}{status}")
         sys.exit(1)
     print(c(f"No task matching '{query}'", "red"))
     sys.exit(1)
@@ -2436,13 +2457,15 @@ def cmd_arc(args):
 def cmd_iterm(args):
     """Manage iTerm2/tmux integration."""
     if not args:
-        print("Usage: wt iterm <open|close|status|setup>")
+        print("Usage: wt iterm <command>")
         print()
         print("Commands:")
-        print("  open <task>   Open iTerm2 terminal for a task")
-        print("  close <task>  Close tmux session for a task")
-        print("  status        Show integration status")
-        print("  setup         Enable iTerm integration")
+        print("  open <task>              Open iTerm2 terminal for a task")
+        print("  close <task>             Close tmux session for a task")
+        print("  set-folder <task> <path> Set local folder (e.g., git repo) for task")
+        print("  clear-folder <task>      Clear local folder setting")
+        print("  status                   Show integration status")
+        print("  setup                    Enable iTerm integration")
         sys.exit(1)
 
     subcmd = args[0].lower()
@@ -2564,9 +2587,59 @@ def cmd_iterm(args):
 
         print(c(f"✓ Closed session for: {task['title']}", "green"))
 
+    elif subcmd == "set-folder":
+        if len(args) < 3:
+            print("Usage: wt iterm set-folder <task> <path>")
+            print("  Sets a local folder (e.g., git repo) for the task's terminal session")
+            sys.exit(1)
+
+        data = load()
+        task_query = args[1]
+        folder_path = args[2]
+
+        task = resolve_task(data, task_query)
+        if not task:
+            print(c(f"Task not found: {task_query}", "red"))
+            sys.exit(1)
+
+        # Expand and validate path
+        folder = Path(folder_path).expanduser().resolve()
+        if not folder.exists():
+            print(c(f"Folder does not exist: {folder}", "red"))
+            sys.exit(1)
+        if not folder.is_dir():
+            print(c(f"Path is not a directory: {folder}", "red"))
+            sys.exit(1)
+
+        task["local_folder"] = str(folder)
+        save(data)
+
+        print(c(f"✓ Set local folder for: {task['title']}", "green"))
+        print(f"  Folder: {folder}")
+
+    elif subcmd == "clear-folder":
+        if len(args) < 2:
+            print("Usage: wt iterm clear-folder <task>")
+            sys.exit(1)
+
+        data = load()
+        task_query = " ".join(args[1:])
+
+        task = resolve_task(data, task_query)
+        if not task:
+            print(c(f"Task not found: {task_query}", "red"))
+            sys.exit(1)
+
+        if "local_folder" in task:
+            del task["local_folder"]
+            save(data)
+            print(c(f"✓ Cleared local folder for: {task['title']}", "green"))
+        else:
+            print(c("No local folder was set for this task", "dim"))
+
     else:
         print(c(f"Unknown iterm subcommand: {subcmd}", "red"))
-        print("Usage: wt iterm <open|close|status|setup>")
+        print("Usage: wt iterm <open|close|status|setup|set-folder|clear-folder>")
         sys.exit(1)
 
 

@@ -73,7 +73,8 @@ Arc browser integration: Tasks can have associated Arc folders. When enabled, th
 iTerm2/tmux integration: Tasks can have associated terminal sessions and folders.
 
 - `iterm_session_name` — tmux session name for task (e.g., `wt-demokit-my-task`)
-- `task_folder_path` — Path to task's project folder
+- `task_folder_path` — Path to task's project folder (auto-created in WorkloadTracker)
+- `local_folder` — Optional path to local git repo or custom folder (overrides task_folder_path for terminal sessions)
 - `config.iterm_enabled` — Enable iTerm integration (default: false)
 - `config.iterm_projects_dir` — Base directory for task folders (default: `~/Library/Mobile Documents/com~apple~CloudDocs/WorkloadTracker`, symlinked to `~/WorkloadTracker` for shorter terminal prompts)
 
@@ -113,8 +114,12 @@ Each task can have an associated terminal session with a dedicated project folde
 wt iterm setup               # Enable iTerm integration
 wt iterm open <task>         # Open iTerm2 terminal for a task
 wt iterm close <task>        # Close tmux session for a task
+wt iterm set-folder <task> <path>  # Set local folder (e.g., git repo)
+wt iterm clear-folder <task> # Clear local folder setting
 wt iterm status              # Show iTerm integration status
 ```
+
+If a task has a `local_folder` set, the terminal opens in that directory instead of the auto-created WorkloadTracker folder.
 
 **TUI**: Press `i` on a task to open its terminal.
 
