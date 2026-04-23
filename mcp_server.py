@@ -12,7 +12,7 @@ Add to Claude Code MCP settings:
         "mcpServers": {
             "workload-tracker": {
                 "command": "python3",
-                "args": ["/Users/carlos/dev/carlos/workload-tracker/mcp_server.py"]
+                "args": ["/path/to/workload-tracker/mcp_server.py"]
             }
         }
     }
