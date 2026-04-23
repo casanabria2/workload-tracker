@@ -25,11 +25,12 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, tabs, presence, config, calendar.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
+- **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
 ### Data Model
 
@@ -69,6 +70,13 @@ Arc browser integration: Tasks can have associated Arc folders. When enabled, th
 - `config.idle_timeout_minutes` — Minutes of inactivity before auto-stop (default: 15)
 - `config.subtract_idle_time` — Subtract idle time from logged session (default: true)
 
+iTerm2/tmux integration: Tasks can have associated terminal sessions and folders.
+
+- `iterm_session_name` — tmux session name for task (e.g., `wt-demokit-my-task`)
+- `task_folder_path` — Path to task's project folder
+- `config.iterm_enabled` — Enable iTerm integration (default: false)
+- `config.iterm_projects_dir` — Base directory for task folders (default: `~/Library/Mobile Documents/com~apple~CloudDocs/WorkloadTracker`, symlinked to `~/WorkloadTracker` for shorter terminal prompts)
+
 ### Domain Constants
 
 - **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`.
@@ -96,6 +104,49 @@ Key classes in `arc_browser.py`:
 - `ArcAppleScript` — AppleScript commands for tab operations
 - `TabClassifier` — Claude API for classifying tab relevance to tasks
 - `TaskTabManager` — Orchestrates the workflow hooks
+
+### iTerm2/tmux Integration
+
+Each task can have an associated terminal session with a dedicated project folder.
+
+```bash
+wt iterm setup               # Enable iTerm integration
+wt iterm open <task>         # Open iTerm2 terminal for a task
+wt iterm close <task>        # Close tmux session for a task
+wt iterm status              # Show iTerm integration status
+```
+
+**TUI**: Press `i` on a task to open its terminal.
+
+**Folder structure** (organized by role + title slug):
+```
+~/Library/Mobile Documents/com~apple~CloudDocs/WorkloadTracker/
+├── demokit/
+│   ├── document-current-fe-platform/
+│   └── teardown-gds2025-environment/
+├── demos/
+│   └── grafana-workshop-prep/
+└── other/
+    └── task-time-management/
+```
+
+Note: A symlink `~/WorkloadTracker` is used in terminal sessions for shorter prompts.
+
+**tmux layout** (3-pane: 2 top, 1 bottom):
+```
+┌────────────────┬────────────────┐
+│   Pane 0.0     │   Pane 0.1     │  ← 2/3 height
+│  (top-left)    │  (top-right)   │
+├────────────────┴────────────────┤
+│         Pane 0.2                │  ← 1/3 height
+│        (bottom)                 │
+└─────────────────────────────────┘
+```
+
+Key classes in `iterm_manager.py`:
+- `TmuxManager` — Create/kill tmux sessions with 3-pane layout
+- `ItermAppleScript` — Open iTerm2 windows via AppleScript
+- `TaskTerminalManager` — Main orchestrator, manages folders and sessions
 
 ### Time Log Management
 

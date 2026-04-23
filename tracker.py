@@ -1632,6 +1632,7 @@ class WorkloadTracker(App):
         Binding("g",   "link_github", "GitHub"),
         Binding("o",   "open_github", "Open issue"),
         Binding("c",   "import_calendar", "Calendar"),
+        Binding("i",   "open_terminal", "iTerm"),
         Binding("a",   "toggle_show_done", "Show done"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
@@ -2014,6 +2015,50 @@ class WorkloadTracker(App):
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
+
+    def action_open_terminal(self):
+        """Open iTerm2 terminal for the selected task."""
+        task = self._selected_task()
+        if not task:
+            return
+
+        # Check if integration is enabled
+        config = self._data.get("config", {})
+        if not config.get("iterm_enabled"):
+            self.notify("iTerm integration not enabled. Run 'wt iterm setup' first.", severity="warning")
+            return
+
+        self._open_terminal_worker(task)
+
+    @work(thread=True)
+    def _open_terminal_worker(self, task: dict):
+        """Open terminal in background thread."""
+        try:
+            from iterm_manager import TaskTerminalManager
+            manager = TaskTerminalManager(self._data)
+
+            result = manager.open_terminal(task, save_data)
+
+            if result["error"]:
+                self.call_from_thread(
+                    self.notify, f"iTerm error: {result['error']}", severity="error"
+                )
+            elif result["session_created"]:
+                self.call_from_thread(
+                    self.notify, f"Created session: {result['session_name']}", severity="information"
+                )
+            else:
+                self.call_from_thread(
+                    self.notify, f"Opened: {result['session_name']}", severity="information"
+                )
+        except ImportError:
+            self.call_from_thread(
+                self.notify, "iTerm integration not available", severity="error"
+            )
+        except Exception as e:
+            self.call_from_thread(
+                self.notify, f"iTerm error: {e}", severity="error"
+            )
 
     def action_edit_task(self):
         task = self._selected_task()

@@ -36,6 +36,7 @@ _wt() {
         'calendar:Import tasks from Google Calendar'
         'cal:Import tasks from Google Calendar'
         'arc:Arc browser integration'
+        'iterm:iTerm2/tmux integration'
         'tabs:Manage task tabs'
         'presence:Presence detection settings'
         'rename:Rename a task'
@@ -171,6 +172,27 @@ except:
                 local -a subcommands
                 subcommands=('setup:Set up Arc integration' 'status:Show Arc status' 'sync:Sync folders' 'spaces:List Arc spaces' 'link:Link to existing space')
                 _describe -t subcommands 'arc subcommand' subcommands
+            fi
+            ;;
+        iterm)
+            if (( CURRENT == 3 )); then
+                local -a subcommands
+                subcommands=('setup:Enable iTerm integration' 'status:Show iTerm status' 'open:Open terminal for task' 'close:Close tmux session')
+                _describe -t subcommands 'iterm subcommand' subcommands
+            elif (( CURRENT == 4 )); then
+                case "${words[3]}" in
+                    open|close)
+                        local -a tasks
+                        tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+                        compadd -Q "${tasks[@]}"
+                        ;;
+                esac
             fi
             ;;
         tabs)

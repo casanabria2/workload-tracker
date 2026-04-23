@@ -53,6 +53,11 @@ Usage:
     wt arc status                — Show Arc integration status
     wt arc sync                  — Sync folders with current roles/tasks
 
+    wt iterm setup               — Enable iTerm2/tmux integration
+    wt iterm open <task>         — Open iTerm2 terminal for a task
+    wt iterm close <task>        — Close tmux session for a task
+    wt iterm status              — Show iTerm integration status
+
     wt tabs                      — List tabs in current task's folder
     wt tabs cleanup              — Manually trigger tab cleanup
 
@@ -2426,6 +2431,145 @@ def cmd_arc(args):
         sys.exit(1)
 
 
+# ── iTerm2/tmux Integration ───────────────────────────────
+
+def cmd_iterm(args):
+    """Manage iTerm2/tmux integration."""
+    if not args:
+        print("Usage: wt iterm <open|close|status|setup>")
+        print()
+        print("Commands:")
+        print("  open <task>   Open iTerm2 terminal for a task")
+        print("  close <task>  Close tmux session for a task")
+        print("  status        Show integration status")
+        print("  setup         Enable iTerm integration")
+        sys.exit(1)
+
+    subcmd = args[0].lower()
+
+    if subcmd == "setup":
+        try:
+            from iterm_manager import TaskTerminalManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        manager = TaskTerminalManager(data)
+
+        # Optional: custom projects directory
+        projects_dir = None
+        if len(args) > 1:
+            projects_dir = args[1]
+
+        result = manager.setup(save, projects_dir)
+
+        if result["error"]:
+            print(c(f"Error: {result['error']}", "red"))
+            sys.exit(1)
+
+        print(c("✓ iTerm integration enabled", "green"))
+        print(f"  Projects directory: {result['projects_dir']}")
+        if result["created_dir"]:
+            print(c("  (created directory)", "dim"))
+        print()
+        print("Press 'i' in TUI or use 'wt iterm open <task>' to open a terminal.")
+
+    elif subcmd == "status":
+        try:
+            from iterm_manager import TaskTerminalManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        manager = TaskTerminalManager(data)
+        status = manager.get_status()
+
+        print(c("\n  iTerm Integration Status\n", "bold"))
+        print(f"  Enabled:            {'Yes' if status['enabled'] else 'No'}")
+        print(f"  Projects directory: {status['projects_dir']}")
+        print(f"  Directory exists:   {'Yes' if status['projects_dir_exists'] else 'No'}")
+        print(f"  iTerm running:      {'Yes' if status['iterm_running'] else 'No'}")
+        print(f"  Tasks with sessions:{status['tasks_with_sessions']}")
+        print(f"  Active sessions:    {status['active_sessions']}")
+        if status['session_names']:
+            print(f"  Sessions:           {', '.join(status['session_names'])}")
+        print()
+
+    elif subcmd == "open":
+        if len(args) < 2:
+            print("Usage: wt iterm open <task>")
+            sys.exit(1)
+
+        try:
+            from iterm_manager import TaskTerminalManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        manager = TaskTerminalManager(data)
+
+        # Check if enabled
+        if not manager.is_enabled():
+            print(c("iTerm integration not enabled.", "red"))
+            print("Run 'wt iterm setup' first.")
+            sys.exit(1)
+
+        task_query = " ".join(args[1:])
+        task = resolve_task(data, task_query)
+        if not task:
+            print(c(f"Task not found: {task_query}", "red"))
+            sys.exit(1)
+
+        print(f"Opening terminal for: {task['title']}")
+        result = manager.open_terminal(task, save)
+
+        if result["error"]:
+            print(c(f"Error: {result['error']}", "red"))
+            sys.exit(1)
+
+        if result["session_created"]:
+            print(c(f"✓ Created session: {result['session_name']}", "green"))
+        else:
+            print(c(f"✓ Opened session: {result['session_name']}", "green"))
+        print(f"  Folder: {result['folder_path']}")
+
+    elif subcmd == "close":
+        if len(args) < 2:
+            print("Usage: wt iterm close <task>")
+            sys.exit(1)
+
+        try:
+            from iterm_manager import TaskTerminalManager
+        except ImportError as e:
+            print(c(f"Error: {e}", "red"))
+            sys.exit(1)
+
+        data = load()
+        manager = TaskTerminalManager(data)
+
+        task_query = " ".join(args[1:])
+        task = resolve_task(data, task_query)
+        if not task:
+            print(c(f"Task not found: {task_query}", "red"))
+            sys.exit(1)
+
+        result = manager.close_session(task)
+
+        if result["error"]:
+            print(c(f"Error: {result['error']}", "red"))
+            sys.exit(1)
+
+        print(c(f"✓ Closed session for: {task['title']}", "green"))
+
+    else:
+        print(c(f"Unknown iterm subcommand: {subcmd}", "red"))
+        print("Usage: wt iterm <open|close|status|setup>")
+        sys.exit(1)
+
+
 # ── Google Calendar Integration ───────────────────────────
 
 GCAL_CREDENTIALS_FILE = Path.home() / ".workload_tracker_gcal_credentials.json"
@@ -2904,6 +3048,7 @@ COMMANDS = {
     "presence": cmd_presence,
     "roles": cmd_roles,
     "arc": cmd_arc,
+    "iterm": cmd_iterm,
     "tabs": cmd_tabs,
     "calendar": cmd_calendar,
     "cal": cmd_calendar,
