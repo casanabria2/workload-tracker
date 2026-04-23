@@ -83,7 +83,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 - **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`.
 - **Statuses**: `todo`, `inprogress`, `done`
 - Done tasks are hidden by default in all list views (CLI, TUI, MCP)
-- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks (TUI)
+- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI)
 
 ### Key Patterns
 
@@ -108,7 +108,7 @@ Key classes in `arc_browser.py`:
 
 ### iTerm2/tmux Integration
 
-Each task can have an associated terminal session with a dedicated project folder.
+Each task can have an associated terminal session with a dedicated project folder. Uses Hammerspoon for window positioning.
 
 ```bash
 wt iterm setup               # Enable iTerm integration
@@ -119,38 +119,41 @@ wt iterm clear-folder <task> # Clear local folder setting
 wt iterm status              # Show iTerm integration status
 ```
 
-If a task has a `local_folder` set, the terminal opens in that directory instead of the auto-created WorkloadTracker folder.
+**Local folder**: If a task has a `local_folder` set, the terminal opens in that directory instead of the auto-created WorkloadTracker folder. Set via CLI (`wt iterm set-folder`) or TUI (edit task with `e`, fill "Local folder path" field).
 
-**TUI**: Press `i` on a task to open its terminal.
+**TUI keybindings**:
+- `i` — Open iTerm2 terminal for selected task
+- `e` — Edit task (includes local folder field)
 
-**Folder structure** (organized by role + title slug):
+**Folder structure** (when no local_folder set, organized by role + title slug):
 ```
 ~/Library/Mobile Documents/com~apple~CloudDocs/WorkloadTracker/
 ├── demokit/
-│   ├── document-current-fe-platform/
-│   └── teardown-gds2025-environment/
+│   └── my-task-slug/
 ├── demos/
-│   └── grafana-workshop-prep/
+│   └── another-task/
 └── other/
-    └── task-time-management/
+    └── misc-task/
 ```
 
 Note: A symlink `~/WorkloadTracker` is used in terminal sessions for shorter prompts.
 
-**tmux layout** (3-pane: 2 top, 1 bottom):
+**tmux layout** (3-pane using `main-horizontal`):
 ```
 ┌────────────────┬────────────────┐
-│   Pane 0.0     │   Pane 0.1     │  ← 2/3 height
+│   Pane 0       │   Pane 1       │  ← 2/3 height
 │  (top-left)    │  (top-right)   │
 ├────────────────┴────────────────┤
-│         Pane 0.2                │  ← 1/3 height
+│         Pane 2                  │  ← 1/3 height
 │        (bottom)                 │
 └─────────────────────────────────┘
 ```
 
+**Window positioning**: Hammerspoon positions new windows at (111, 35) with size 3440x1410.
+
 Key classes in `iterm_manager.py`:
-- `TmuxManager` — Create/kill tmux sessions with 3-pane layout
-- `ItermAppleScript` — Open iTerm2 windows via AppleScript
+- `TmuxManager` — Create/kill tmux sessions with 3-pane layout (uses `main-horizontal`)
+- `ItermAppleScript` — Open iTerm2 windows via AppleScript, position with Hammerspoon
 - `TaskTerminalManager` — Main orchestrator, manages folders and sessions
 
 ### Time Log Management
