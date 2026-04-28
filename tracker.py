@@ -1640,6 +1640,7 @@ class WorkloadTracker(App):
         Binding("l",   "log_time",    "Manage logs"),
         Binding("s",   "cycle_status","Cycle status"),
         Binding("g",   "link_github", "GitHub"),
+        Binding("u",   "update_github", "Update GH"),
         Binding("o",   "open_github", "Open issue"),
         Binding("c",   "import_calendar", "Calendar"),
         Binding("i",   "open_terminal", "iTerm"),
@@ -2245,6 +2246,33 @@ class WorkloadTracker(App):
         else:
             self.call_from_thread(
                 self.notify, f"Sync errors: {', '.join(result['errors'])}", severity="warning"
+            )
+
+    def action_update_github(self):
+        """Manually sync task state (hours, status, activity, sprint) to GitHub project."""
+        task = self._selected_task()
+        if not task:
+            return
+        if not task.get("github_issue"):
+            self.notify("No GitHub issue linked", severity="warning")
+            return
+        self.notify("Syncing to GitHub…", severity="information")
+        self._update_github_project(task)
+
+    @work(thread=True)
+    def _update_github_project(self, task: dict):
+        """Push current task state to GitHub project in background."""
+        result = setup_issue_in_project(task["github_issue"], task, self._data)
+        if result["success"]:
+            save_data(self._data)
+            hours = mins_to_quarter_hours(task_logged_mins(task))
+            self.call_from_thread(
+                self.notify, f"GitHub updated: {hours}h", severity="information"
+            )
+            self.call_from_thread(self._populate_table)
+        else:
+            self.call_from_thread(
+                self.notify, f"Update failed: {', '.join(result['errors'])}", severity="warning"
             )
 
     def _on_create_issue_confirmed(self, task: dict, confirmed: bool):

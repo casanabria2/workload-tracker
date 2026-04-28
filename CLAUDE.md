@@ -203,12 +203,14 @@ wt calendar import <event>   # Import event as task (prompts for time)
 wt calendar setup            # Show setup instructions
 ```
 
-**Setup**: Requires Google Calendar API credentials:
-1. Go to Google Cloud Console
-2. Enable Google Calendar API
-3. Create OAuth credentials (Desktop app)
-4. Save credentials to `~/.workload_tracker_gcal_credentials.json`
-5. First run opens browser for authorization
+**Setup**: Requires Google Calendar API credentials (`~/.workload_tracker_gcal_credentials.json`):
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a project (or select existing) and enable **Google Calendar API**
+3. Go to **APIs & Services → Credentials**
+4. Find your OAuth 2.0 Client ID (Desktop app type), or create one
+5. Create a new client secret and download the JSON file
+6. Save as `~/.workload_tracker_gcal_credentials.json`
+7. Run `wt calendar` — browser opens for authorization, token is saved automatically
 
 **Configuration**:
 ```bash
