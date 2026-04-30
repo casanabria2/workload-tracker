@@ -118,15 +118,29 @@ for t in data.get('tasks', []):
                 local -a subcommands
                 subcommands=('setup:Show setup instructions' 'import:Import a calendar event as task')
                 _describe -t subcommands 'calendar subcommand' subcommands
-            elif (( CURRENT == 4 )); then
+            elif (( CURRENT >= 4 )); then
                 case "${words[3]}" in
                     import)
-                        # Show recent calendar event titles
-                        local -a events
-                        local wt_dir="${0:A:h}"
-                        local venv_python="${wt_dir}/venv/bin/python"
-                        [[ -x "$venv_python" ]] || venv_python="python3"
-                        events=("${(@f)$($venv_python -c "
+                        # Complete --task flag or event titles
+                        if [[ "${words[CURRENT-1]}" == "--task" ]]; then
+                            # Complete task names
+                            local -a tasks
+                            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    if t.get('status') != 'done':
+        print(t['title'])
+" 2>/dev/null)}")
+                            compadd "${tasks[@]}"
+                        elif (( CURRENT == 4 )); then
+                            # Show recent calendar event titles
+                            local -a events
+                            local wt_dir="${0:A:h}"
+                            local venv_python="${wt_dir}/venv/bin/python"
+                            [[ -x "$venv_python" ]] || venv_python="python3"
+                            events=("${(@f)$($venv_python -c "
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -134,7 +148,13 @@ from datetime import datetime, timedelta
 # Load config for calendar_id
 data = json.loads((Path.home() / '.workload_tracker.json').read_text())
 calendar_id = data.get('config', {}).get('calendar_id', 'primary')
-imported_uids = {t.get('calendar_event_uid') for t in data.get('tasks', [])}
+imported_uids = set()
+for t in data.get('tasks', []):
+    if t.get('calendar_event_uid'):
+        imported_uids.add(t['calendar_event_uid'])
+    for log in t.get('logs', []):
+        if log.get('calendar_event_uid'):
+            imported_uids.add(log['calendar_event_uid'])
 
 # Try to get events from Google Calendar
 try:
@@ -162,7 +182,11 @@ try:
 except:
     pass
 " 2>/dev/null)}")
-                        compadd "${events[@]}"
+                            compadd "${events[@]}"
+                        else
+                            # Offer --task flag
+                            compadd -- "--task"
+                        fi
                         ;;
                 esac
             fi

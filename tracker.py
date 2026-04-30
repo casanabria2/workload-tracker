@@ -45,11 +45,12 @@ from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
 from wt import (
-    get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue,
+    get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, delete_github_issue,
     sync_project_status, get_role_activity, update_project_activity, get_calendar_events,
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
-    get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint
+    get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
+    get_imported_calendar_uids
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -538,12 +539,12 @@ class ConfirmCloseTaskModal(ModalScreen):
                 yield Button("Cancel  [esc]", id="btn-cancel-close")
 
     def on_mount(self):
-        self.query_one("#btn-close-task").focus()
+        self.query_one("#btn-cancel-close").focus()
 
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(False)
-        elif event.key in ("y", "enter"):
+        elif event.key == "y":
             self.dismiss(True)
 
     @on(Button.Pressed, "#btn-close-task")
@@ -595,12 +596,12 @@ class ConfirmCloseNoGitHubModal(ModalScreen):
                 yield Button("Cancel  [esc]", id="btn-cancel-no-gh")
 
     def on_mount(self):
-        self.query_one("#btn-close-no-gh").focus()
+        self.query_one("#btn-cancel-no-gh").focus()
 
     def on_key(self, event):
         if event.key == "escape":
             self.dismiss(False)
-        elif event.key in ("y", "enter"):
+        elif event.key == "y":
             self.dismiss(True)
 
     @on(Button.Pressed, "#btn-close-no-gh")
@@ -608,6 +609,64 @@ class ConfirmCloseNoGitHubModal(ModalScreen):
         self.dismiss(True)
 
     @on(Button.Pressed, "#btn-cancel-no-gh")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Delete GitHub Issue
+# ──────────────────────────────────────────────────────────
+
+class DeleteGitHubIssueModal(ModalScreen):
+    """Modal to confirm permanent deletion of a GitHub issue."""
+    CSS = """
+    DeleteGitHubIssueModal { align: center middle; }
+    #delete-gh-box {
+        width: 65;
+        height: auto;
+        background: $surface;
+        border: tall $error;
+        padding: 1 2;
+    }
+    #delete-gh-box Label { margin-bottom: 1; }
+    #delete-gh-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, issue_ref: str):
+        super().__init__()
+        self._task_title = task_title
+        self._issue_ref = issue_ref
+
+    def compose(self) -> ComposeResult:
+        with Container(id="delete-gh-box"):
+            yield Label("[bold red]DELETE GitHub Issue[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label(f"Issue: [cyan]{self._issue_ref}[/]")
+            yield Label("")
+            yield Label("[bold red]WARNING: This is permanent and cannot be undone![/]")
+            yield Label("[red]All comments, labels, and history on this[/]")
+            yield Label("[red]issue will be permanently destroyed.[/]")
+            yield Label("")
+            yield Label("The task will be kept but unlinked from the issue.")
+            yield Label("")
+            with Horizontal(id="delete-gh-actions"):
+                yield Button("Cancel  [esc]", id="btn-cancel-delete-gh")
+                yield Button("Delete Issue  [y]", variant="error", id="btn-delete-gh")
+
+    def on_mount(self):
+        self.query_one("#btn-cancel-delete-gh").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-delete-gh")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-delete-gh")
     def cancel(self):
         self.dismiss(False)
 
@@ -1347,6 +1406,79 @@ class CalendarTimeModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Task Picker (for calendar log-to-task)
+# ──────────────────────────────────────────────────────────
+
+class TaskPickerModal(ModalScreen):
+    """Modal to pick an existing task to log time to."""
+    CSS = """
+    TaskPickerModal { align: center middle; }
+    #task-picker-box {
+        width: 70;
+        height: auto;
+        max-height: 70%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #task-picker-box Label { margin-bottom: 1; }
+    #task-picker-table { height: 15; margin-bottom: 1; }
+    #task-picker-actions { margin-top: 1; }
+    """
+
+    def __init__(self, tasks: list):
+        super().__init__()
+        self._tasks = tasks
+
+    def compose(self) -> ComposeResult:
+        with Container(id="task-picker-box"):
+            yield Label("[bold]Select a task[/]")
+            yield DataTable(id="task-picker-table", cursor_type="row", zebra_stripes=True)
+            with Horizontal(id="task-picker-actions"):
+                yield Button("Select  [enter]", variant="primary", id="btn-pick")
+                yield Button("Cancel  [esc]", id="btn-cancel-pick")
+
+    def on_mount(self):
+        table = self.query_one("#task-picker-table", DataTable)
+        table.add_columns("Title", "Role", "Status", "Logged")
+        for task in self._tasks:
+            logged = fmt_mins(task_logged_mins(task))
+            table.add_row(
+                task["title"][:40],
+                task.get("role_id", ""),
+                STATUS_LABELS.get(task.get("status", "todo"), task.get("status", "")),
+                logged,
+                key=task["id"],
+            )
+        table.focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "enter":
+            self._do_pick()
+
+    @on(Button.Pressed, "#btn-pick")
+    def on_pick(self):
+        self._do_pick()
+
+    @on(Button.Pressed, "#btn-cancel-pick")
+    def on_cancel(self):
+        self.dismiss(None)
+
+    def _do_pick(self):
+        table = self.query_one("#task-picker-table", DataTable)
+        if table.cursor_row is None or table.row_count == 0:
+            return
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+            task = next((t for t in self._tasks if t["id"] == key), None)
+            self.dismiss(task)
+        except Exception:
+            self.dismiss(None)
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Calendar Import
 # ──────────────────────────────────────────────────────────
 
@@ -1354,6 +1486,7 @@ class CalendarModal(ModalScreen):
     """Modal to list and import calendar events as tasks."""
     BINDINGS = [
         Binding("i", "import_event", "Import", priority=True),
+        Binding("l", "log_to_task", "Log to task", priority=True),
         Binding("d", "delete_event", "Delete", priority=True),
         Binding("escape", "close_modal", "Close", priority=True),
     ]
@@ -1402,9 +1535,10 @@ class CalendarModal(ModalScreen):
             yield DataTable(id="calendar-table", cursor_type="row", zebra_stripes=True)
             with Horizontal(id="calendar-actions"):
                 yield Button("Import  [i]", variant="primary", id="btn-import")
+                yield Button("Log to task  [l]", variant="success", id="btn-log-to-task")
                 yield Button("Delete  [d]", variant="error", id="btn-delete")
                 yield Button("Close  [Esc]", id="btn-close")
-            yield Label("[dim]\\[i] Import event  \\[d] Delete imported task  ✓ = already imported[/]", id="calendar-help")
+            yield Label("[dim]\\[i] Import as new task  \\[l] Log to existing task  \\[d] Delete  ✓ = imported[/]", id="calendar-help")
 
     def on_mount(self):
         self._load_events()
@@ -1450,7 +1584,7 @@ class CalendarModal(ModalScreen):
         self._events = get_calendar_events(days_back=self._days_back, calendar_id=calendar_id)
 
         # Get already imported UIDs
-        imported_uids = {t.get("calendar_event_uid") for t in self._data.get("tasks", [])}
+        imported_uids = get_imported_calendar_uids(self._data)
 
         # Build table
         table.clear(columns=True)
@@ -1504,12 +1638,79 @@ class CalendarModal(ModalScreen):
     def on_delete(self):
         self._do_delete()
 
+    @on(Button.Pressed, "#btn-log-to-task")
+    def on_log_to_task(self):
+        self._do_log_to_task()
+
     @on(Button.Pressed, "#btn-close")
     def on_close(self):
         self.dismiss(False)
 
     @on(Button.Pressed, "#btn-refresh")
     def on_refresh(self):
+        self._load_events()
+
+    def action_log_to_task(self):
+        self._do_log_to_task()
+
+    def _do_log_to_task(self):
+        """Log a calendar event's time to an existing task."""
+        event = self._get_selected_event()
+        if not event:
+            self.notify("No event selected", severity="warning")
+            return
+
+        # Check if already imported
+        imported_uids = get_imported_calendar_uids(self._data)
+        if event["uid"] in imported_uids:
+            self.notify("Event already imported", severity="warning")
+            return
+
+        # Get non-done tasks
+        tasks = [t for t in self._data.get("tasks", []) if t.get("status") != "done"]
+        if not tasks:
+            self.notify("No active tasks", severity="warning")
+            return
+
+        self._pending_log_event = event
+        self.app.push_screen(TaskPickerModal(tasks), self._on_task_picked)
+
+    def _on_task_picked(self, task: dict | None):
+        """Callback after task picker."""
+        if task is None or not hasattr(self, '_pending_log_event'):
+            return
+
+        event = self._pending_log_event
+        del self._pending_log_event
+
+        self._pending_log = {
+            "event": event,
+            "task": task,
+        }
+        self.app.push_screen(CalendarTimeModal(event), self._on_log_time_confirmed)
+
+    def _on_log_time_confirmed(self, minutes: float | None):
+        """Callback after time confirmation for log-to-task."""
+        if minutes is None or not hasattr(self, '_pending_log'):
+            return
+
+        event = self._pending_log["event"]
+        task = self._pending_log["task"]
+        del self._pending_log
+
+        # Add log entry to existing task with calendar_event_uid
+        task["logs"].append({
+            "id": uid(),
+            "minutes": round(minutes, 2),
+            "note": f"Calendar: {event['title']}",
+            "at": event["end_date"],
+            "started_at": event["start_date"],
+            "ended_at": event["end_date"],
+            "calendar_event_uid": event["uid"],
+        })
+        self._save(self._data)
+
+        self.notify(f"Logged {fmt_mins(minutes)} to '{task['title']}'", severity="information")
         self._load_events()
 
     def _do_delete(self):
@@ -1541,7 +1742,7 @@ class CalendarModal(ModalScreen):
             return
 
         # Check if already imported
-        imported_uids = {t.get("calendar_event_uid") for t in self._data.get("tasks", [])}
+        imported_uids = get_imported_calendar_uids(self._data)
         if event["uid"] in imported_uids:
             self.notify("Event already imported", severity="warning")
             return
@@ -1642,6 +1843,7 @@ class WorkloadTracker(App):
         Binding("g",   "link_github", "GitHub"),
         Binding("u",   "update_github", "Update GH"),
         Binding("o",   "open_github", "Open issue"),
+        Binding("x",   "delete_github_issue", "Delete GH issue", show=False),
         Binding("c",   "import_calendar", "Calendar"),
         Binding("i",   "open_terminal", "iTerm"),
         Binding("a",   "toggle_show_done", "Show done"),
@@ -1662,6 +1864,17 @@ class WorkloadTracker(App):
         super().__init__()
         self._data = load_data()
         self._timer_task = None
+        self._bg_tasks: set[str] = set()
+
+    def _bg_start(self, label: str):
+        """Show a background operation in the header subtitle."""
+        self._bg_tasks.add(label)
+        self.sub_title = "⟳ " + ", ".join(sorted(self._bg_tasks))
+
+    def _bg_end(self, label: str):
+        """Clear a background operation from the header subtitle."""
+        self._bg_tasks.discard(label)
+        self.sub_title = ("⟳ " + ", ".join(sorted(self._bg_tasks))) if self._bg_tasks else ""
 
     # ── Compose ────────────────────────────────────────────
 
@@ -1993,11 +2206,15 @@ class WorkloadTracker(App):
         issue_ref = task.get("github_issue")
         if not issue_ref:
             return
-        if sync_project_hours(issue_ref, task, self._data, save_data):
-            hours = mins_to_quarter_hours(task_logged_mins(task))
-            self.call_from_thread(
-                self.notify, f"Synced {hours}h to {issue_ref}", severity="information"
-            )
+        self.call_from_thread(self._bg_start, "Syncing hours")
+        try:
+            if sync_project_hours(issue_ref, task, self._data, save_data):
+                hours = mins_to_quarter_hours(task_logged_mins(task))
+                self.call_from_thread(
+                    self.notify, f"Synced {hours}h to {issue_ref}", severity="information"
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Syncing hours")
 
     # ── Actions ───────────────────────────────────────────
 
@@ -2061,6 +2278,7 @@ class WorkloadTracker(App):
             self.notify("iTerm integration not enabled. Run 'wt iterm setup' first.", severity="warning")
             return
 
+        self._bg_start("Opening iTerm")
         self._open_terminal_worker(task)
 
     @work(thread=True)
@@ -2092,6 +2310,8 @@ class WorkloadTracker(App):
             self.call_from_thread(
                 self.notify, f"iTerm error: {e}", severity="error"
             )
+        finally:
+            self.call_from_thread(self._bg_end, "Opening iTerm")
 
     def action_edit_task(self):
         task = self._selected_task()
@@ -2132,15 +2352,19 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _update_github_issue_title(self, task: dict):
         """Update GitHub issue title in background thread."""
-        from wt import update_issue_title
-        if update_issue_title(task["github_issue"], task["title"]):
-            self.call_from_thread(
-                self.notify, f"Updated GitHub issue: {task['github_issue']}", severity="information"
-            )
-        else:
-            self.call_from_thread(
-                self.notify, "Failed to update GitHub issue title", severity="warning"
-            )
+        self.call_from_thread(self._bg_start, "Updating issue title")
+        try:
+            from wt import update_issue_title
+            if update_issue_title(task["github_issue"], task["title"]):
+                self.call_from_thread(
+                    self.notify, f"Updated GitHub issue: {task['github_issue']}", severity="information"
+                )
+            else:
+                self.call_from_thread(
+                    self.notify, "Failed to update GitHub issue title", severity="warning"
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Updating issue title")
 
     @work(thread=True)
     def _create_github_issue_for_task(self, task: dict, refresh_ui: bool = False):
@@ -2151,6 +2375,7 @@ class WorkloadTracker(App):
                 self.notify, "No GitHub repo configured for this role", severity="warning"
             )
             return
+        self.call_from_thread(self._bg_start, "Creating GitHub issue")
         try:
             # Create the issue
             issue_ref = create_github_issue(task, repo)
@@ -2179,6 +2404,8 @@ class WorkloadTracker(App):
             self.call_from_thread(
                 self.notify, f"Failed to create issue: {e}", severity="error"
             )
+        finally:
+            self.call_from_thread(self._bg_end, "Creating GitHub issue")
 
     def action_link_github(self):
         """Create and link a GitHub issue, or sync project fields if already linked."""
@@ -2233,20 +2460,24 @@ class WorkloadTracker(App):
         if not issue_ref:
             return
 
-        result = setup_issue_in_project(issue_ref, task, self._data)
-        if result["success"]:
-            save_data(self._data)
-            hours = mins_to_quarter_hours(task_logged_mins(task))
-            sprint = get_current_sprint(self._data)
-            sprint_title = sprint["title"] if sprint else "N/A"
-            self.call_from_thread(
-                self.notify, f"Synced to project: {hours}h, {sprint_title}", severity="information"
-            )
-            self.call_from_thread(self._populate_table)
-        else:
-            self.call_from_thread(
-                self.notify, f"Sync errors: {', '.join(result['errors'])}", severity="warning"
-            )
+        self.call_from_thread(self._bg_start, "Syncing to project")
+        try:
+            result = setup_issue_in_project(issue_ref, task, self._data)
+            if result["success"]:
+                save_data(self._data)
+                hours = mins_to_quarter_hours(task_logged_mins(task))
+                sprint = get_current_sprint(self._data)
+                sprint_title = sprint["title"] if sprint else "N/A"
+                self.call_from_thread(
+                    self.notify, f"Synced to project: {hours}h, {sprint_title}", severity="information"
+                )
+                self.call_from_thread(self._populate_table)
+            else:
+                self.call_from_thread(
+                    self.notify, f"Sync errors: {', '.join(result['errors'])}", severity="warning"
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Syncing to project")
 
     def action_update_github(self):
         """Manually sync task state (hours, status, activity, sprint) to GitHub project."""
@@ -2256,24 +2487,27 @@ class WorkloadTracker(App):
         if not task.get("github_issue"):
             self.notify("No GitHub issue linked", severity="warning")
             return
-        self.notify("Syncing to GitHub…", severity="information")
+        self._bg_start("Updating GitHub")
         self._update_github_project(task)
 
     @work(thread=True)
     def _update_github_project(self, task: dict):
         """Push current task state to GitHub project in background."""
-        result = setup_issue_in_project(task["github_issue"], task, self._data)
-        if result["success"]:
-            save_data(self._data)
-            hours = mins_to_quarter_hours(task_logged_mins(task))
-            self.call_from_thread(
-                self.notify, f"GitHub updated: {hours}h", severity="information"
-            )
-            self.call_from_thread(self._populate_table)
-        else:
-            self.call_from_thread(
-                self.notify, f"Update failed: {', '.join(result['errors'])}", severity="warning"
-            )
+        try:
+            result = setup_issue_in_project(task["github_issue"], task, self._data)
+            if result["success"]:
+                save_data(self._data)
+                hours = mins_to_quarter_hours(task_logged_mins(task))
+                self.call_from_thread(
+                    self.notify, f"GitHub updated: {hours}h", severity="information"
+                )
+                self.call_from_thread(self._populate_table)
+            else:
+                self.call_from_thread(
+                    self.notify, f"Update failed: {', '.join(result['errors'])}", severity="warning"
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Updating GitHub")
 
     def _on_create_issue_confirmed(self, task: dict, confirmed: bool):
         """Callback after issue creation confirmation."""
@@ -2299,6 +2533,45 @@ class WorkloadTracker(App):
             return
         webbrowser.open(url)
         self.notify(f"Opened: {issue_ref}", severity="information")
+
+    def action_delete_github_issue(self):
+        """Delete the GitHub issue linked to the selected task."""
+        task = self._selected_task()
+        if not task:
+            return
+        issue_ref = task.get("github_issue")
+        if not issue_ref:
+            self.notify("No GitHub issue linked to this task", severity="warning")
+            return
+        self.push_screen(
+            DeleteGitHubIssueModal(task["title"], issue_ref),
+            lambda confirmed: self._on_delete_issue_confirmed(task, confirmed)
+        )
+
+    def _on_delete_issue_confirmed(self, task: dict, confirmed: bool):
+        if not confirmed:
+            return
+        self._bg_start("Deleting GitHub issue")
+        self._delete_github_issue_worker(task)
+
+    @work(thread=True)
+    def _delete_github_issue_worker(self, task: dict):
+        """Delete GitHub issue in background thread."""
+        issue_ref = task["github_issue"]
+        try:
+            if delete_github_issue(issue_ref):
+                del task["github_issue"]
+                save_data(self._data)
+                self.call_from_thread(
+                    self.notify, f"Deleted issue: {issue_ref}", severity="information"
+                )
+                self.call_from_thread(self._populate_table)
+            else:
+                self.call_from_thread(
+                    self.notify, "Failed to delete issue (may need admin permissions)", severity="error"
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Deleting GitHub issue")
 
     def action_delete_task(self):
         task = self._selected_task()
@@ -2399,6 +2672,7 @@ class WorkloadTracker(App):
         if not self._data.get("config", {}).get("tab_cleanup_enabled"):
             return
         # Run classification in background to avoid blocking UI
+        self._bg_start("Classifying tabs")
         self._arc_tab_cleanup_worker(task)
 
     @work(thread=True)
@@ -2431,6 +2705,8 @@ class WorkloadTracker(App):
             self.call_from_thread(
                 self.notify, f"Tab cleanup failed: {e}", severity="warning"
             )
+        finally:
+            self.call_from_thread(self._bg_end, "Classifying tabs")
 
     def _show_tab_cleanup_modal(self, unrelated_data: list, task_title: str, manager):
         """Show the tab cleanup modal (called from main thread)."""
@@ -2525,17 +2801,21 @@ class WorkloadTracker(App):
 
     def _fetch_gh_hours_and_confirm_close(self, task: dict):
         """Fetch GitHub hours in background, then show confirmation modal."""
+        self._bg_start("Fetching GitHub hours")
         self._fetch_gh_hours_worker(task)
 
     @work(thread=True)
     def _fetch_gh_hours_worker(self, task: dict):
         """Fetch GitHub project hours in background."""
-        gh_hours = None
-        if task.get("github_issue"):
-            gh_hours = get_project_hours(task["github_issue"], self._data)
+        try:
+            gh_hours = None
+            if task.get("github_issue"):
+                gh_hours = get_project_hours(task["github_issue"], self._data)
 
-        local_mins = task_logged_mins(task)
-        self.call_from_thread(self._show_close_confirmation, task, local_mins, gh_hours)
+            local_mins = task_logged_mins(task)
+            self.call_from_thread(self._show_close_confirmation, task, local_mins, gh_hours)
+        finally:
+            self.call_from_thread(self._bg_end, "Fetching GitHub hours")
 
     def _show_close_confirmation(self, task: dict, local_mins: float, gh_hours: float | None):
         """Show the close confirmation modal with hours comparison."""
@@ -2571,56 +2851,60 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _run_close_workflow(self, task: dict, repo: str, create_issue: bool = False):
         """Run the close workflow in a background thread to avoid blocking."""
-        # Create issue if needed
-        if create_issue:
-            try:
-                issue_ref = create_github_issue(task, repo)
-                task["github_issue"] = issue_ref
-                save_data(self._data)
-                self.call_from_thread(self.notify, f"Created issue: {issue_ref}", severity="information")
-
-                # Set up project fields for new issue (status, activity, sprint, hours)
-                result = setup_issue_in_project(issue_ref, task, self._data)
-                if result["success"]:
+        self.call_from_thread(self._bg_start, "Closing task")
+        try:
+            # Create issue if needed
+            if create_issue:
+                try:
+                    issue_ref = create_github_issue(task, repo)
+                    task["github_issue"] = issue_ref
                     save_data(self._data)
-            except Exception as e:
-                self.call_from_thread(self.notify, f"Failed to create issue: {e}", severity="error")
-                return
+                    self.call_from_thread(self.notify, f"Created issue: {issue_ref}", severity="information")
 
-        # Update project if configured
-        config = self._data.get("config", {})
-        if config.get("github_project_number"):
-            try:
-                total_mins = task_logged_mins(task)
-                hours = mins_to_quarter_hours(total_mins)
-                add_to_project_and_update(task["github_issue"], hours, self._data)
+                    # Set up project fields for new issue (status, activity, sprint, hours)
+                    result = setup_issue_in_project(issue_ref, task, self._data)
+                    if result["success"]:
+                        save_data(self._data)
+                except Exception as e:
+                    self.call_from_thread(self.notify, f"Failed to create issue: {e}", severity="error")
+                    return
 
-                # Mark logs as uploaded
-                from wt import mark_logs_uploaded
-                mark_logs_uploaded(task)
-                save_data(self._data)
+            # Update project if configured
+            config = self._data.get("config", {})
+            if config.get("github_project_number"):
+                try:
+                    total_mins = task_logged_mins(task)
+                    hours = mins_to_quarter_hours(total_mins)
+                    add_to_project_and_update(task["github_issue"], hours, self._data)
 
-                # Set activity if role has one configured
-                activity = get_role_activity(task, self._data)
-                if activity:
-                    update_project_activity(task["github_issue"], activity, self._data)
-                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Activity: {activity})", severity="information")
-                else:
-                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h)", severity="information")
-            except Exception as e:
-                self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
+                    # Mark logs as uploaded
+                    from wt import mark_logs_uploaded
+                    mark_logs_uploaded(task)
+                    save_data(self._data)
 
-        # Close the GitHub issue
-        if task.get("github_issue"):
-            if close_github_issue(task["github_issue"]):
-                self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
+                    # Set activity if role has one configured
+                    activity = get_role_activity(task, self._data)
+                    if activity:
+                        update_project_activity(task["github_issue"], activity, self._data)
+                        self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Activity: {activity})", severity="information")
+                    else:
+                        self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h)", severity="information")
+                except Exception as e:
+                    self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
 
-        # Mark as done
-        task["status"] = "done"
-        save_data(self._data)
+            # Close the GitHub issue
+            if task.get("github_issue"):
+                if close_github_issue(task["github_issue"]):
+                    self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
 
-        # Update UI from main thread
-        self.call_from_thread(self._finish_close_workflow, task)
+            # Mark as done
+            task["status"] = "done"
+            save_data(self._data)
+
+            # Update UI from main thread
+            self.call_from_thread(self._finish_close_workflow, task)
+        finally:
+            self.call_from_thread(self._bg_end, "Closing task")
 
     def _finish_close_workflow(self, task: dict):
         """Update UI after close workflow completes."""
@@ -2648,9 +2932,13 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _sync_project_status_async(self, task: dict, status: str):
         """Sync task status to GitHub project in background thread."""
-        if sync_project_status(task["github_issue"], status, self._data):
-            status_label = {"todo": "Todo", "inprogress": "In Progress", "done": "Done"}.get(status, status)
-            self.call_from_thread(self.notify, f"Project status: {status_label}", severity="information")
+        self.call_from_thread(self._bg_start, "Syncing status")
+        try:
+            if sync_project_status(task["github_issue"], status, self._data):
+                status_label = {"todo": "Todo", "inprogress": "In Progress", "done": "Done"}.get(status, status)
+                self.call_from_thread(self.notify, f"Project status: {status_label}", severity="information")
+        finally:
+            self.call_from_thread(self._bg_end, "Syncing status")
 
 
 if __name__ == "__main__":

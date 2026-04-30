@@ -199,7 +199,8 @@ Import calendar events as tasks with automatic time logging.
 ```bash
 wt calendar                  # List events from yesterday & today
 wt calendar 7                # List events from last 7 days
-wt calendar import <event>   # Import event as task (prompts for time)
+wt calendar import <event>   # Import event as new task
+wt calendar import <event> --task <task>  # Log event time to existing task
 wt calendar setup            # Show setup instructions
 ```
 
@@ -217,14 +218,19 @@ wt calendar setup            # Show setup instructions
 wt config calendar_id your.email@gmail.com  # Use specific calendar (default: primary)
 ```
 
-**Import flow**:
+**Import flow** (new task):
 1. Shows event details (title, time, duration)
 2. Prompts for role selection
 3. Prompts for time: `[Y/n/minutes]` - confirm, skip, or adjust duration
 4. Creates task with status "done" and logs time with original timestamps
 
-**Tracking**: Imported events store `calendar_event_uid` to prevent duplicate imports. Already-imported events show with ✓ in the list.
-- User receives a Textual notification in the TUI
+**Log to existing task** (CLI `--task` flag, TUI `l` key):
+- Logs the calendar event's time to an existing task instead of creating a new one
+- Useful for recurring meetings or events that belong to an ongoing task
+- The `calendar_event_uid` is stored on the log entry to prevent duplicate imports
+
+**Tracking**: Imported events store `calendar_event_uid` (on tasks or log entries) to prevent duplicate imports. Already-imported events show with ✓ in the list.
+- **TUI keybindings**: `i` = import as new task, `l` = log to existing task, `d` = delete imported task
 
 ### Task Closing Workflow with GitHub Project Integration
 

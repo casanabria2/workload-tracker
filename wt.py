@@ -46,7 +46,7 @@ Usage:
 
     wt calendar                  — List events from yesterday & today
     wt calendar <days>           — List events from last N days
-    wt calendar import <event>   — Import event as task (prompts for time)
+    wt calendar import <event> [--task <task>]  — Import event (or log to existing task)
     wt calendar setup            — Show Google Calendar setup instructions
 
     wt arc setup                 — Set up Arc browser integration
@@ -130,6 +130,18 @@ def get_roles(data: dict) -> dict:
 def get_role_ids(data: dict) -> list:
     """Return list of role IDs"""
     return [r["id"] for r in data.get("roles", [])]
+
+
+def get_imported_calendar_uids(data: dict) -> set:
+    """Collect all imported calendar event UIDs from tasks and log entries."""
+    uids = set()
+    for t in data.get("tasks", []):
+        if t.get("calendar_event_uid"):
+            uids.add(t["calendar_event_uid"])
+        for log in t.get("logs", []):
+            if log.get("calendar_event_uid"):
+                uids.add(log["calendar_event_uid"])
+    return uids
 
 
 def fmt_mins(mins: float) -> str:
@@ -834,6 +846,17 @@ def close_github_issue(issue_ref: str) -> bool:
     """Close a GitHub issue. Returns True on success."""
     result = subprocess.run(
         ["gh", "issue", "close", *gh_issue_args(issue_ref)],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
+def delete_github_issue(issue_ref: str) -> bool:
+    """Permanently delete a GitHub issue. Returns True on success.
+    WARNING: This is irreversible and removes all comments and history.
+    """
+    result = subprocess.run(
+        ["gh", "issue", "delete", *gh_issue_args(issue_ref), "--yes"],
         capture_output=True, text=True
     )
     return result.returncode == 0
@@ -2806,18 +2829,37 @@ def cmd_calendar(args):
         return
 
     if args and args[0].lower() == "import":
-        # Import mode: wt calendar import <event-title>
+        # Import mode: wt calendar import <event-title> [--task <task-name>]
         if len(args) < 2:
-            print("Usage: wt calendar import <event-title>")
+            print("Usage: wt calendar import <event-title> [--task <task-name>]")
             sys.exit(1)
 
-        query = " ".join(args[1:])
+        # Parse --task flag
+        target_task = None
+        remaining_args = args[1:]
+        if "--task" in remaining_args:
+            idx = remaining_args.index("--task")
+            if idx + 1 >= len(remaining_args):
+                print(c("--task requires a task name", "red"))
+                sys.exit(1)
+            task_query = " ".join(remaining_args[idx + 1:])
+            remaining_args = remaining_args[:idx]
+            target_task = resolve_task(data, task_query)
+            if not target_task:
+                print(c(f"No task found matching '{task_query}'", "red"))
+                sys.exit(1)
+
+        if not remaining_args:
+            print("Usage: wt calendar import <event-title> [--task <task-name>]")
+            sys.exit(1)
+
+        query = " ".join(remaining_args)
 
         # Get events to find a match
         events = get_calendar_events(days_back=7, calendar_id=calendar_id)  # Search wider range for import
 
         # Check which events are already imported
-        imported_uids = {t.get("calendar_event_uid") for t in data.get("tasks", [])}
+        imported_uids = get_imported_calendar_uids(data)
 
         # Find matching event (case-insensitive partial match)
         q = query.lower()
@@ -2852,28 +2894,6 @@ def cmd_calendar(args):
         print(f"  Calendar: {event['calendar_name']}")
         print()
 
-        # Prompt for role
-        roles = data.get("roles", [])
-        print(c("  Select role:", "bold"))
-        for i, r in enumerate(roles, 1):
-            print(f"    {i}. {r['label']} ({r['id']})")
-        print()
-
-        try:
-            role_choice = input(f"  Role (1-{len(roles)}): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            sys.exit(0)
-
-        role_id = "other"
-        if role_choice:
-            try:
-                role_idx = int(role_choice) - 1
-                if 0 <= role_idx < len(roles):
-                    role_id = roles[role_idx]["id"]
-            except ValueError:
-                pass
-
         # Prompt for time logging
         duration = event["duration_mins"]
         print()
@@ -2894,38 +2914,76 @@ def cmd_calendar(args):
                 print(c("Invalid input, logging full duration.", "yellow"))
                 log_minutes = duration
 
-        # Create task
-        task = {
-            "id": uid(),
-            "title": event["title"],
-            "description": event.get("notes", ""),
-            "role_id": role_id,
-            "status": "done",  # Calendar events are typically already completed
-            "logs": [],
-            "created_at": time.time(),
-            "calendar_event_uid": event["uid"],
-        }
+        if target_task:
+            # Log to existing task
+            if log_minutes and log_minutes > 0:
+                target_task["logs"].append({
+                    "id": uid(),
+                    "minutes": round(log_minutes, 2),
+                    "note": f"Calendar: {event['title']}",
+                    "at": event["end_date"],
+                    "started_at": event["start_date"],
+                    "ended_at": event["end_date"],
+                    "calendar_event_uid": event["uid"],
+                })
+                save(data)
+                print(c(f"\n✓ Logged {fmt_mins(log_minutes)} to '{target_task['title']}'", "green"))
+            else:
+                print(c("No time to log.", "dim"))
+        else:
+            # Create new task
+            # Prompt for role
+            roles = data.get("roles", [])
+            print(c("  Select role:", "bold"))
+            for i, r in enumerate(roles, 1):
+                print(f"    {i}. {r['label']} ({r['id']})")
+            print()
 
-        # Add time log if requested
-        if log_minutes and log_minutes > 0:
-            task["logs"].append({
+            try:
+                role_choice = input(f"  Role (1-{len(roles)}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+
+            role_id = "other"
+            if role_choice:
+                try:
+                    role_idx = int(role_choice) - 1
+                    if 0 <= role_idx < len(roles):
+                        role_id = roles[role_idx]["id"]
+                except ValueError:
+                    pass
+
+            task = {
                 "id": uid(),
-                "minutes": round(log_minutes, 2),
-                "note": f"From calendar: {event['calendar_name']}",
-                "at": event["end_date"],
-                "started_at": event["start_date"],
-                "ended_at": event["end_date"],
-            })
+                "title": event["title"],
+                "description": event.get("notes", ""),
+                "role_id": role_id,
+                "status": "done",
+                "logs": [],
+                "created_at": time.time(),
+                "calendar_event_uid": event["uid"],
+            }
 
-        data["tasks"].insert(0, task)
-        save(data)
+            if log_minutes and log_minutes > 0:
+                task["logs"].append({
+                    "id": uid(),
+                    "minutes": round(log_minutes, 2),
+                    "note": f"From calendar: {event['calendar_name']}",
+                    "at": event["end_date"],
+                    "started_at": event["start_date"],
+                    "ended_at": event["end_date"],
+                })
 
-        role_label = get_roles(data).get(role_id, role_id)
-        print(c(f"\n✓ Created: {task['title']}", "green"))
-        print(f"  [{role_label}] [Done]")
-        if log_minutes:
-            print(c(f"  Logged: {fmt_mins(log_minutes)}", "dim"))
-        print(c(f"  id: {task['id']}", "dim"))
+            data["tasks"].insert(0, task)
+            save(data)
+
+            role_label = get_roles(data).get(role_id, role_id)
+            print(c(f"\n✓ Created: {task['title']}", "green"))
+            print(f"  [{role_label}] [Done]")
+            if log_minutes:
+                print(c(f"  Logged: {fmt_mins(log_minutes)}", "dim"))
+            print(c(f"  id: {task['id']}", "dim"))
         return
 
     # List mode: wt calendar [days]
@@ -2945,7 +3003,7 @@ def cmd_calendar(args):
         return
 
     # Check which events are already imported
-    imported_uids = {t.get("calendar_event_uid") for t in data.get("tasks", [])}
+    imported_uids = get_imported_calendar_uids(data)
 
     # Group events by date
     events_by_date = {}
@@ -2991,7 +3049,7 @@ def cmd_calendar(args):
     not_imported = len([e for e in events if e["uid"] not in imported_uids])
     if not_imported > 0:
         print(c(f"  {not_imported} events available to import.", "dim"))
-        print(c("  Use: wt calendar import <event-title>", "dim"))
+        print(c("  Use: wt calendar import <event-title> [--task <task-name>]", "dim"))
     else:
         print(c("  All events have been imported.", "dim"))
     print()
