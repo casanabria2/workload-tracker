@@ -1,0 +1,11 @@
+#!/bin/bash
+# Wrapper script for workload tracker CLI
+# Makes 'wt' available as a command (required for zsh autocompletion)
+REAL_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c "import os; print(os.path.realpath('${BASH_SOURCE[0]}'))")"
+SCRIPT_DIR="$(dirname "$REAL_PATH")"
+VENV_PYTHON="${SCRIPT_DIR}/venv/bin/python"
+if [[ -x "$VENV_PYTHON" ]]; then
+    exec "$VENV_PYTHON" "${SCRIPT_DIR}/wt.py" "$@"
+else
+    exec python3 "${SCRIPT_DIR}/wt.py" "$@"
+fi

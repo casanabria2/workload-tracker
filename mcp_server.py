@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from wt import sync_project_status
+from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -162,6 +162,7 @@ def add_task(
     status: str = "todo",
     description: str = "",
     github_issue: str = "",
+    sprint: str = "",
 ) -> str:
     """Add a new task to the workload tracker.
 
@@ -171,6 +172,7 @@ def add_task(
         status: One of: todo, inprogress, done (default: todo)
         description: Optional task description
         github_issue: Optional GitHub issue reference (e.g., owner/repo#123)
+        sprint: Sprint title (e.g., "Sprint 43"). Auto-assigns current sprint if empty.
     """
     data = load()
     roles = get_roles(data)
@@ -191,9 +193,26 @@ def add_task(
     }
     if github_issue:
         task["github_issue"] = github_issue
+
+    # Sprint assignment
+    if sprint and sprint.lower() != "none":
+        all_sprints = get_all_sprints(data)
+        match = _match_sprint(all_sprints, sprint)
+        if match:
+            task["sprint"] = match["title"]
+            task["sprint_id"] = match["id"]
+        else:
+            return f"Error: Sprint '{sprint}' not found. Use list_sprints() to see available sprints."
+    elif sprint.lower() != "none" if sprint else True:
+        current = get_current_sprint(data)
+        if current:
+            task["sprint"] = current["title"]
+            task["sprint_id"] = current["id"]
+
     data["tasks"].insert(0, task)
     save(data)
-    result = f"Created task '{title}' (id: {task['id']}) [{roles[role]}] [{STATUS_LABELS[status]}]"
+    sprint_info = f" [{task.get('sprint', 'no sprint')}]" if task.get("sprint") else ""
+    result = f"Created task '{title}' (id: {task['id']}) [{roles[role]}] [{STATUS_LABELS[status]}]{sprint_info}"
     if github_issue:
         result += f" [GitHub: {github_issue}]"
     return result
@@ -215,6 +234,9 @@ def list_tasks(role: str | None = None, status: str | None = None, include_done:
     at = data.get("active_timer")
     roles = get_roles(data)
 
+    # Always hide shadow tasks (cross-sprint splits)
+    tasks = [t for t in tasks if not t.get("cross_sprint_parent")]
+
     if role:
         tasks = [t for t in tasks if t.get("role_id") == role]
     if status:
@@ -231,10 +253,11 @@ def list_tasks(role: str | None = None, status: str | None = None, include_done:
         running = at and at.get("task_id") == task["id"]
         logged = task_logged_mins(task) + task_live_mins(task, at)
         timer_icon = "▶ " if running else ""
+        sprint_str = f" | Sprint: {task['sprint']}" if task.get("sprint") else ""
         lines.append(
             f"{timer_icon}{task['title']}\n"
             f"  ID: {task['id']} | Role: {roles.get(task['role_id'], task['role_id'])} | "
-            f"Status: {STATUS_LABELS.get(task['status'], task['status'])} | Time: {fmt_mins(logged)}"
+            f"Status: {STATUS_LABELS.get(task['status'], task['status'])} | Time: {fmt_mins(logged)}{sprint_str}"
         )
 
     return "\n\n".join(lines)
@@ -261,6 +284,7 @@ def get_task(task_query: str) -> str:
         f"Title: {task['title']}",
         f"ID: {task['id']}",
         f"Role: {roles.get(task['role_id'], task['role_id'])}",
+        f"Sprint: {task.get('sprint') or '(none)'}",
         f"Status: {STATUS_LABELS.get(task['status'], task['status'])}",
         f"Time logged: {fmt_mins(logged)}",
         f"Timer running: {'Yes' if running else 'No'}",
@@ -1361,6 +1385,113 @@ def sync_arc_folders() -> str:
         lines.append("\nRestart Arc to see the changes.")
 
     return "\n".join(lines)
+
+
+# ── Sprint Management ──────────────────────────────────────
+
+
+@mcp.tool()
+def list_sprints() -> str:
+    """List all available sprint iterations from the GitHub project."""
+    data = load()
+    sprints = get_all_sprints(data)
+    if not sprints:
+        return "No sprints found (project not configured or query failed)."
+
+    current = get_current_sprint(data)
+    current_id = current["id"] if current else None
+
+    lines = ["Available sprints:"]
+    for s in sprints:
+        marker = " ← current" if s["id"] == current_id else ""
+        lines.append(f"  {s['title']} ({s['startDate']}, {s['duration']} days){marker}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_current_sprint_info() -> str:
+    """Get information about the current sprint."""
+    data = load()
+    current = get_current_sprint(data)
+    if not current:
+        return "No active sprint found."
+    return (
+        f"Current sprint: {current['title']}\n"
+        f"Start: {current['startDate']}\n"
+        f"Duration: {current['duration']} days"
+    )
+
+
+@mcp.tool()
+def set_sprint(task_query: str, sprint_title: str) -> str:
+    """Set or change the sprint for a task.
+
+    Args:
+        task_query: Task ID or partial title
+        sprint_title: Sprint title (e.g., "Sprint 43") or "none" to clear
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    if sprint_title.lower() == "none":
+        task.pop("sprint", None)
+        task.pop("sprint_id", None)
+        save(data)
+        return f"Cleared sprint for '{task['title']}'"
+
+    all_sprints = get_all_sprints(data)
+    if not all_sprints:
+        return "No sprints found."
+
+    match = _match_sprint(all_sprints, sprint_title)
+    if not match:
+        available = ", ".join(s["title"] for s in all_sprints[-5:])
+        return f"No sprint matching '{sprint_title}'. Recent: {available}"
+
+    task["sprint"] = match["title"]
+    task["sprint_id"] = match["id"]
+    save(data)
+    return f"Set sprint for '{task['title']}' to {match['title']}"
+
+
+@mcp.tool()
+def sprint_split(task_query: str) -> str:
+    """Split a cross-sprint task: create shadow tasks for previous sprints.
+
+    If a task has time logged in multiple sprints, this creates separate GitHub
+    issues for each previous sprint with the correct hours, and updates the main
+    task to only show the most recent sprint's hours.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    all_sprints = get_all_sprints(data)
+    if not all_sprints:
+        return "No sprints found."
+
+    summary = sprint_summary_for_task(task, all_sprints)
+    if len(summary) <= 1:
+        sprint_name = summary[0]["sprint_title"] if summary else task.get("sprint", "unknown")
+        return f"Task '{task['title']}' only has time in {sprint_name}. No split needed."
+
+    from wt import fmt_mins as wt_fmt
+    result = split_cross_sprint_task(task, data, save, all_sprints)
+    if result.get("success"):
+        lines = [f"Split '{task['title']}' across {len(summary)} sprints:"]
+        for st in result.get("sprint_tasks_created", []):
+            issue = st.get("issue_ref", "no issue")
+            lines.append(f"  {st['sprint']}: {wt_fmt(st['total_mins'])} → {issue}")
+        lines.append(f"  Main task: {result.get('main_sprint', '?')}")
+        return "\n".join(lines)
+    else:
+        return f"Split failed: {result.get('error', 'unknown')}"
 
 
 if __name__ == "__main__":

@@ -46,6 +46,9 @@ _wt() {
         'delete-log:Delete a log entry'
         'split-log:Split a log entry'
         'merge-logs:Merge two log entries'
+        'sprint:Show sprint info'
+        'set-sprint:Set sprint for a task'
+        'split-sprint:Split cross-sprint task'
     )
 
     if (( CURRENT == 2 )); then
@@ -84,7 +87,8 @@ for t in data.get('tasks', []):
             _arguments \
                 "--role[Role]:role:(${roles[*]})" \
                 '--status[Status]:status:(todo inprogress done)' \
-                '--desc[Description]:'
+                '--desc[Description]:' \
+                '--sprint[Sprint]:sprint:(none)'
             ;;
         list|ls)
             local -a roles
@@ -240,7 +244,7 @@ for t in data.get('tasks', []):
                 _describe -t options 'presence option' options
             fi
             ;;
-        rename|mv|logs|edit-log|delete-log|split-log|merge-logs)
+        rename|mv|logs|edit-log|delete-log|split-log|merge-logs|split-sprint)
             local -a tasks
             tasks=("${(@f)$(python3 -c "
 import json
@@ -250,6 +254,23 @@ for t in data.get('tasks', []):
     print(t['title'])
 " 2>/dev/null)}")
             compadd -Q "${tasks[@]}"
+            ;;
+        set-sprint)
+            if (( CURRENT == 3 )); then
+                # Complete task names
+                local -a tasks
+                tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+                compadd -Q "${tasks[@]}"
+            elif (( CURRENT == 4 )); then
+                # Complete sprint names (includes "none")
+                compadd "none"
+            fi
             ;;
     esac
 }

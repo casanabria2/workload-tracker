@@ -25,17 +25,17 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, done, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, sprint, set-sprint, split-sprint.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
 ### Data Model
 
 Plain JSON with three top-level keys:
-- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `calendar_event_uid`
+- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `calendar_event_uid`, `sprint`, `sprint_id`, `cross_sprint_parent`
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color, and optionally `github_repo`. Roles are user-configurable via `wt roles` commands.
 
@@ -299,6 +299,48 @@ set_task_status("My task", "done", create_issue=True)
 set_role_repo("demokit", "grafana/field-eng-demo-kit")
 set_role_repo("other")  # Clear repo (disables GitHub integration for role)
 ```
+
+### Sprint Tracking
+
+Tasks are assigned to sprints (GitHub Project iterations). Sprints are auto-assigned on task creation.
+
+**Task fields:**
+- `sprint` — Sprint title for display (e.g., "Sprint 43")
+- `sprint_id` — GitHub iteration ID for API calls
+- `cross_sprint_parent` — If set, this is a shadow task created by cross-sprint split (hidden from views)
+
+**CLI commands:**
+```bash
+wt sprint                           # Show current sprint + tasks by sprint
+wt set-sprint <task> <sprint>       # Set/change sprint for a task
+wt set-sprint <task> none           # Clear sprint
+wt split-sprint <task>              # Split cross-sprint task into per-sprint shadow tasks
+wt add "title" --sprint "Sprint 43" # Create task with specific sprint
+wt add "title" --sprint none        # Create task without sprint
+```
+
+**Three task lifecycle patterns:**
+1. **Single-sprint**: Fully contained in one sprint. Auto-assigned, no special handling.
+2. **Recurrent**: User creates one task per sprint manually (e.g., "Slack questions" per sprint).
+3. **Cross-sprint**: Task spans multiple sprints. `split-sprint` or close workflow creates shadow tasks.
+
+**Cross-sprint split workflow:**
+When a task has logs in multiple sprints (detected via log timestamps):
+1. For each **previous sprint**: creates a shadow task + GH issue with that sprint's hours, closes it
+2. **Main task**: updated to most recent sprint with only that sprint's hours on GH
+3. Shadow tasks have `cross_sprint_parent` field → hidden from all default views
+4. Original task keeps ALL logs (source of truth)
+
+**Auto-detection:** TUI checks for cross-sprint tasks on mount and shows a notification.
+
+**Key functions in wt.py:**
+- `get_all_sprints(data)` — All sprint iterations from GitHub Project (GraphQL)
+- `get_current_sprint(data)` — Current sprint based on today's date
+- `find_sprint_for_date(sprints, dt)` — Find which sprint a date falls in
+- `sprint_summary_for_task(task, sprints)` — Per-sprint time breakdown
+- `split_cross_sprint_task(task, data, save_callback)` — Execute the split
+
+**MCP tools:** `list_sprints`, `get_current_sprint_info`, `set_sprint`, `sprint_split`
 
 ### GitHub CLI (gh) Reference
 

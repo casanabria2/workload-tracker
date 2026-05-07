@@ -156,6 +156,35 @@ def task_logged_mins(task: dict) -> float:
     return sum(l.get("minutes", 0) for l in task.get("logs", []))
 
 
+def task_logged_mins_for_sprint(task: dict, sprints: list) -> float:
+    """Sum log minutes that fall within the task's assigned sprint.
+
+    If the task has no sprint_id or sprint not found, returns total logged minutes.
+    Used when reporting hours to GitHub: a task split across sprints keeps all
+    logs locally but should only report its assigned sprint's hours to GH.
+    """
+    sprint_id = task.get("sprint_id")
+    if not sprint_id or not sprints:
+        return task_logged_mins(task)
+
+    sprint = next((s for s in sprints if s["id"] == sprint_id), None)
+    if not sprint or not sprint.get("start_date"):
+        return task_logged_mins(task)
+
+    from datetime import datetime
+    total = 0.0
+    for log in task.get("logs", []):
+        ts = log.get("started_at") or log.get("at", 0)
+        if not ts:
+            # No timestamp: attribute to task's sprint
+            total += log.get("minutes", 0)
+            continue
+        log_date = datetime.fromtimestamp(ts).date()
+        if sprint["start_date"] <= log_date < sprint["end_date"]:
+            total += log.get("minutes", 0)
+    return total
+
+
 def task_uploaded_mins(task: dict) -> float:
     """Sum of minutes from logs that have been uploaded to GitHub."""
     return sum(l.get("minutes", 0) for l in task.get("logs", []) if l.get("uploaded_at"))
@@ -431,10 +460,13 @@ def get_project_info(data: dict) -> dict:
     }
 
 
-def get_current_sprint(data: dict) -> dict | None:
-    """Get the current sprint iteration based on today's date.
+def get_all_sprints(data: dict) -> list[dict]:
+    """Get all sprint iterations from the GitHub project.
 
-    Returns dict with id, title, startDate, duration or None if not found.
+    Returns list of dicts sorted by startDate ascending:
+        [{id, title, startDate, duration, field_id, start_date, end_date}, ...]
+    where start_date/end_date are datetime.date objects.
+    Returns [] if project not configured or query fails.
     """
     from datetime import datetime, timedelta
 
@@ -443,9 +475,8 @@ def get_current_sprint(data: dict) -> dict | None:
     project_num = config.get("github_project_number")
 
     if not project_num:
-        return None
+        return []
 
-    # Query sprint iterations via GraphQL
     query = f'''query {{
         organization(login: "{owner}") {{
             projectV2(number: {project_num}) {{
@@ -455,6 +486,12 @@ def get_current_sprint(data: dict) -> dict | None:
                         name
                         configuration {{
                             iterations {{
+                                id
+                                title
+                                startDate
+                                duration
+                            }}
+                            completedIterations {{
                                 id
                                 title
                                 startDate
@@ -472,34 +509,281 @@ def get_current_sprint(data: dict) -> dict | None:
     ], capture_output=True, text=True)
 
     if result.returncode != 0:
-        return None
+        return []
 
     try:
         response = json.loads(result.stdout)
         field = response.get("data", {}).get("organization", {}).get("projectV2", {}).get("field", {})
-        iterations = field.get("configuration", {}).get("iterations", [])
+        config_data = field.get("configuration", {})
+        iterations = config_data.get("iterations", []) + config_data.get("completedIterations", [])
+        field_id = field.get("id")
 
-        today = datetime.now().date()
-
+        sprints = []
         for iteration in iterations:
             start_date = datetime.strptime(iteration["startDate"], "%Y-%m-%d").date()
             end_date = start_date + timedelta(days=iteration["duration"])
+            sprints.append({
+                "id": iteration["id"],
+                "title": iteration["title"],
+                "startDate": iteration["startDate"],
+                "duration": iteration["duration"],
+                "field_id": field_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            })
 
-            if start_date <= today < end_date:
-                return {
-                    "id": iteration["id"],
-                    "title": iteration["title"],
-                    "startDate": iteration["startDate"],
-                    "duration": iteration["duration"],
-                    "field_id": field.get("id"),
-                }
-
-        return None
+        sprints.sort(key=lambda s: s["startDate"])
+        return sprints
     except Exception:
+        return []
+
+
+def get_current_sprint(data: dict) -> dict | None:
+    """Get the current sprint iteration based on today's date."""
+    from datetime import datetime
+    today = datetime.now().date()
+    return find_sprint_for_date(get_all_sprints(data), today)
+
+
+def find_sprint_for_date(sprints: list[dict], dt) -> dict | None:
+    """Find which sprint a date falls in.
+
+    Args:
+        sprints: List from get_all_sprints()
+        dt: datetime.date object
+
+    Returns matching sprint dict or None if date falls outside all sprints.
+    """
+    if not dt:
         return None
+    for s in sprints:
+        if s["start_date"] <= dt < s["end_date"]:
+            return s
+    return None
 
 
-def update_project_sprint(issue_ref: str, sprint_id: str, sprint_field_id: str, data: dict) -> bool:
+def log_effective_date(log: dict) -> float:
+    """Return the best timestamp for determining which sprint a log belongs to.
+
+    Uses started_at (when work happened) if available, falls back to at (when logged).
+    """
+    return log.get("started_at") or log.get("at", 0)
+
+
+def bucket_logs_by_sprint(task: dict, sprints: list[dict]) -> dict:
+    """Group task logs by sprint based on their effective date.
+
+    Returns dict mapping sprint_id -> list of logs.
+    Logs outside any sprint are mapped to None key.
+    """
+    from datetime import datetime
+    buckets = {}
+    for log in task.get("logs", []):
+        ts = log_effective_date(log)
+        dt = datetime.fromtimestamp(ts).date() if ts else None
+        sprint = find_sprint_for_date(sprints, dt) if dt else None
+        key = sprint["id"] if sprint else None
+        buckets.setdefault(key, []).append(log)
+    return buckets
+
+
+def sprint_summary_for_task(task: dict, sprints: list[dict]) -> list[dict]:
+    """Get per-sprint breakdown of logged time for a task.
+
+    Returns list of dicts sorted by sprint start date:
+        [{sprint_id, sprint_title, field_id, start_date, logs, total_mins}, ...]
+    Only includes sprints that have logged time (excludes None bucket).
+    """
+    buckets = bucket_logs_by_sprint(task, sprints)
+    sprint_map = {s["id"]: s for s in sprints}
+    result = []
+    for sprint_id, logs in buckets.items():
+        if sprint_id is None:
+            continue
+        s = sprint_map.get(sprint_id, {})
+        result.append({
+            "sprint_id": sprint_id,
+            "sprint_title": s.get("title", "Unknown"),
+            "field_id": s.get("field_id"),
+            "start_date": s.get("startDate", ""),
+            "logs": logs,
+            "total_mins": sum(l.get("minutes", 0) for l in logs),
+        })
+    result.sort(key=lambda x: x["start_date"])
+    return result
+
+
+def _match_sprint(sprints: list[dict], query: str) -> dict | None:
+    """Fuzzy match a sprint by title. Returns the sprint dict or None."""
+    q = query.lower().strip()
+    # Exact match first
+    for s in sprints:
+        if s["title"].lower() == q:
+            return s
+    # Partial match
+    matches = [s for s in sprints if q in s["title"].lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def split_cross_sprint_task(task: dict, data: dict, save_callback,
+                            all_sprints: list[dict] = None,
+                            progress_callback=None) -> dict:
+    """Split a task that has logs spanning multiple sprints.
+
+    Creates shadow tasks for previous sprints with their own GH issues.
+    The original task is updated to the most recent sprint.
+
+    Args:
+        progress_callback: Optional function(msg) called with progress updates.
+
+    Returns dict with:
+        success, sprint_tasks_created, main_sprint, error
+    """
+    def progress(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    result = {
+        "success": False,
+        "sprint_tasks_created": [],
+        "main_sprint": None,
+        "error": None,
+    }
+
+    if all_sprints is None:
+        progress("Fetching sprints...")
+        all_sprints = get_all_sprints(data)
+    if not all_sprints:
+        result["error"] = "No sprints found"
+        return result
+
+    summary = sprint_summary_for_task(task, all_sprints)
+    if len(summary) <= 1:
+        result["error"] = "Task only has time in one sprint"
+        return result
+
+    # Most recent sprint (last in sorted list) stays on original task
+    main_sprint_info = summary[-1]
+    previous_sprints = summary[:-1]
+
+    repo = get_role_repo(task, data)
+    config = data.get("config", {})
+    has_project = bool(config.get("github_project_number"))
+
+    # Pre-fetch project info once (avoids repeated API calls)
+    pi = None
+    if has_project:
+        progress("Fetching project info...")
+        try:
+            pi = get_project_info(data)
+        except Exception:
+            pass
+
+    for sprint_info in previous_sprints:
+        sprint_label = sprint_info["sprint_title"]
+        shadow_title = f"{task['title']} ({sprint_label})"
+        shadow_task = {
+            "id": uid(),
+            "title": shadow_title,
+            "description": f"Sprint split from: {task['title']}",
+            "role_id": task.get("role_id", "other"),
+            "status": "done",
+            "logs": [{
+                "id": uid(),
+                "minutes": sprint_info["total_mins"],
+                "note": f"Sprint split: {fmt_mins(sprint_info['total_mins'])} from {task['title']}",
+                "at": time.time(),
+            }],
+            "created_at": time.time(),
+            "sprint": sprint_label,
+            "sprint_id": sprint_info["sprint_id"],
+            "cross_sprint_parent": task["id"],
+        }
+
+        created_info = {
+            "sprint": sprint_label,
+            "total_mins": sprint_info["total_mins"],
+            "issue_ref": None,
+        }
+
+        # Create GH issue if role has a repo
+        if repo:
+            try:
+                progress(f"  {sprint_label}: Creating issue...")
+                issue_ref = create_github_issue(
+                    {**shadow_task, "title": shadow_title}, repo
+                )
+                shadow_task["github_issue"] = issue_ref
+                created_info["issue_ref"] = issue_ref
+
+                if pi:
+                    progress(f"  {sprint_label}: Adding to project...")
+                    item_id = add_issue_to_project(issue_ref, data)
+
+                    progress(f"  {sprint_label}: Setting fields...")
+                    sync_project_status(issue_ref, "done", data, project_info=pi, item_id=item_id)
+
+                    hours = mins_to_quarter_hours(sprint_info["total_mins"])
+                    update_project_hours(issue_ref, hours, data, project_info=pi, item_id=item_id)
+
+                    if sprint_info.get("field_id"):
+                        update_project_sprint(
+                            issue_ref, sprint_info["sprint_id"],
+                            sprint_info["field_id"], data,
+                            project_info=pi, item_id=item_id
+                        )
+
+                    activity = get_role_activity(task, data)
+                    if activity:
+                        update_project_activity(issue_ref, activity, data, project_info=pi, item_id=item_id)
+
+                # Add comment linking to main task
+                main_issue = task.get("github_issue", "")
+                if main_issue:
+                    progress(f"  {sprint_label}: Adding comment...")
+                    comment = f"Sprint split from {main_issue}. See that issue for full details and notes."
+                    add_issue_comment(issue_ref, comment)
+
+                progress(f"  {sprint_label}: Closing issue...")
+                close_github_issue(issue_ref)
+                mark_logs_uploaded(shadow_task)
+
+            except Exception as e:
+                created_info["error"] = str(e)
+
+        data["tasks"].append(shadow_task)
+        result["sprint_tasks_created"].append(created_info)
+
+    # Update main task sprint to most recent
+    task["sprint"] = main_sprint_info["sprint_title"]
+    task["sprint_id"] = main_sprint_info["sprint_id"]
+    result["main_sprint"] = main_sprint_info["sprint_title"]
+
+    # Update main task's GH issue hours to only the most recent sprint's hours
+    if task.get("github_issue") and pi:
+        progress(f"  Main task: Updating hours and sprint...")
+        main_item_id = add_issue_to_project(task["github_issue"], data)
+        main_hours = mins_to_quarter_hours(main_sprint_info["total_mins"])
+        update_project_hours(task["github_issue"], main_hours, data, project_info=pi, item_id=main_item_id)
+        if main_sprint_info.get("field_id"):
+            update_project_sprint(
+                task["github_issue"], main_sprint_info["sprint_id"],
+                main_sprint_info["field_id"], data,
+                project_info=pi, item_id=main_item_id
+            )
+
+    # Mark all original task logs as uploaded
+    mark_logs_uploaded(task)
+    save_callback(data)
+
+    result["success"] = True
+    return result
+
+
+def update_project_sprint(issue_ref: str, sprint_id: str, sprint_field_id: str, data: dict,
+                          project_info: dict = None, item_id: str = None) -> bool:
     """Update Sprint field for an issue in the project.
 
     Returns True on success, False if project not configured or field missing.
@@ -509,8 +793,10 @@ def update_project_sprint(issue_ref: str, sprint_id: str, sprint_field_id: str, 
         return False
 
     try:
-        project_info = get_project_info(data)
-        item_id = add_issue_to_project(issue_ref, data)
+        if not project_info:
+            project_info = get_project_info(data)
+        if not item_id:
+            item_id = add_issue_to_project(issue_ref, data)
 
         result = subprocess.run([
             "gh", "project", "item-edit",
@@ -553,13 +839,16 @@ def add_issue_to_project(issue_ref: str, data: dict) -> str:
     return item_id
 
 
-def sync_project_status(issue_ref: str, status: str, data: dict) -> bool:
+def sync_project_status(issue_ref: str, status: str, data: dict,
+                        project_info: dict = None, item_id: str = None) -> bool:
     """Sync task status to GitHub project. Adds issue to project if not already there.
 
     Args:
         issue_ref: GitHub issue reference (owner/repo#number)
         status: Workload tracker status (todo, inprogress, done)
         data: Full data dict with config
+        project_info: Optional cached project info (avoids redundant API call)
+        item_id: Optional cached item ID (avoids redundant API call)
 
     Returns True on success, False if project not configured.
     """
@@ -572,8 +861,10 @@ def sync_project_status(issue_ref: str, status: str, data: dict) -> bool:
         return False  # Unknown status
 
     try:
-        project_info = get_project_info(data)
-        item_id = add_issue_to_project(issue_ref, data)
+        if not project_info:
+            project_info = get_project_info(data)
+        if not item_id:
+            item_id = add_issue_to_project(issue_ref, data)
 
         option_id = project_info["status_options"].get(project_status)
         if not option_id:
@@ -606,7 +897,8 @@ def get_role_type(task: dict, data: dict) -> str | None:
     return role.get("type") if role else None
 
 
-def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
+def update_project_activity(issue_ref: str, activity: str, data: dict,
+                            project_info: dict = None, item_id: str = None) -> bool:
     """Update Activity field for an issue in the project.
 
     Returns True on success, False if project not configured or field/option missing.
@@ -616,8 +908,10 @@ def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
         return False
 
     try:
-        project_info = get_project_info(data)
-        item_id = add_issue_to_project(issue_ref, data)
+        if not project_info:
+            project_info = get_project_info(data)
+        if not item_id:
+            item_id = add_issue_to_project(issue_ref, data)
 
         activity_field = project_info.get("activity_field", {})
         if not activity_field.get("id"):
@@ -640,7 +934,8 @@ def update_project_activity(issue_ref: str, activity: str, data: dict) -> bool:
         return False
 
 
-def update_project_hours(issue_ref: str, hours: int, data: dict) -> bool:
+def update_project_hours(issue_ref: str, hours: int, data: dict,
+                         project_info: dict = None, item_id: str = None) -> bool:
     """Update Hours field for an issue in the project.
 
     Returns True on success, False if project not configured or field missing.
@@ -650,8 +945,10 @@ def update_project_hours(issue_ref: str, hours: int, data: dict) -> bool:
         return False
 
     try:
-        project_info = get_project_info(data)
-        item_id = add_issue_to_project(issue_ref, data)
+        if not project_info:
+            project_info = get_project_info(data)
+        if not item_id:
+            item_id = add_issue_to_project(issue_ref, data)
 
         hours_field = project_info.get("hours_field", {})
         if not hours_field.get("id"):
@@ -761,31 +1058,39 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
         return result
 
     try:
-        # Add to project (idempotent)
-        add_issue_to_project(issue_ref, data)
+        # Pre-fetch (cache) project info and item id
+        pi = get_project_info(data)
+        item_id = add_issue_to_project(issue_ref, data)
+        all_sprints = get_all_sprints(data)
 
         # Sync status
         status = task.get("status", "todo")
-        if not sync_project_status(issue_ref, status, data):
+        if not sync_project_status(issue_ref, status, data, project_info=pi, item_id=item_id):
             result["errors"].append("Failed to set status")
 
         # Set activity based on role
         activity = get_role_activity(task, data)
         if activity:
-            if not update_project_activity(issue_ref, activity, data):
+            if not update_project_activity(issue_ref, activity, data, project_info=pi, item_id=item_id):
                 result["errors"].append(f"Failed to set activity: {activity}")
 
-        # Set sprint to current sprint
-        current_sprint = get_current_sprint(data)
-        if current_sprint:
-            if not update_project_sprint(issue_ref, current_sprint["id"], current_sprint["field_id"], data):
-                result["errors"].append(f"Failed to set sprint: {current_sprint['title']}")
+        # Set sprint: use task's stored sprint, fall back to current sprint
+        sprint_id = task.get("sprint_id")
+        if sprint_id:
+            field_id = all_sprints[0]["field_id"] if all_sprints else None
+            if field_id and not update_project_sprint(issue_ref, sprint_id, field_id, data, project_info=pi, item_id=item_id):
+                result["errors"].append(f"Failed to set sprint: {task.get('sprint', '?')}")
+        else:
+            current_sprint = get_current_sprint(data)
+            if current_sprint:
+                if not update_project_sprint(issue_ref, current_sprint["id"], current_sprint["field_id"], data, project_info=pi, item_id=item_id):
+                    result["errors"].append(f"Failed to set sprint: {current_sprint['title']}")
 
-        # Set hours (rounded to 0.25 hours)
-        total_mins = task_logged_mins(task)
-        if total_mins > 0:
-            hours = mins_to_quarter_hours(total_mins)
-            if not update_project_hours(issue_ref, hours, data):
+        # Set hours (filtered by task's sprint if assigned, rounded to 0.25 hours)
+        sprint_mins = task_logged_mins_for_sprint(task, all_sprints)
+        if sprint_mins > 0:
+            hours = mins_to_quarter_hours(sprint_mins)
+            if not update_project_hours(issue_ref, hours, data, project_info=pi, item_id=item_id):
                 result["errors"].append("Failed to set hours")
             else:
                 # Mark logs as uploaded
@@ -800,10 +1105,10 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
 
 
 def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=None) -> bool:
-    """Sync task to GitHub project - updates Hours, Status, and Activity.
+    """Sync task to GitHub project - updates Hours, Status, Activity, and Sprint.
 
     Calculates total logged time, rounds to nearest 0.25 hours, and updates project.
-    Also syncs Status and Activity fields.
+    Also syncs Status, Activity, and Sprint fields.
     Marks logs as uploaded after successful sync.
 
     Returns True on success.
@@ -828,10 +1133,18 @@ def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=Non
         if not update_project_activity(issue_ref, activity, data):
             success = False
 
-    # Sync hours
-    total_mins = task_logged_mins(task)
-    if total_mins > 0:
-        hours = mins_to_quarter_hours(total_mins)
+    # Sync sprint: use task's stored sprint
+    all_sprints = get_all_sprints(data)
+    sprint_id = task.get("sprint_id")
+    if sprint_id:
+        field_id = all_sprints[0]["field_id"] if all_sprints else None
+        if field_id:
+            update_project_sprint(issue_ref, sprint_id, field_id, data)
+
+    # Sync hours (filtered by task's sprint if assigned)
+    sprint_mins = task_logged_mins_for_sprint(task, all_sprints)
+    if sprint_mins > 0:
+        hours = mins_to_quarter_hours(sprint_mins)
         if update_project_hours(issue_ref, hours, data):
             mark_logs_uploaded(task)
             if save_callback:
@@ -962,9 +1275,8 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     config = data.get("config", {})
     if config.get("github_project_number"):
         try:
-            total_mins = sum(l.get("minutes", 0) for l in task.get("logs", []))
-            hours = round(total_mins / 60)
-
+            total_mins = task_logged_mins(task)
+            hours = mins_to_quarter_hours(total_mins)
             add_to_project_and_update(task["github_issue"], hours, data)
             result["project_updated"] = True
 
@@ -972,6 +1284,14 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             activity = get_role_activity(task, data)
             if activity:
                 update_project_activity(task["github_issue"], activity, data)
+
+            # Set sprint from task's stored sprint
+            sprint_id = task.get("sprint_id")
+            if sprint_id:
+                all_sprints = get_all_sprints(data)
+                field_id = all_sprints[0]["field_id"] if all_sprints else None
+                if field_id:
+                    update_project_sprint(task["github_issue"], sprint_id, field_id, data)
 
             # Set type if role has one configured
             type_val = get_role_type(task, data)
@@ -994,8 +1314,9 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     if close_github_issue(task["github_issue"]):
         result["issue_closed"] = True
 
-    # 5. Mark as done
+    # 6. Mark as done
     task["status"] = "done"
+    mark_logs_uploaded(task)
     save_callback(data)
     result["success"] = True
     return result
@@ -1005,7 +1326,7 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
 
 def cmd_add(args):
     if not args:
-        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC]")
+        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC] [--sprint SPRINT]")
         sys.exit(1)
 
     data = load()
@@ -1016,6 +1337,7 @@ def cmd_add(args):
     role_id = "other"
     status = "todo"
     desc = ""
+    sprint_override = None
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
@@ -1024,6 +1346,8 @@ def cmd_add(args):
             status = args[i+1]; i += 2
         elif args[i] == "--desc" and i + 1 < len(args):
             desc = args[i+1]; i += 2
+        elif args[i] == "--sprint" and i + 1 < len(args):
+            sprint_override = args[i+1]; i += 2
         else:
             title_parts.append(args[i]); i += 1
     title = " ".join(title_parts)
@@ -1035,9 +1359,28 @@ def cmd_add(args):
         "role_id": role_id, "status": status,
         "logs": [], "created_at": time.time()
     }
+
+    # Auto-assign sprint (or use override)
+    if sprint_override and sprint_override.lower() == "none":
+        pass  # Skip sprint assignment
+    elif sprint_override:
+        all_sprints = get_all_sprints(data)
+        match = _match_sprint(all_sprints, sprint_override)
+        if match:
+            task["sprint"] = match["title"]
+            task["sprint_id"] = match["id"]
+        else:
+            print(c(f"Sprint '{sprint_override}' not found.", "red")); sys.exit(1)
+    else:
+        current_sprint = get_current_sprint(data)
+        if current_sprint:
+            task["sprint"] = current_sprint["title"]
+            task["sprint_id"] = current_sprint["id"]
+
     data["tasks"].insert(0, task)
     save(data)
-    print(c(f"✓ Added: {title}", "green") + f"  [{roles.get(role_id, role_id)}]  [{STATUS_LABELS.get(status, status)}]")
+    sprint_info = f"  [{task.get('sprint', 'no sprint')}]" if task.get("sprint") else ""
+    print(c(f"✓ Added: {title}", "green") + f"  [{roles.get(role_id, role_id)}]  [{STATUS_LABELS.get(status, status)}]{sprint_info}")
     print(c(f"  id: {task['id']}", "dim"))
 
     # Arc integration: create task folder via UI scripting
@@ -1063,12 +1406,15 @@ def cmd_list(args):
 
     filter_role = None
     show_done = False
+    show_shadows = False
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
             filter_role = resolve_role(data, args[i+1]); i += 2
         elif args[i] in ("--all", "-a"):
             show_done = True; i += 1
+        elif args[i] == "--shadows":
+            show_shadows = True; i += 1
         else:
             i += 1
 
@@ -1078,6 +1424,10 @@ def cmd_list(args):
     # Hide done tasks by default
     if not show_done:
         tasks = [t for t in tasks if t.get("status") != "done"]
+
+    # Hide shadow tasks (cross-sprint splits) by default
+    if not show_shadows:
+        tasks = [t for t in tasks if not t.get("cross_sprint_parent")]
 
     if not tasks:
         print(c("No tasks.", "dim")); return
@@ -1106,7 +1456,8 @@ def cmd_list(args):
                 notes_icon = " "
             time_str = c(fmt_mins(logged), "dim")
             status_str = c(f"[{status}]", "dim")
-            print(f"  {dot}{t['title'][:50]:<52} {notes_icon} {time_str:<10} {status_str}")
+            sprint_str = c(f"[{t['sprint']}]", "dim") if t.get("sprint") else ""
+            print(f"  {dot}{t['title'][:50]:<52} {notes_icon} {time_str:<10} {status_str} {sprint_str}")
             print(c(f"      id: {t['id']}", "dim"))
     print()
 
@@ -3152,6 +3503,127 @@ def cmd_tabs(args):
         sys.exit(1)
 
 
+def cmd_sprint(args):
+    """Show current sprint info and tasks grouped by sprint."""
+    data = load()
+    all_sprints = get_all_sprints(data)
+    current = get_current_sprint(data)
+
+    if current:
+        print(c(f"\n  Current sprint: {current['title']}", "bold", "cyan"))
+        print(c(f"  Start: {current['startDate']}, Duration: {current['duration']} days", "dim"))
+    elif all_sprints:
+        print(c("\n  No active sprint right now.", "yellow"))
+    else:
+        print(c("\n  No sprints found (project not configured or query failed).", "yellow"))
+        return
+
+    tasks = [t for t in data.get("tasks", [])
+             if t.get("status") != "done" and not t.get("cross_sprint_parent")]
+    if not tasks:
+        print(c("  No active tasks.", "dim"))
+        print()
+        return
+
+    at = data.get("active_timer")
+    by_sprint = {}
+    for t in tasks:
+        by_sprint.setdefault(t.get("sprint", "Unassigned"), []).append(t)
+
+    for sprint_name in sorted(by_sprint.keys()):
+        sprint_tasks = by_sprint[sprint_name]
+        print(c(f"\n  {sprint_name}", "bold"))
+        for t in sprint_tasks:
+            logged = task_logged_mins(t) + task_live_mins(t, at)
+            running = at and at.get("task_id") == t["id"]
+            dot = c("▶ ", "green") if running else "  "
+            print(f"    {dot}{t['title'][:50]:<52} {fmt_mins(logged)}")
+    print()
+
+
+def cmd_set_sprint(args):
+    """Set or change the sprint for a task."""
+    if len(args) < 2:
+        print("Usage: wt set-sprint <task> <sprint-title>")
+        sys.exit(1)
+
+    data = load()
+    all_sprints = get_all_sprints(data)
+    if not all_sprints:
+        print(c("No sprints found.", "red")); sys.exit(1)
+
+    # First arg is task, rest is sprint title
+    task = resolve_task(data, args[0])
+    sprint_query = " ".join(args[1:])
+
+    if sprint_query.lower() == "none":
+        task.pop("sprint", None)
+        task.pop("sprint_id", None)
+        save(data)
+        print(c(f"✓ Cleared sprint for '{task['title']}'", "green"))
+        return
+
+    match = _match_sprint(all_sprints, sprint_query)
+    if not match:
+        # Show available sprints
+        print(c(f"No sprint matching '{sprint_query}'.", "red"))
+        print(c("  Available sprints:", "dim"))
+        for s in all_sprints[-10:]:  # Show last 10
+            print(c(f"    {s['title']}", "dim"))
+        sys.exit(1)
+
+    task["sprint"] = match["title"]
+    task["sprint_id"] = match["id"]
+    save(data)
+    print(c(f"✓ Set sprint for '{task['title']}' to {match['title']}", "green"))
+
+
+def cmd_split_sprint(args):
+    """Split cross-sprint task: create shadow tasks for previous sprints."""
+    if not args:
+        print("Usage: wt split-sprint <task>"); sys.exit(1)
+
+    data = load()
+    task = resolve_task(data, " ".join(args))
+    all_sprints = get_all_sprints(data)
+
+    if not all_sprints:
+        print(c("No sprints found.", "red")); sys.exit(1)
+
+    summary = sprint_summary_for_task(task, all_sprints)
+    if len(summary) <= 1:
+        sprint_name = summary[0]["sprint_title"] if summary else task.get("sprint", "unknown")
+        print(c(f"Task '{task['title']}' only has time in {sprint_name}. No split needed.", "dim"))
+        return
+
+    # Show breakdown
+    print(c(f"\n  Sprint breakdown for: {task['title']}\n", "bold"))
+    for s in summary:
+        marker = " ← current" if s == summary[-1] else ""
+        print(f"    {s['sprint_title']:<20} {fmt_mins(s['total_mins']):<10} ({len(s['logs'])} logs){marker}")
+
+    print(f"\n  This will create {len(summary) - 1} shadow task(s) for previous sprints.")
+    try:
+        response = input("  Proceed? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(); return
+
+    if response in ("n", "no"):
+        return
+
+    def on_progress(msg):
+        print(c(f"  {msg}", "dim"), flush=True)
+
+    result = split_cross_sprint_task(task, data, save, all_sprints, progress_callback=on_progress)
+    if result.get("success"):
+        for st in result.get("sprint_tasks_created", []):
+            issue = st.get("issue_ref", "no issue")
+            print(c(f"  ✓ {st['sprint']}: {fmt_mins(st['total_mins'])} → {issue}", "green"))
+        print(c(f"  ✓ Main task updated to {result.get('main_sprint', '?')}", "green"))
+    else:
+        print(c(f"  ✗ Split failed: {result.get('error', 'unknown')}", "red"))
+
+
 COMMANDS = {
     "add": cmd_add,
     "add-issue": cmd_add_issue,
@@ -3183,6 +3655,9 @@ COMMANDS = {
     "tabs": cmd_tabs,
     "calendar": cmd_calendar,
     "cal": cmd_calendar,
+    "sprint": cmd_sprint,
+    "set-sprint": cmd_set_sprint,
+    "split-sprint": cmd_split_sprint,
 }
 
 

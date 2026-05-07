@@ -50,7 +50,7 @@ from wt import (
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
     get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
-    get_imported_calendar_uids
+    get_imported_calendar_uids, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -162,10 +162,11 @@ class TaskModal(ModalScreen):
     #modal-actions { margin-top: 1; }
     """
 
-    def __init__(self, task_data: Optional[dict] = None, roles: Optional[list] = None):
+    def __init__(self, task_data: Optional[dict] = None, roles: Optional[list] = None, sprints: Optional[list] = None):
         super().__init__()
         self._task_data = task_data
         self._roles = roles or []
+        self._sprints = sprints or []
         self._is_new = task_data is None
 
     def compose(self) -> ComposeResult:
@@ -173,12 +174,28 @@ class TaskModal(ModalScreen):
         role_options = [(r["label"], r["id"]) for r in self._roles]
         default_role = self._roles[0]["id"] if self._roles else "other"
         status_options = [(STATUS_LABELS[s], s) for s in STATUSES]
+        # Show current sprint + previous 4, descending order
+        from datetime import datetime as _dt
+        _today = _dt.now().date()
+        _current_idx = None
+        for _i, _s in enumerate(self._sprints):
+            if _s.get("start_date") and _s["start_date"] <= _today < _s["end_date"]:
+                _current_idx = _i
+                break
+        if _current_idx is not None:
+            _start = max(0, _current_idx - 4)
+            _recent = self._sprints[_start:_current_idx + 1]
+        else:
+            _recent = self._sprints[-5:]
+        sprint_options = [("(none)", "")] + [(s["title"], s["id"]) for s in reversed(_recent)]
+        default_sprint = t.get("sprint_id", "")
         with Container(id="modal-box"):
             yield Label("Edit task" if self._task_data else "New task")
             yield Input(value=t.get("title", ""), placeholder="Task title...", id="inp-title")
             yield Input(value=t.get("description", ""), placeholder="Description (optional)", id="inp-desc")
             yield Select(role_options, value=t.get("role_id", default_role), id="sel-role", prompt="Select role")
             yield Select(status_options, value=t.get("status", "todo"), id="sel-status", prompt="Select status")
+            yield Select(sprint_options, value=default_sprint, id="sel-sprint", prompt="Select sprint")
             yield Input(value=t.get("local_folder", ""), placeholder="Local folder path (optional, e.g., ~/dev/myproject)", id="inp-local-folder")
             if self._is_new:
                 with Horizontal():
@@ -231,10 +248,17 @@ class TaskModal(ModalScreen):
                 result["local_folder"] = str(folder_path.resolve())
             else:
                 result["local_folder"] = local_folder  # Store as-is, will error on use
+        # Handle sprint selection
+        sprint_id = self.query_one("#sel-sprint").value
+        if sprint_id:
+            sprint = next((s for s in self._sprints if s["id"] == sprint_id), None)
+            if sprint:
+                result["sprint"] = sprint["title"]
+                result["sprint_id"] = sprint["id"]
         # Preserve additional fields from existing task
         if self._task_data:
-            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid"):
-                if key in self._task_data:
+            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid", "sprint", "sprint_id"):
+                if key in self._task_data and key not in result:
                     result[key] = self._task_data[key]
             # Track if title changed for GitHub issue update
             if self._task_data.get("title") != title:
@@ -1865,6 +1889,8 @@ class WorkloadTracker(App):
         self._data = load_data()
         self._timer_task = None
         self._bg_tasks: set[str] = set()
+        self._sprints_cache: list[dict] = []
+        self._sprints_fetched = False
 
     def _bg_start(self, label: str):
         """Show a background operation in the header subtitle."""
@@ -1910,6 +1936,44 @@ class WorkloadTracker(App):
         self._refresh_overview()
         self._focus_running_task()
         self.set_interval(1, self._tick)
+        self._fetch_sprints_worker()
+
+    @work(thread=True)
+    def _fetch_sprints_worker(self):
+        """Fetch sprints from GitHub and check for cross-sprint tasks."""
+        self._bg_start("Fetching sprints")
+        try:
+            sprints = get_all_sprints(self._data)
+            self._sprints_cache = sprints
+            self._sprints_fetched = True
+
+            # Auto-detect cross-sprint tasks
+            if sprints:
+                from datetime import datetime
+                current = None
+                today = datetime.now().date()
+                for s in sprints:
+                    if s["start_date"] <= today < s["end_date"]:
+                        current = s
+                        break
+
+                if current:
+                    for task in self._data.get("tasks", []):
+                        if task.get("status") == "done" or task.get("cross_sprint_parent"):
+                            continue
+                        if not task.get("logs"):
+                            continue
+                        summary = sprint_summary_for_task(task, sprints)
+                        if len(summary) > 1:
+                            self.call_from_thread(
+                                self.notify,
+                                f"'{task['title']}' has time in {len(summary)} sprints. Use 'wt split-sprint' to split.",
+                                title="Cross-sprint detected",
+                                severity="warning",
+                                timeout=8,
+                            )
+        finally:
+            self._bg_end("Fetching sprints")
 
     def _focus_running_task(self):
         """Focus on the currently running task, or the first task if none running."""
@@ -1937,7 +2001,7 @@ class WorkloadTracker(App):
     def _build_table(self):
         table = self.query_one("#task-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("●", "Title", "Role", "Status", "Logged", "N", "Description")
+        table.add_columns("●", "Title", "Role", "Sprint", "Status", "Logged", "N", "Description")
         self._populate_table()
 
     def _populate_table(self):
@@ -1974,10 +2038,12 @@ class WorkloadTracker(App):
                 notes_icon = "+"
             else:
                 notes_icon = " "
+            sprint_label = task.get("sprint", "")
             table.add_row(
                 timer_dot,
                 task["title"],
                 role["label"],
+                sprint_label,
                 STATUS_LABELS.get(status, status),
                 fmt_mins(logged),
                 notes_icon,
@@ -1997,6 +2063,8 @@ class WorkloadTracker(App):
 
     def _visible_tasks(self) -> list:
         tasks = self._data.get("tasks", [])
+        # Always hide shadow tasks (cross-sprint splits)
+        tasks = [t for t in tasks if not t.get("cross_sprint_parent")]
         if self.filter_role != "all":
             tasks = [t for t in tasks if t.get("role_id") == self.filter_role]
         if not self.show_done:
@@ -2255,7 +2323,7 @@ class WorkloadTracker(App):
 
     def action_new_task(self):
         roles = get_roles(self._data)
-        self.push_screen(TaskModal(roles=roles), self._on_task_saved)
+        self.push_screen(TaskModal(roles=roles, sprints=self._sprints_cache), self._on_task_saved)
 
     def action_import_calendar(self):
         self.push_screen(CalendarModal(self._data, save_data), self._on_calendar_closed)
@@ -2317,7 +2385,7 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if task:
             roles = get_roles(self._data)
-            self.push_screen(TaskModal(task_data=task, roles=roles), self._on_task_saved)
+            self.push_screen(TaskModal(task_data=task, roles=roles, sprints=self._sprints_cache), self._on_task_saved)
 
     def _on_task_saved(self, result: Optional[dict]):
         if not result:
@@ -2331,6 +2399,17 @@ class WorkloadTracker(App):
         tasks = self._data["tasks"]
         existing = next((i for i, t in enumerate(tasks) if t["id"] == result["id"]), None)
         is_new = existing is None
+
+        # Auto-assign current sprint for new tasks if not set by modal
+        if is_new and not result.get("sprint_id") and self._sprints_cache:
+            from datetime import datetime
+            today = datetime.now().date()
+            for s in self._sprints_cache:
+                if s["start_date"] <= today < s["end_date"]:
+                    result["sprint"] = s["title"]
+                    result["sprint_id"] = s["id"]
+                    break
+
         if existing is not None:
             tasks[existing] = result
         else:
@@ -2878,7 +2957,7 @@ class WorkloadTracker(App):
                     add_to_project_and_update(task["github_issue"], hours, self._data)
 
                     # Mark logs as uploaded
-                    from wt import mark_logs_uploaded
+                    from wt import mark_logs_uploaded, update_project_sprint
                     mark_logs_uploaded(task)
                     save_data(self._data)
 
@@ -2886,9 +2965,16 @@ class WorkloadTracker(App):
                     activity = get_role_activity(task, self._data)
                     if activity:
                         update_project_activity(task["github_issue"], activity, self._data)
-                        self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Activity: {activity})", severity="information")
-                    else:
-                        self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h)", severity="information")
+
+                    # Set sprint from task's stored sprint
+                    sprint_id = task.get("sprint_id")
+                    if sprint_id:
+                        sprints = get_all_sprints(self._data)
+                        field_id = sprints[0]["field_id"] if sprints else None
+                        if field_id:
+                            update_project_sprint(task["github_issue"], sprint_id, field_id, self._data)
+
+                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Sprint: {task.get('sprint', '?')})", severity="information")
                 except Exception as e:
                     self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
 

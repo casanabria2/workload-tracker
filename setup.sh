@@ -40,10 +40,24 @@ else
     echo "Created ~/.workload_tracker.json -> ~/WorkloadTracker/.workload_tracker.json"
 fi
 
+# Set up 'wt' command: symlink wrapper into venv/bin (which should be in PATH)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ln -sf "${SCRIPT_DIR}/wt" "${SCRIPT_DIR}/venv/bin/wt"
+echo "Linked 'wt' command to venv/bin/"
+
+# Set up zsh autocompletion
+ZSH_SITE_FUNCTIONS="/opt/homebrew/share/zsh/site-functions"
+if [ -d "$ZSH_SITE_FUNCTIONS" ]; then
+    ln -sf "${SCRIPT_DIR}/_wt" "${ZSH_SITE_FUNCTIONS}/_wt"
+    echo "Linked zsh completions to ${ZSH_SITE_FUNCTIONS}/_wt"
+    echo "Run 'rm -f ~/.zcompdump* && exec zsh' to activate completions"
+fi
+
 echo ""
 echo "Done. To run the workload tracker:"
 echo "  source venv/bin/activate"
 echo "  python tracker.py"
 echo ""
-echo "Or use the venv directly:"
-echo "  ./venv/bin/python tracker.py"
+echo "CLI (with venv in PATH):"
+echo "  wt list"
+echo "  wt sprint"
