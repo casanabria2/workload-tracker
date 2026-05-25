@@ -84,6 +84,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 - **Statuses**: `todo`, `inprogress`, `recurrent`, `done`
 - Done tasks are hidden by default in all list views (CLI, TUI, MCP)
 - `recurrent` is for tasks that intentionally span sprints (e.g. recurring meetings, on-call). They are excluded from cross-sprint split detection.
+- **GitHub Project status mapping** (`PROJECT_STATUS_MAP` in `wt.py`): `todo` → `Todo`, `inprogress` → `In Progress`, `recurrent` → `In Progress`, `done` → `Done`. Used by `sync_project_status()` and `setup_issue_in_project()`. Any tracker status missing from this map causes project field sync to be silently skipped — keep it in sync when adding new statuses.
 - TUI status transitions are explicit (no cycling): `p` moves `todo` → `inprogress`, `D` (Shift+d) moves `inprogress` → `done` via the close workflow. Status edits beyond that are done through the edit modal (`e`).
 - TUI board layout: the task board is split into two tables — non-recurrent tasks at the top, recurrent tasks at the bottom. Role filter and `_selected_task()` work against whichever table is focused.
 - Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI)
