@@ -64,9 +64,9 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUSES = ["todo", "inprogress", "done"]
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "done": "Done"}
-STATUS_COLORS = {"todo": "white", "inprogress": "blue", "done": "green"}
+STATUSES = ["todo", "inprogress", "recurrent", "done"]
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
+STATUS_COLORS = {"todo": "white", "inprogress": "blue", "recurrent": "magenta", "done": "green"}
 
 
 def uid() -> str:
@@ -2113,6 +2113,13 @@ class WorkloadTracker(App):
     #filter-bar Label { margin-right: 1; color: $text-muted; }
     #filter-bar Select { width: 22; }
     #task-table { height: 1fr; }
+    #recurrent-divider {
+        height: 1;
+        color: $text-muted;
+        background: $surface;
+        text-align: center;
+    }
+    #task-table-recurrent { height: 30%; min-height: 5; }
 
     /* Overview */
     #overview { padding: 1; }
@@ -2128,7 +2135,8 @@ class WorkloadTracker(App):
         Binding("d",   "delete_task", "Delete"),
         Binding("t",   "toggle_timer","Timer"),
         Binding("l",   "log_time",    "Manage logs"),
-        Binding("s",   "cycle_status","Cycle status"),
+        Binding("p",   "start_progress", "Start"),
+        Binding("D",   "mark_done",   "Done"),
         Binding("g",   "link_github", "GitHub"),
         Binding("u",   "update_github", "Update GH"),
         Binding("o",   "open_github", "Open issue"),
@@ -2191,6 +2199,8 @@ class WorkloadTracker(App):
                             value="all", id="role-filter"
                         )
                     yield DataTable(id="task-table", cursor_type="row", zebra_stripes=True)
+                    yield Label("─── Recurrent ───", id="recurrent-divider")
+                    yield DataTable(id="task-table-recurrent", cursor_type="row", zebra_stripes=True)
                 with TabPane("Overview  [o]", id="overview-tab"):
                     yield ScrollableContainer(Static(id="overview-content"), id="overview")
         yield Footer()
@@ -2224,7 +2234,7 @@ class WorkloadTracker(App):
 
                 if current:
                     for task in self._data.get("tasks", []):
-                        if task.get("status") == "done" or task.get("cross_sprint_parent"):
+                        if task.get("status") in ("done", "recurrent") or task.get("cross_sprint_parent"):
                             continue
                         if not task.get("logs"):
                             continue
@@ -2242,36 +2252,38 @@ class WorkloadTracker(App):
 
     def _focus_running_task(self):
         """Focus on the currently running task, or the first task if none running."""
-        table = self.query_one("#task-table", DataTable)
-        if table.row_count == 0:
-            return
+        main = self.query_one("#task-table", DataTable)
+        rec = self.query_one("#task-table-recurrent", DataTable)
 
         # Check if there's an active timer
         active_timer = self._data.get("active_timer")
         if active_timer:
             task_id = active_timer.get("task_id")
-            # Find the row with this task
-            for idx, row_key in enumerate(table.rows.keys()):
-                if row_key.value == task_id:
-                    table.cursor_coordinate = (idx, 0)
-                    table.focus()
-                    return
+            for table in (main, rec):
+                for idx, row_key in enumerate(table.rows.keys()):
+                    if row_key.value == task_id:
+                        table.cursor_coordinate = (idx, 0)
+                        table.focus()
+                        return
 
-        # No running task or not found, focus on first row
-        table.cursor_coordinate = (0, 0)
-        table.focus()
+        # No running task or not found, focus on first row of main table
+        if main.row_count > 0:
+            main.cursor_coordinate = (0, 0)
+            main.focus()
+        elif rec.row_count > 0:
+            rec.cursor_coordinate = (0, 0)
+            rec.focus()
 
     # ── Table ──────────────────────────────────────────────
 
     def _build_table(self):
-        table = self.query_one("#task-table", DataTable)
-        table.clear(columns=True)
-        table.add_columns("●", "Title", "Role", "Sprint", "Status", "Logged", "N", "Description")
+        for table_id in ("#task-table", "#task-table-recurrent"):
+            table = self.query_one(table_id, DataTable)
+            table.clear(columns=True)
+            table.add_columns("●", "Title", "Role", "Sprint", "Status", "Logged", "N", "Description")
         self._populate_table()
 
-    def _populate_table(self):
-        table = self.query_one("#task-table", DataTable)
-
+    def _populate_one_table(self, table: DataTable, tasks: list):
         # Preserve cursor position by saving the selected row key
         selected_key = None
         try:
@@ -2281,7 +2293,6 @@ class WorkloadTracker(App):
             pass
 
         table.clear()
-        tasks = self._visible_tasks()
         role_map = get_role_map(self._data)
         roles = get_roles(self._data)
         default_role = roles[-1] if roles else {"id": "other", "label": "Other", "color": "white"}
@@ -2326,6 +2337,18 @@ class WorkloadTracker(App):
             except Exception:
                 pass
 
+    def _populate_table(self):
+        main_tasks, recurrent_tasks = self._visible_tasks_split()
+        self._populate_one_table(self.query_one("#task-table", DataTable), main_tasks)
+        self._populate_one_table(self.query_one("#task-table-recurrent", DataTable), recurrent_tasks)
+
+    def _visible_tasks_split(self) -> tuple[list, list]:
+        """Return (main_tasks, recurrent_tasks) after applying filters."""
+        tasks = self._visible_tasks()
+        main = [t for t in tasks if t.get("status") != "recurrent"]
+        recurrent = [t for t in tasks if t.get("status") == "recurrent"]
+        return main, recurrent
+
     def _visible_tasks(self) -> list:
         tasks = self._data.get("tasks", [])
         # Always hide shadow tasks (cross-sprint splits)
@@ -2337,16 +2360,25 @@ class WorkloadTracker(App):
         return tasks
 
     def _selected_task(self) -> Optional[dict]:
-        table = self.query_one("#task-table", DataTable)
-        if table.cursor_row is None:
-            return None
-        row_key = table.get_row_at(table.cursor_row)
-        # row_key is actually the cell values; use coordinate to get key
-        try:
-            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
-            return next((t for t in self._data["tasks"] if t["id"] == key), None)
-        except Exception:
-            return None
+        # Prefer whichever table is currently focused
+        main = self.query_one("#task-table", DataTable)
+        rec = self.query_one("#task-table-recurrent", DataTable)
+        focused = self.focused
+        if focused is rec and rec.cursor_row is not None:
+            tables = [rec, main]
+        else:
+            tables = [main, rec]
+        for table in tables:
+            if table.cursor_row is None or table.row_count == 0:
+                continue
+            try:
+                key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+                task = next((t for t in self._data["tasks"] if t["id"] == key), None)
+                if task:
+                    return task
+            except Exception:
+                continue
+        return None
 
     # ── Sidebar & Overview ────────────────────────────────
 
@@ -3082,25 +3114,37 @@ class WorkloadTracker(App):
             self._refresh_sidebar()
             self._refresh_overview()
 
-    def action_cycle_status(self):
+    def action_start_progress(self):
+        """Move a To Do task into In Progress."""
         task = self._selected_task()
         if not task:
             return
         current = task.get("status", "todo")
-        idx = STATUSES.index(current) if current in STATUSES else 0
-        new_status = STATUSES[(idx + 1) % len(STATUSES)]
-        old_status = task["status"]
+        if current != "todo":
+            self.notify(
+                f"Can only start tasks in To Do state (current: {STATUS_LABELS.get(current, current)})",
+                severity="warning",
+            )
+            return
+        task["status"] = "inprogress"
+        save_data(self._data)
+        self._populate_table()
+        if task.get("github_issue"):
+            self._sync_project_status_async(task, "inprogress")
 
-        # If transitioning to "done", use the close workflow
-        if new_status == "done" and old_status != "done":
-            self._close_task_with_workflow(task)
-        else:
-            task["status"] = new_status
-            save_data(self._data)
-            self._populate_table()
-            # Sync status to GitHub project if task has a linked issue
-            if task.get("github_issue"):
-                self._sync_project_status_async(task, new_status)
+    def action_mark_done(self):
+        """Move an In Progress task into Done, running the close workflow."""
+        task = self._selected_task()
+        if not task:
+            return
+        current = task.get("status", "todo")
+        if current != "inprogress":
+            self.notify(
+                f"Can only mark In Progress tasks as Done (current: {STATUS_LABELS.get(current, current)})",
+                severity="warning",
+            )
+            return
+        self._close_task_with_workflow(task)
 
     def _close_task_with_workflow(self, task: dict):
         """Handle the task closing workflow with GitHub integration."""

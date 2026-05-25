@@ -37,7 +37,7 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "done": "Done"}
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
 
 mcp = FastMCP("workload-tracker")
 
@@ -169,7 +169,7 @@ def add_task(
     Args:
         title: The task title (required)
         role: Role ID (use list_roles to see available roles)
-        status: One of: todo, inprogress, done (default: todo)
+        status: One of: todo, inprogress, recurrent, done (default: todo)
         description: Optional task description
         github_issue: Optional GitHub issue reference (e.g., owner/repo#123)
         sprint: Sprint title (e.g., "Sprint 43"). Auto-assigns current sprint if empty.
@@ -180,7 +180,7 @@ def add_task(
     if role not in roles:
         return f"Error: Invalid role '{role}'. Available: {', '.join(roles.keys())}"
     if status not in STATUS_LABELS:
-        return f"Error: Invalid status '{status}'. Use: todo, inprogress, done"
+        return f"Error: Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
 
     task = {
         "id": uid(),
@@ -226,7 +226,7 @@ def list_tasks(role: str | None = None, status: str | None = None, include_done:
 
     Args:
         role: Filter by role ID (use list_roles to see available roles)
-        status: Filter by status (todo, inprogress, done)
+        status: Filter by status (todo, inprogress, recurrent, done)
         include_done: Include done tasks in the list (default: False)
     """
     data = load()
@@ -678,7 +678,7 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
 
     Args:
         task_query: Task ID or partial title
-        status: New status: todo, inprogress, or done
+        status: New status: todo, inprogress, recurrent, or done
         create_issue: If True and setting to done, create GitHub issue if missing
     """
     data = load()
@@ -687,7 +687,7 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
         return f"No task found matching '{task_query}'"
 
     if status not in STATUS_LABELS:
-        return f"Invalid status '{status}'. Use: todo, inprogress, done"
+        return f"Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
 
     old_status = task.get("status", "todo")
 

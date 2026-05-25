@@ -88,7 +88,7 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "done": "Done"}
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
 COLORS = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "blue": "\033[34m", "green": "\033[32m", "yellow": "\033[33m",
