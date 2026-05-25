@@ -436,6 +436,7 @@ def create_github_issue(task: dict, repo: str) -> str:
 PROJECT_STATUS_MAP = {
     "todo": "Todo",
     "inprogress": "In Progress",
+    "recurrent": "In Progress",
     "done": "Done",
 }
 
