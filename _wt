@@ -86,9 +86,10 @@ for t in data.get('tasks', []):
             roles=("${(@f)$(_wt_get_roles)}")
             _arguments \
                 "--role[Role]:role:(${roles[*]})" \
-                '--status[Status]:status:(todo inprogress done)' \
+                '--status[Status]:status:(todo inprogress recurrent done)' \
                 '--desc[Description]:' \
-                '--sprint[Sprint]:sprint:(none)'
+                '--sprint[Sprint]:sprint:(none)' \
+                '--create-issue[Also create a linked GitHub issue]'
             ;;
         list|ls)
             local -a roles

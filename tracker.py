@@ -53,6 +53,7 @@ from wt import (
     get_imported_calendar_uids, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
     get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
     save_sprints_cache, get_sprint_date_range_for_task,
+    resolve_event_to_task, strip_sprint_suffix,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -1832,7 +1833,7 @@ class CalendarModal(ModalScreen):
             remove_event_mapping(self._data, event["title"])
             self._save(self._data)
             task = resolve_task_by_id(self._data, existing_mapping)
-            task_name = task["title"] if task else f"[deleted: {existing_mapping[:12]}]"
+            task_name = strip_sprint_suffix(task["title"]) if task else f"[deleted: {existing_mapping[:12]}]"
             self.notify(f"Removed mapping: '{event['title']}' → '{task_name}'", severity="information")
             self._load_events()
         else:
@@ -1854,7 +1855,7 @@ class CalendarModal(ModalScreen):
 
         set_event_mapping(self._data, event["title"], task["id"])
         self._save(self._data)
-        self.notify(f"Mapped: '{event['title']}' → '{task['title']}'", severity="information")
+        self.notify(f"Mapped: '{event['title']}' → '{strip_sprint_suffix(task['title'])}'", severity="information")
         self._load_events()
 
     @on(Button.Pressed, "#btn-import")
@@ -1897,10 +1898,9 @@ class CalendarModal(ModalScreen):
             self.notify("Event already imported", severity="warning")
             return
 
-        # Check for mapping
-        mapped_task_id = get_event_mapping(self._data, event["title"])
-        if mapped_task_id:
-            mapped_task = resolve_task_by_id(self._data, mapped_task_id)
+        # Check for mapping (sprint-aware: picks the per-sprint copy when applicable)
+        if get_event_mapping(self._data, event["title"]) is not None:
+            mapped_task = resolve_event_to_task(self._data, event)
             if mapped_task:
                 # Show quick confirmation modal for mapped event
                 self._pending_mapped_log = {"event": event, "task": mapped_task}

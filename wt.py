@@ -4,7 +4,7 @@ wt — Workload Tracker CLI
 Quick command-line interface to manage tasks without launching the full TUI.
 
 Usage:
-    wt add "Task title" --role strategic --status inprogress
+    wt add "Task title" --role strategic --status inprogress [--sprint NN] [--create-issue]
     wt list [--role strategic] [--all]
     wt start <task-id or partial title>
     wt stop
@@ -72,6 +72,7 @@ Tasks linked to GitHub issues use the issue for notes instead.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -190,6 +191,69 @@ def remove_event_mapping(data: dict, event_title: str) -> bool:
 def resolve_task_by_id(data: dict, task_id: str) -> dict | None:
     """Find a task by its exact ID."""
     return next((t for t in data.get("tasks", []) if t["id"] == task_id), None)
+
+
+# Matches a trailing " - Sprint <number>" suffix (case-insensitive, whitespace-tolerant).
+SPRINT_SUFFIX_RE = re.compile(r"\s*-\s*Sprint\s+\d+\s*$", re.IGNORECASE)
+
+
+def strip_sprint_suffix(title: str) -> str:
+    """Return *title* with any trailing ' - Sprint XX' suffix removed.
+
+    Used by the calendar mapping resolver so a single mapping like
+    'Carlos / Ana weekly sync' → 'Ana 1:1 calls - casanabria - Sprint 100'
+    can dispatch to the per-sprint task whose dates cover the calendar event.
+    """
+    return SPRINT_SUFFIX_RE.sub("", title or "").strip()
+
+
+def resolve_event_to_task(data: dict, event: dict) -> dict | None:
+    """Find which task a calendar event should be logged to via its mapping.
+
+    Returns None if no mapping exists or the mapped task has been deleted.
+
+    When the originally mapped task has a ``- Sprint XX`` suffix, look for a
+    sibling task with the same base name whose sprint covers the event's
+    start date and prefer that one. Falls back to the originally mapped task
+    when no sprint-specific sibling is found.
+    """
+    mapped_task_id = get_event_mapping(data, event.get("title", ""))
+    if not mapped_task_id:
+        return None
+    mapped_task = resolve_task_by_id(data, mapped_task_id)
+    if not mapped_task:
+        return None
+
+    base_name = strip_sprint_suffix(mapped_task["title"])
+    if base_name == mapped_task["title"]:
+        # Mapped task isn't sprint-suffixed; nothing smarter to do.
+        return mapped_task
+
+    start_ts = event.get("start_date")
+    if not start_ts:
+        return mapped_task
+    try:
+        event_date = datetime.fromtimestamp(start_ts).date()
+    except (TypeError, ValueError, OSError):
+        return mapped_task
+
+    sprints = get_cached_sprints(data)
+    if not sprints:
+        sprints = get_all_sprints(data) or []
+    target_sprint = find_sprint_for_date(sprints, event_date)
+    if not target_sprint:
+        return mapped_task
+
+    base_lower = base_name.lower()
+    for t in data.get("tasks", []):
+        if t.get("cross_sprint_parent"):
+            continue
+        if strip_sprint_suffix(t.get("title", "")).lower() != base_lower:
+            continue
+        if t.get("sprint_id") == target_sprint["id"]:
+            return t
+
+    return mapped_task
 
 
 def fmt_mins(mins: float) -> str:
@@ -1451,7 +1515,7 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
 
 def cmd_add(args):
     if not args:
-        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC] [--sprint SPRINT]")
+        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC] [--sprint SPRINT] [--create-issue]")
         sys.exit(1)
 
     data = load()
@@ -1463,6 +1527,7 @@ def cmd_add(args):
     status = "todo"
     desc = ""
     sprint_override = None
+    create_issue = False
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
@@ -1473,11 +1538,30 @@ def cmd_add(args):
             desc = args[i+1]; i += 2
         elif args[i] == "--sprint" and i + 1 < len(args):
             sprint_override = args[i+1]; i += 2
+        elif args[i] == "--create-issue":
+            create_issue = True; i += 1
         else:
             title_parts.append(args[i]); i += 1
     title = " ".join(title_parts)
     if not title:
         print(c("Title is required.", "red")); sys.exit(1)
+
+    # Validate --create-issue preconditions BEFORE touching the data file
+    if create_issue:
+        role_repo = next(
+            (r.get("github_repo") for r in data["roles"] if r["id"] == role_id),
+            None,
+        )
+        if not role_repo:
+            print(c(
+                f"--create-issue requires role '{role_id}' to have a github_repo set.",
+                "red",
+            ))
+            print(c(
+                f"  Configure with: wt roles set-repo {role_id} owner/repo",
+                "dim",
+            ))
+            sys.exit(1)
 
     task = {
         "id": uid(), "title": title, "description": desc,
@@ -1520,6 +1604,31 @@ def cmd_add(args):
                 print(c(f"  [Arc: {result['error']}]", "dim"))
         except ImportError:
             pass
+
+    # Optional: create the linked GitHub issue and set up the project entry
+    if create_issue:
+        repo = get_role_repo(task, data)
+        # repo is guaranteed by the pre-flight check above, but be defensive
+        if not repo:
+            print(c("  [skip github] role has no github_repo", "dim"))
+            return
+        try:
+            issue_ref = create_github_issue(task, repo)
+        except Exception as e:
+            print(c(f"  Failed to create issue: {e}", "red"))
+            sys.exit(1)
+        task["github_issue"] = issue_ref
+        save(data)
+        print(c(f"  ✓ Created issue: {issue_ref}", "green"))
+
+        # Add to GitHub project (Status, Activity, Sprint, Hours) if configured
+        if data.get("config", {}).get("github_project_number"):
+            res = setup_issue_in_project(issue_ref, task, data)
+            if res.get("success"):
+                print(c("  ✓ Added to project (Status/Activity/Sprint/Hours)", "green"))
+            else:
+                for err in res.get("errors") or ["unknown error"]:
+                    print(c(f"  ! project setup: {err}", "yellow"))
 
 
 def cmd_list(args):
@@ -3325,7 +3434,9 @@ def cmd_calendar(args):
         for event_title, task_id in mappings.items():
             task = resolve_task_by_id(data, task_id)
             if task:
-                print(f"  {c(event_title, 'cyan')} → {task['title']}")
+                # Show the base (non-sprint-suffixed) name so a single mapping
+                # is obviously serving all per-sprint copies of a recurring task.
+                print(f"  {c(event_title, 'cyan')} → {strip_sprint_suffix(task['title'])}")
             else:
                 print(f"  {c(event_title, 'cyan')} → {c(f'[deleted task: {task_id[:12]}...]', 'red')}")
         print()
@@ -3348,10 +3459,10 @@ def cmd_calendar(args):
         existing_mapping = get_event_mapping(data, event_title)
         if existing_mapping:
             existing_task = resolve_task_by_id(data, existing_mapping)
-            existing_name = existing_task["title"] if existing_task else f"[deleted: {existing_mapping[:12]}]"
-            print(f"Updating mapping: '{event_title}' → '{existing_name}' => '{task['title']}'")
+            existing_name = strip_sprint_suffix(existing_task["title"]) if existing_task else f"[deleted: {existing_mapping[:12]}]"
+            print(f"Updating mapping: '{event_title}' → '{existing_name}' => '{strip_sprint_suffix(task['title'])}'")
         else:
-            print(f"Creating mapping: '{event_title}' → '{task['title']}'")
+            print(f"Creating mapping: '{event_title}' → '{strip_sprint_suffix(task['title'])}'")
 
         set_event_mapping(data, event_title, task["id"])
         save(data)
@@ -3438,7 +3549,9 @@ def cmd_calendar(args):
         if not target_task:
             mapped_task_id = get_event_mapping(data, event["title"])
             if mapped_task_id:
-                mapped_task = resolve_task_by_id(data, mapped_task_id)
+                # Use the sprint-aware resolver so a recurring "X - Sprint NN"
+                # task picks the sprint matching the event's date.
+                mapped_task = resolve_event_to_task(data, event)
                 if mapped_task:
                     # Show quick confirmation for mapped event
                     print(c(f"\n  Event: {event['title']}", "bold"))

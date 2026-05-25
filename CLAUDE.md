@@ -239,6 +239,13 @@ wt config calendar_id your.email@gmail.com  # Use specific calendar (default: pr
 
 **TUI calendar range**: When the modal is opened from the TUI (`c` keybinding), the date range defaults to the selected task's sprint window. If the task has no `sprint_id`, the current sprint is used. If neither is available, it falls back to "yesterday + today". Sprint date ranges are resolved via `get_sprint_date_range_for_task()` against the persisted `config.sprints_cache`, which `_fetch_sprints_worker` in `tracker.py` populates after fetching from GitHub (via `save_sprints_cache()`). The CLI `wt calendar [days]` still uses the `days_back` integer.
 
+**Event ↔ task mapping (sprint-aware)**: `data["config"]["calendar_event_mappings"]` stores `event_title → task_id`. Lookup goes through `resolve_event_to_task(data, event)` in `wt.py`, which:
+1. Reads the mapping via `get_event_mapping()` (case- and whitespace-insensitive).
+2. If the mapped task's title ends in ` - Sprint XX`, strips that suffix with `strip_sprint_suffix()` (regex `\s*-\s*Sprint\s+\d+\s*$`, case-insensitive) and looks for a sibling task with the same base name whose `sprint_id` covers the event's `start_date` (via `get_cached_sprints()` → `find_sprint_for_date()`, with `get_all_sprints()` fallback). `cross_sprint_parent` shadow tasks are skipped.
+3. Falls back to the originally mapped task when no sprint-specific sibling is found.
+
+This means a single mapping like `Carlos / Ana weekly sync → Ana 1:1 calls - casanabria - Sprint 100` automatically routes future occurrences to `… - Sprint 101`, `… - Sprint 102`, etc., based on the event's date. The CLI/TUI `wt calendar import` and TUI `l` (log to task) paths both call `resolve_event_to_task()`. The mappings list (`wt calendar mappings`), `wt calendar map`, and TUI mapping notifications display the base name via `strip_sprint_suffix()` so the conceptual mapping is obvious.
+
 ### Task Closing Workflow with GitHub Project Integration
 
 When a task is marked as "done" (via CLI `wt done`, TUI `D` keybinding, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
@@ -481,3 +488,166 @@ local venv_python="${wt_dir}/venv/bin/python"
 ```bash
 rm -f ~/.zcompdump* && exec zsh
 ```
+
+---
+
+## wt.py API quick reference
+
+Authoritative signatures (use these instead of guessing — see live values via `python3 -c "import wt, inspect; print(inspect.signature(wt.<fn>))"`):
+
+**Data loading & ids**
+- `load() -> dict` — reads `~/.workload_tracker.json`
+- `save(data: dict)` — writes it back; always call after mutating
+- `uid() -> str` — timestamp-based id (yyyymmddHHMMSS + 4 random letters)
+- `notes_path(task_id: str) -> Path`
+
+**Task resolution**
+- `resolve_task(data: dict, query: str)` — fuzzy match by id or title
+- `resolve_task_by_id(data: dict, task_id: str) -> dict | None` — exact id only
+
+**Time accounting**
+- `task_logged_mins(task) -> float`
+- `task_uploaded_mins(task) -> float`
+- `task_pending_upload_mins(task) -> float`
+- `mins_to_quarter_hours(mins: float) -> float`
+- `fmt_mins(mins: float) -> str`
+- `log_effective_date(log) -> float` — prefers `started_at` over `at`
+- `bucket_logs_by_sprint(task, sprints) -> dict` — `sprint_id → [logs]`, `None` key for orphans
+
+**GitHub integration** (the signature footguns)
+- `create_github_issue(task: dict, repo: str) -> str` — **NOT** `(title, body, repo)`; body is read from `notes_path(task["id"])`
+- `setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict` — adds to project, sets Status/Activity/Sprint/Hours
+- `add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict`
+- `sync_project_status(issue_ref, status, data, project_info=None, item_id=None) -> bool` — silently no-ops for statuses missing from `PROJECT_STATUS_MAP`
+- `sync_project_hours(issue_ref, task, data, save_callback=None) -> bool`
+- `update_project_activity(issue_ref, activity, data, project_info=None, item_id=None) -> bool`
+- `get_project_hours(issue_ref, data) -> float | None`
+- `close_github_issue(issue_ref) -> bool`
+- `delete_github_issue(issue_ref) -> bool`
+- `get_role_repo(task, data) -> str | None`
+- `get_role_activity(task, data) -> str | None`
+
+**Sprints**
+- `get_all_sprints(data) -> list[dict]` — network call each time; entries have `id, title, start_date, end_date, field_id`
+- `get_current_sprint(data) -> dict | None` — based on today's date
+- `find_sprint_for_date(sprints, dt) -> dict | None` — half-open `[start, end)`
+- `save_sprints_cache(data, sprints) -> None` — caller must `save(data)`
+- `get_cached_sprints(data) -> list[dict]` — reads `data["config"]["sprints_cache"]`
+- `get_sprint_date_range_for_task(task, data) -> (sprint, start, end) | None` — cache-first, falls back to live
+- `sprint_summary_for_task(task, sprints) -> list[dict]`
+- `split_cross_sprint_task(task, data, save_callback, all_sprints=None, progress_callback=None) -> dict`
+
+**Calendar integration**
+- `get_calendar_events(days_back=1, calendar_id="primary", start_date=None, end_date=None) -> list[dict]` — event dict has `uid, title, start_date (ts), end_date (ts), duration_mins, calendar_name`
+- `get_gcal_service()`
+- `get_imported_calendar_uids(data) -> set` — checks both task-level and log-level `calendar_event_uid`
+- `normalize_event_title(title) -> str` — `.strip().lower()`
+- `get_event_mapping(data, event_title) -> str | None`
+- `set_event_mapping(data, event_title, task_id)`
+- `remove_event_mapping(data, event_title) -> bool`
+- `strip_sprint_suffix(title) -> str` — drops trailing ` - Sprint XX`
+- `resolve_event_to_task(data, event) -> dict | None` — sprint-aware; prefer this over raw `get_event_mapping` + `resolve_task_by_id` in any new code
+
+---
+
+## Common recipes
+
+### Create a task with a GitHub issue
+
+Use the `--create-issue` flag on `wt add`. The CLI creates the task, opens
+the issue via `gh`, and adds it to the configured GitHub Project with
+Status/Activity/Sprint/Hours all set. **Do not** shell out to `gh issue
+create` or write ad-hoc Python — the flag is the supported entry point and
+matches the TUI's behaviour. The role must have a `github_repo` configured
+(set via `wt roles set-repo <role> owner/repo`); the CLI fails fast otherwise.
+
+```bash
+# Standard case (auto-assigns to current sprint)
+python3 wt.py add "Refactor login flow" --role demokit --create-issue
+
+# Sprint-suffixed recurrent task (the Ana 1:1 backfill pattern)
+python3 wt.py add "Ana 1:1 calls - casanabria - Sprint 95" \
+    --role other --status recurrent --sprint "Sprint 95" --create-issue
+```
+
+For multi-sprint backfills, loop in shell (don't parallelize — the JSON file
+is read-modify-written each invocation):
+
+```bash
+for s in "Sprint 95" "Sprint 96" "Sprint 97"; do
+    python3 wt.py add "Ana 1:1 calls - casanabria - $s" \
+        --role other --status recurrent --sprint "$s" --create-issue
+done
+```
+
+The Claude Code skill at `.claude/skills/new-task-with-issue/SKILL.md`
+documents the full workflow and failure modes.
+
+### Run a recurrent task across many past sprints
+
+For each sprint, repeat the recipe above with a fresh task title and `--sprint "Sprint NN"`. Sprint names must match `get_all_sprints(data)` titles exactly. Sprint dates can be read from `data["config"]["sprints_cache"]` without a network call.
+
+### Map a recurring calendar event to a per-sprint recurrent task
+
+Map once against any one of the sprint copies — `resolve_event_to_task()` will route future occurrences to the sprint whose dates contain the event:
+
+```bash
+wt calendar map "Carlos / Ana weekly sync" "Ana 1:1 calls - casanabria - Sprint 100"
+# All "Ana 1:1 calls - casanabria - Sprint NN" tasks now receive their respective events.
+```
+
+To verify resolution for a hypothetical event:
+```python
+import wt
+from datetime import datetime
+data = wt.load()
+event = {"title": "Carlos / Ana weekly sync",
+         "start_date": datetime(2026, 3, 15, 12, 0).timestamp()}
+print(wt.resolve_event_to_task(data, event)["title"])
+# -> "Ana 1:1 calls - casanabria - Sprint 95"
+```
+
+### Look up sprint dates without hitting GitHub
+
+```python
+import wt
+data = wt.load()
+sprints = wt.get_cached_sprints(data)  # date objects, offline
+target = next(s for s in sprints if s["title"] == "Sprint 95")
+print(target["start_date"], "→", target["end_date"])
+```
+
+### Find which sprint a timestamp/date belongs to
+
+```python
+import wt
+from datetime import datetime
+sprints = wt.get_cached_sprints(wt.load())
+s = wt.find_sprint_for_date(sprints, datetime(2026, 3, 15).date())
+print(s and s["title"])  # "Sprint 95"
+```
+
+### Add a log entry programmatically (preserve calendar UID)
+
+```python
+import wt
+data = wt.load()
+task = wt.resolve_task(data, "ana 1:1 ... sprint 100")
+task["logs"].append({
+    "id": wt.uid(),
+    "minutes": 30.0,
+    "note": "Calendar: Carlos / Ana weekly sync",
+    "at": end_ts,
+    "started_at": start_ts,
+    "ended_at": end_ts,
+    "calendar_event_uid": event["uid"],  # prevents re-import
+})
+wt.save(data)
+```
+
+### Things to avoid
+
+- Don't shell out to `gh issue create` or `gh project item-edit` directly — use `create_github_issue` + `setup_issue_in_project` so Status/Activity/Sprint/Hours fields stay in sync.
+- Don't write to `data["config"]["sprints_cache"]` by hand — use `save_sprints_cache(data, sprints)` so the entry shape stays correct (ISO date strings).
+- Don't add new task statuses without updating `PROJECT_STATUS_MAP` (`wt.py`) — missing entries cause silent sync no-ops.
+- Don't bypass `resolve_event_to_task()` in new code that logs a calendar event to a mapped task — manual `resolve_task_by_id(get_event_mapping(...))` skips the sprint-aware routing.
