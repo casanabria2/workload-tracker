@@ -81,8 +81,11 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 ### Domain Constants
 
 - **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`.
-- **Statuses**: `todo`, `inprogress`, `done`
+- **Statuses**: `todo`, `inprogress`, `recurrent`, `done`
 - Done tasks are hidden by default in all list views (CLI, TUI, MCP)
+- `recurrent` is for tasks that intentionally span sprints (e.g. recurring meetings, on-call). They are excluded from cross-sprint split detection.
+- TUI status transitions are explicit (no cycling): `p` moves `todo` → `inprogress`, `D` (Shift+d) moves `inprogress` → `done` via the close workflow. Status edits beyond that are done through the edit modal (`e`).
+- TUI board layout: the task board is split into two tables — non-recurrent tasks at the top, recurrent tasks at the bottom. Role filter and `_selected_task()` work against whichever table is focused.
 - Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI)
 
 ### Key Patterns
@@ -234,7 +237,7 @@ wt config calendar_id your.email@gmail.com  # Use specific calendar (default: pr
 
 ### Task Closing Workflow with GitHub Project Integration
 
-When a task is marked as "done" (via CLI `wt done`, TUI status cycling, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
+When a task is marked as "done" (via CLI `wt done`, TUI `D` keybinding, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
 
 **Role → Repository Mapping:**
 
@@ -321,8 +324,8 @@ wt add "title" --sprint none        # Create task without sprint
 
 **Three task lifecycle patterns:**
 1. **Single-sprint**: Fully contained in one sprint. Auto-assigned, no special handling.
-2. **Recurrent**: User creates one task per sprint manually (e.g., "Slack questions" per sprint).
-3. **Cross-sprint**: Task spans multiple sprints. `split-sprint` or close workflow creates shadow tasks.
+2. **Recurrent**: Long-lived tasks that intentionally span sprints (e.g. "Slack questions", on-call). Marked with `status="recurrent"`, displayed in the dedicated bottom table in the TUI, and skipped by cross-sprint detection. Alternatively, the user can still create one regular task per sprint manually.
+3. **Cross-sprint**: A non-recurrent task that ended up with logs in multiple sprints. `split-sprint` or close workflow creates shadow tasks.
 
 **Cross-sprint split workflow:**
 When a task has logs in multiple sprints (detected via log timestamps):
