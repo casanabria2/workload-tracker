@@ -52,6 +52,7 @@ from wt import (
     get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
     get_imported_calendar_uids, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
     get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
+    save_sprints_cache, get_sprint_date_range_for_task,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -1661,15 +1662,30 @@ class CalendarModal(ModalScreen):
     #calendar-help { color: $text-muted; }
     #calendar-error { color: $error; margin-bottom: 1; }
     #role-select { width: 30; margin-bottom: 1; }
-    #days-input { width: 10; }
+    #calendar-range { color: $text-muted; margin-bottom: 1; }
     """
 
-    def __init__(self, data: dict, save_callback):
+    def __init__(self, data: dict, save_callback, task: dict | None = None):
         super().__init__()
         self._data = data
         self._save = save_callback
+        self._task = task
         self._events = []
-        self._days_back = 1
+        # Resolve the sprint date range up front so the modal can render
+        # its header even before _load_events runs.
+        rng = get_sprint_date_range_for_task(task, data)
+        if rng is not None:
+            self._sprint, self._start_date, self._end_date = rng
+        else:
+            self._sprint = None
+            self._start_date = None
+            self._end_date = None
+
+    def _range_label(self) -> str:
+        if self._sprint and self._start_date and self._end_date:
+            source = "task sprint" if (self._task and self._task.get("sprint_id") == self._sprint["id"]) else "current sprint"
+            return f"[dim]Range: {self._sprint['title']} ({self._start_date} → {self._end_date}, {source})[/]"
+        return "[dim]Range: yesterday + today (no sprint info available)[/]"
 
     def compose(self) -> ComposeResult:
         roles = get_roles(self._data)
@@ -1683,9 +1699,8 @@ class CalendarModal(ModalScreen):
                     value=roles[0]["id"] if roles else "other",
                     id="role-select"
                 )
+            yield Label(self._range_label(), id="calendar-range")
             with Horizontal():
-                yield Label("Days back: ")
-                yield Input(value="1", id="days-input", type="integer")
                 yield Button("Refresh", id="btn-refresh", variant="default")
             yield DataTable(id="calendar-table", cursor_type="row", zebra_stripes=True)
             with Horizontal(id="calendar-actions"):
@@ -1724,19 +1739,31 @@ class CalendarModal(ModalScreen):
 
         error_label.update("")
 
-        # Get days back from input
-        try:
-            days_input = self.query_one("#days-input", Input)
-            self._days_back = int(days_input.value) if days_input.value else 1
-        except (ValueError, Exception):
-            self._days_back = 1
+        # Refresh the sprint range in case the persisted cache was updated
+        # since the modal was constructed (e.g. background sprint fetch finished).
+        if self._sprint is None:
+            rng = get_sprint_date_range_for_task(self._task, self._data)
+            if rng is not None:
+                self._sprint, self._start_date, self._end_date = rng
+                try:
+                    self.query_one("#calendar-range", Label).update(self._range_label())
+                except Exception:
+                    pass
 
         # Get calendar ID from config
         config = self._data.get("config", {})
         calendar_id = config.get("calendar_id", "primary")
 
-        # Fetch events
-        self._events = get_calendar_events(days_back=self._days_back, calendar_id=calendar_id)
+        # Fetch events using the resolved sprint range, falling back to the
+        # original "yesterday + today" window if no sprint info is available.
+        if self._start_date and self._end_date:
+            self._events = get_calendar_events(
+                start_date=self._start_date,
+                end_date=self._end_date,
+                calendar_id=calendar_id,
+            )
+        else:
+            self._events = get_calendar_events(days_back=1, calendar_id=calendar_id)
 
         # Get already imported UIDs
         imported_uids = get_imported_calendar_uids(self._data)
@@ -2222,6 +2249,12 @@ class WorkloadTracker(App):
             self._sprints_cache = sprints
             self._sprints_fetched = True
 
+            # Persist sprint dates so the calendar modal (and other features)
+            # can resolve sprint ranges without waiting for a GitHub round-trip.
+            if sprints:
+                save_sprints_cache(self._data, sprints)
+                save_data(self._data)
+
             # Auto-detect cross-sprint tasks
             if sprints:
                 from datetime import datetime
@@ -2623,7 +2656,8 @@ class WorkloadTracker(App):
         self.push_screen(TaskModal(roles=roles, sprints=self._sprints_cache), self._on_task_saved)
 
     def action_import_calendar(self):
-        self.push_screen(CalendarModal(self._data, save_data), self._on_calendar_closed)
+        task = self._selected_task()
+        self.push_screen(CalendarModal(self._data, save_data, task=task), self._on_calendar_closed)
 
     def _on_calendar_closed(self, result):
         # Refresh UI after calendar modal closes (events may have been imported)

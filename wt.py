@@ -611,6 +611,82 @@ def find_sprint_for_date(sprints: list[dict], dt) -> dict | None:
     return None
 
 
+def save_sprints_cache(data: dict, sprints: list[dict]) -> None:
+    """Persist the sprint list to data['config']['sprints_cache'].
+
+    Stores only the fields needed for offline lookup (id, title, start_date,
+    end_date, field_id). Dates are ISO strings so the JSON file stays portable.
+    The caller is responsible for invoking save(data) after this.
+    """
+    if not sprints:
+        return
+    cfg = data.setdefault("config", {})
+    cfg["sprints_cache"] = [
+        {
+            "id": s["id"],
+            "title": s["title"],
+            "start_date": s["start_date"].isoformat(),
+            "end_date": s["end_date"].isoformat(),
+            "field_id": s.get("field_id"),
+        }
+        for s in sprints
+    ]
+
+
+def get_cached_sprints(data: dict) -> list[dict]:
+    """Read the persisted sprint list from config and parse dates back to date objects.
+
+    Returns [] if the cache is missing or unreadable. Cached sprints carry the
+    same start_date/end_date date-object contract as get_all_sprints().
+    """
+    from datetime import date
+    raw = data.get("config", {}).get("sprints_cache", [])
+    out = []
+    for s in raw:
+        try:
+            out.append({
+                "id": s["id"],
+                "title": s["title"],
+                "start_date": date.fromisoformat(s["start_date"]),
+                "end_date": date.fromisoformat(s["end_date"]),
+                "field_id": s.get("field_id"),
+            })
+        except (KeyError, ValueError):
+            continue
+    return out
+
+
+def get_sprint_date_range_for_task(task: dict | None, data: dict):
+    """Resolve (start_date, end_date) for a task's sprint context.
+
+    Lookup order:
+      1. The task's sprint_id, resolved against the persisted sprints cache.
+      2. The current sprint based on today's date, resolved against the cache.
+      3. The same lookups against a live get_all_sprints() call (network).
+
+    Returns a (sprint_dict, start_date, end_date) tuple or None if no sprint
+    information is available. The returned dates are datetime.date objects.
+    """
+    from datetime import datetime
+
+    def _pick(sprints):
+        if not sprints:
+            return None
+        if task and task.get("sprint_id"):
+            for s in sprints:
+                if s["id"] == task["sprint_id"]:
+                    return s
+        today = datetime.now().date()
+        return find_sprint_for_date(sprints, today)
+
+    sprint = _pick(get_cached_sprints(data))
+    if sprint is None:
+        sprint = _pick(get_all_sprints(data))
+    if sprint is None:
+        return None
+    return sprint, sprint["start_date"], sprint["end_date"]
+
+
 def log_effective_date(log: dict) -> float:
     """Return the best timestamp for determining which sprint a log belongs to.
 
@@ -3125,12 +3201,16 @@ def get_gcal_service():
     return build('calendar', 'v3', credentials=creds)
 
 
-def get_calendar_events(days_back: int = 1, calendar_id: str = "primary") -> list[dict]:
+def get_calendar_events(days_back: int = 1, calendar_id: str = "primary",
+                        start_date=None, end_date=None) -> list[dict]:
     """Get events from Google Calendar for the specified date range.
 
     Args:
-        days_back: Number of days to look back (default 1 = yesterday + today)
+        days_back: Number of days to look back (default 1 = yesterday + today).
+            Ignored if explicit start_date/end_date are provided.
         calendar_id: Google Calendar ID (default "primary", or email like "user@domain.com")
+        start_date: Optional datetime.date for the inclusive range start.
+        end_date: Optional datetime.date for the inclusive range end.
 
     Returns list of event dicts: {title, start_date, end_date, calendar_name, notes, duration_mins, uid}
     """
@@ -3139,13 +3219,18 @@ def get_calendar_events(days_back: int = 1, calendar_id: str = "primary") -> lis
         return []
 
     # Calculate time range
-    now = datetime.now()
-    start_date = (now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    if start_date is not None and end_date is not None:
+        # Whole-day boundaries for the provided date range.
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        end_dt = datetime.combine(end_date, datetime.max.time()).replace(microsecond=0)
+    else:
+        now = datetime.now()
+        start_dt = (now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
     # Convert to RFC3339 format
-    start_str = start_date.isoformat() + 'Z'
-    end_str = end_date.isoformat() + 'Z'
+    start_str = start_dt.isoformat() + 'Z'
+    end_str = end_dt.isoformat() + 'Z'
 
     try:
         events_result = service.events().list(

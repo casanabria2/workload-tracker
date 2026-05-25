@@ -38,6 +38,7 @@ Plain JSON with three top-level keys:
 - `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `calendar_event_uid`, `sprint`, `sprint_id`, `cross_sprint_parent`
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color, and optionally `github_repo`. Roles are user-configurable via `wt roles` commands.
+- `config.sprints_cache[]` — Persisted list of `{id, title, start_date, end_date, field_id}` written by `save_sprints_cache()` after the TUI fetches sprints from GitHub. Used by `get_sprint_date_range_for_task()` to avoid network calls (e.g. for the calendar modal's default range).
 
 Time tracking: `logs[]` array of log entries. Timer sessions auto-commit as log entries when stopped.
 
@@ -236,6 +237,8 @@ wt config calendar_id your.email@gmail.com  # Use specific calendar (default: pr
 **Tracking**: Imported events store `calendar_event_uid` (on tasks or log entries) to prevent duplicate imports. Already-imported events show with ✓ in the list.
 - **TUI keybindings**: `i` = import as new task, `l` = log to existing task, `d` = delete imported task
 
+**TUI calendar range**: When the modal is opened from the TUI (`c` keybinding), the date range defaults to the selected task's sprint window. If the task has no `sprint_id`, the current sprint is used. If neither is available, it falls back to "yesterday + today". Sprint date ranges are resolved via `get_sprint_date_range_for_task()` against the persisted `config.sprints_cache`, which `_fetch_sprints_worker` in `tracker.py` populates after fetching from GitHub (via `save_sprints_cache()`). The CLI `wt calendar [days]` still uses the `days_back` integer.
+
 ### Task Closing Workflow with GitHub Project Integration
 
 When a task is marked as "done" (via CLI `wt done`, TUI `D` keybinding, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
@@ -338,11 +341,13 @@ When a task has logs in multiple sprints (detected via log timestamps):
 **Auto-detection:** TUI checks for cross-sprint tasks on mount and shows a notification.
 
 **Key functions in wt.py:**
-- `get_all_sprints(data)` — All sprint iterations from GitHub Project (GraphQL)
+- `get_all_sprints(data)` — All sprint iterations from GitHub Project (GraphQL); no caching, network call every time
 - `get_current_sprint(data)` — Current sprint based on today's date
 - `find_sprint_for_date(sprints, dt)` — Find which sprint a date falls in
 - `sprint_summary_for_task(task, sprints)` — Per-sprint time breakdown
 - `split_cross_sprint_task(task, data, save_callback)` — Execute the split
+- `save_sprints_cache(data, sprints)` / `get_cached_sprints(data)` — Persist sprint list (id, title, start_date, end_date, field_id) to `data["config"]["sprints_cache"]` so consumers can resolve sprint dates without hitting GitHub. Caller must `save(data)` after writing.
+- `get_sprint_date_range_for_task(task, data)` — Resolves `(sprint_dict, start_date, end_date)` for a task's sprint context. Looks up the task's `sprint_id` first, falls back to current sprint; tries the persisted cache before the network.
 
 **MCP tools:** `list_sprints`, `get_current_sprint_info`, `set_sprint`, `sprint_split`
 
