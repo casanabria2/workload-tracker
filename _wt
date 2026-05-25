@@ -120,7 +120,13 @@ for t in data.get('tasks', []):
         calendar|cal)
             if (( CURRENT == 3 )); then
                 local -a subcommands
-                subcommands=('setup:Show setup instructions' 'import:Import a calendar event as task')
+                subcommands=(
+                    'setup:Show setup instructions'
+                    'import:Import a calendar event as task'
+                    'mappings:List all event-to-task mappings'
+                    'map:Map an event title to a task'
+                    'unmap:Remove an event title mapping'
+                )
                 _describe -t subcommands 'calendar subcommand' subcommands
             elif (( CURRENT >= 4 )); then
                 case "${words[3]}" in
@@ -190,6 +196,77 @@ except:
                         else
                             # Offer --task flag
                             compadd -- "--task"
+                        fi
+                        ;;
+                    map)
+                        if (( CURRENT == 4 )); then
+                            # Complete event titles from mappings or recent calendar events
+                            local -a events
+                            local wt_dir="${0:A:h}"
+                            local venv_python="${wt_dir}/venv/bin/python"
+                            [[ -x "$venv_python" ]] || venv_python="python3"
+                            events=("${(@f)$($venv_python -c "
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+calendar_id = data.get('config', {}).get('calendar_id', 'primary')
+
+# Try to get recent event titles
+try:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    token_file = Path.home() / '.workload_tracker_gcal_token.json'
+    if token_file.exists():
+        creds = Credentials.from_authorized_user_file(str(token_file))
+        service = build('calendar', 'v3', credentials=creds)
+
+        now = datetime.now()
+        start = (now - timedelta(days=7)).isoformat() + 'Z'
+        end = now.replace(hour=23, minute=59).isoformat() + 'Z'
+
+        result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start, timeMax=end,
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+
+        for item in result.get('items', []):
+            if 'dateTime' in item.get('start', {}):
+                print(item.get('summary', ''))
+except:
+    pass
+" 2>/dev/null)}")
+                            compadd "${events[@]}"
+                        elif (( CURRENT == 5 )); then
+                            # Complete task names
+                            local -a tasks
+                            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    if t.get('status') != 'done':
+        print(t['title'])
+" 2>/dev/null)}")
+                            compadd "${tasks[@]}"
+                        fi
+                        ;;
+                    unmap)
+                        if (( CURRENT == 4 )); then
+                            # Complete mapped event titles
+                            local -a mapped_events
+                            mapped_events=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+mappings = data.get('config', {}).get('calendar_event_mappings', {})
+for title in mappings.keys():
+    print(title)
+" 2>/dev/null)}")
+                            compadd "${mapped_events[@]}"
                         fi
                         ;;
                 esac

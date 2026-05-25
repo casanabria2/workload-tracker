@@ -51,6 +51,7 @@ from wt import (
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
     get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
     get_imported_calendar_uids, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
+    get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -1478,8 +1479,10 @@ class TaskPickerModal(ModalScreen):
 
     def on_key(self, event):
         if event.key == "escape":
+            event.stop()
             self.dismiss(None)
         elif event.key == "enter":
+            event.stop()  # Prevent Enter from propagating to next modal
             self._do_pick()
 
     @on(Button.Pressed, "#btn-pick")
@@ -1503,6 +1506,133 @@ class TaskPickerModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Mapped Log Confirmation
+# ──────────────────────────────────────────────────────────
+
+class MappedLogConfirmModal(ModalScreen):
+    """Quick confirmation modal for logging a mapped calendar event."""
+    CSS = """
+    MappedLogConfirmModal { align: center middle; }
+    #mapped-log-box {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #mapped-log-box Label { margin-bottom: 1; }
+    #mapped-log-minutes { width: 100%; margin-bottom: 1; }
+    #mapped-log-actions { margin-top: 1; }
+    """
+
+    def __init__(self, event: dict, task: dict):
+        super().__init__()
+        self._event = event
+        self._task = task
+
+    def compose(self) -> ComposeResult:
+        with Container(id="mapped-log-box"):
+            yield Label(f"[bold]Log Calendar Event[/]")
+            yield Label(f"Event: {self._event['title']}")
+            yield Label(f"Mapped to: [cyan]{self._task['title']}[/]")
+            yield Label("")
+            yield Label("Minutes to log:")
+            yield Input(
+                value=str(int(self._event["duration_mins"])),
+                id="mapped-log-minutes",
+                type="number"
+            )
+            with Horizontal(id="mapped-log-actions"):
+                yield Button("Log", variant="success", id="btn-mapped-log")
+                yield Button("Other task", variant="default", id="btn-mapped-other")
+                yield Button("Cancel", id="btn-mapped-cancel")
+
+    def on_mount(self):
+        self.query_one("#mapped-log-minutes", Input).focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "enter":
+            self._do_log()
+
+    @on(Button.Pressed, "#btn-mapped-log")
+    def on_log(self):
+        self._do_log()
+
+    @on(Button.Pressed, "#btn-mapped-other")
+    def on_other(self):
+        self.dismiss({"action": "other"})
+
+    @on(Button.Pressed, "#btn-mapped-cancel")
+    def on_cancel(self):
+        self.dismiss(None)
+
+    def _do_log(self):
+        try:
+            minutes = float(self.query_one("#mapped-log-minutes", Input).value)
+            if minutes > 0:
+                self.dismiss({"action": "log", "minutes": minutes})
+            else:
+                self.dismiss(None)
+        except ValueError:
+            self.dismiss(None)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Save Mapping Confirmation
+# ──────────────────────────────────────────────────────────
+
+class SaveMappingConfirmModal(ModalScreen):
+    """Simple yes/no modal to save an event->task mapping."""
+    CSS = """
+    SaveMappingConfirmModal { align: center middle; }
+    #save-mapping-box {
+        width: 55;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #save-mapping-box Label { margin-bottom: 1; }
+    #save-mapping-actions { margin-top: 1; }
+    """
+
+    def __init__(self, event_title: str, task_title: str):
+        super().__init__()
+        self._event_title = event_title
+        self._task_title = task_title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="save-mapping-box"):
+            yield Label("[bold]Save Mapping?[/]")
+            yield Label(f"Event: {self._event_title}")
+            yield Label(f"Task: [cyan]{self._task_title}[/]")
+            yield Label("")
+            yield Label("Remember this mapping for future events?")
+            with Horizontal(id="save-mapping-actions"):
+                yield Button("Yes", variant="success", id="btn-save-yes")
+                yield Button("No", variant="default", id="btn-save-no")
+
+    def on_mount(self):
+        self.query_one("#btn-save-yes", Button).focus()
+
+    def on_key(self, event):
+        if event.key == "escape" or event.key == "n":
+            self.dismiss(False)
+        elif event.key == "enter" or event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-save-yes")
+    def on_yes(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-save-no")
+    def on_no(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Calendar Import
 # ──────────────────────────────────────────────────────────
 
@@ -1511,6 +1641,7 @@ class CalendarModal(ModalScreen):
     BINDINGS = [
         Binding("i", "import_event", "Import", priority=True),
         Binding("l", "log_to_task", "Log to task", priority=True),
+        Binding("m", "toggle_mapping", "Map/unmap", priority=True),
         Binding("d", "delete_event", "Delete", priority=True),
         Binding("escape", "close_modal", "Close", priority=True),
     ]
@@ -1562,7 +1693,7 @@ class CalendarModal(ModalScreen):
                 yield Button("Log to task  [l]", variant="success", id="btn-log-to-task")
                 yield Button("Delete  [d]", variant="error", id="btn-delete")
                 yield Button("Close  [Esc]", id="btn-close")
-            yield Label("[dim]\\[i] Import as new task  \\[l] Log to existing task  \\[d] Delete  ✓ = imported[/]", id="calendar-help")
+            yield Label("[dim]\\[i] Import  \\[l] Log  \\[m] Map/unmap  \\[d] Delete  ✓=imported  →=mapped[/]", id="calendar-help")
 
     def on_mount(self):
         self._load_events()
@@ -1616,7 +1747,14 @@ class CalendarModal(ModalScreen):
 
         for event in self._events:
             is_imported = event["uid"] in imported_uids
-            status = "✓" if is_imported else " "
+            is_mapped = get_event_mapping(self._data, event["title"]) is not None
+            # Show indicators: ✓=imported, →=mapped
+            if is_imported:
+                status = "✓"
+            elif is_mapped:
+                status = "→"
+            else:
+                status = " "
             start_dt = datetime.fromtimestamp(event["start_date"])
             date_str = start_dt.strftime("%m/%d")
             time_str = start_dt.strftime("%H:%M")
@@ -1654,6 +1792,44 @@ class CalendarModal(ModalScreen):
     def action_close_modal(self):
         self.dismiss(False)
 
+    def action_toggle_mapping(self):
+        """Toggle mapping for the selected event."""
+        event = self._get_selected_event()
+        if not event:
+            self.notify("No event selected", severity="warning")
+            return
+
+        existing_mapping = get_event_mapping(self._data, event["title"])
+        if existing_mapping:
+            # Remove existing mapping
+            remove_event_mapping(self._data, event["title"])
+            self._save(self._data)
+            task = resolve_task_by_id(self._data, existing_mapping)
+            task_name = task["title"] if task else f"[deleted: {existing_mapping[:12]}]"
+            self.notify(f"Removed mapping: '{event['title']}' → '{task_name}'", severity="information")
+            self._load_events()
+        else:
+            # Show task picker to create mapping
+            tasks = [t for t in self._data.get("tasks", []) if t.get("status") != "done"]
+            if not tasks:
+                self.notify("No active tasks to map to", severity="warning")
+                return
+            self._pending_map_event = event
+            self.app.push_screen(TaskPickerModal(tasks), self._on_mapping_task_picked)
+
+    def _on_mapping_task_picked(self, task: dict | None):
+        """Callback after task picker for mapping."""
+        if task is None or not hasattr(self, '_pending_map_event'):
+            return
+
+        event = self._pending_map_event
+        del self._pending_map_event
+
+        set_event_mapping(self._data, event["title"], task["id"])
+        self._save(self._data)
+        self.notify(f"Mapped: '{event['title']}' → '{task['title']}'", severity="information")
+        self._load_events()
+
     @on(Button.Pressed, "#btn-import")
     def on_import(self):
         self._do_import()
@@ -1679,6 +1855,10 @@ class CalendarModal(ModalScreen):
 
     def _do_log_to_task(self):
         """Log a calendar event's time to an existing task."""
+        # Clear any stale pending state from previous interactions
+        if hasattr(self, '_pending_save_mapping'):
+            del self._pending_save_mapping
+
         event = self._get_selected_event()
         if not event:
             self.notify("No event selected", severity="warning")
@@ -1690,6 +1870,22 @@ class CalendarModal(ModalScreen):
             self.notify("Event already imported", severity="warning")
             return
 
+        # Check for mapping
+        mapped_task_id = get_event_mapping(self._data, event["title"])
+        if mapped_task_id:
+            mapped_task = resolve_task_by_id(self._data, mapped_task_id)
+            if mapped_task:
+                # Show quick confirmation modal for mapped event
+                self._pending_mapped_log = {"event": event, "task": mapped_task}
+                self.app.push_screen(
+                    MappedLogConfirmModal(event, mapped_task),
+                    self._on_mapped_log_result
+                )
+                return
+            else:
+                # Mapped task was deleted, warn and continue to normal flow
+                self.notify("Mapped task was deleted, selecting new task", severity="warning")
+
         # Get non-done tasks
         tasks = [t for t in self._data.get("tasks", []) if t.get("status") != "done"]
         if not tasks:
@@ -1698,6 +1894,40 @@ class CalendarModal(ModalScreen):
 
         self._pending_log_event = event
         self.app.push_screen(TaskPickerModal(tasks), self._on_task_picked)
+
+    def _on_mapped_log_result(self, result: dict | None):
+        """Callback after MappedLogConfirmModal."""
+        if result is None or not hasattr(self, '_pending_mapped_log'):
+            return
+
+        event = self._pending_mapped_log["event"]
+        task = self._pending_mapped_log["task"]
+        del self._pending_mapped_log
+
+        if result.get("action") == "other":
+            # User wants to pick a different task
+            tasks = [t for t in self._data.get("tasks", []) if t.get("status") != "done"]
+            if not tasks:
+                self.notify("No active tasks", severity="warning")
+                return
+            self._pending_log_event = event
+            self.app.push_screen(TaskPickerModal(tasks), self._on_task_picked)
+            return
+
+        if result.get("action") == "log":
+            minutes = result.get("minutes", event["duration_mins"])
+            task["logs"].append({
+                "id": uid(),
+                "minutes": round(minutes, 2),
+                "note": f"Calendar: {event['title']}",
+                "at": event["end_date"],
+                "started_at": event["start_date"],
+                "ended_at": event["end_date"],
+                "calendar_event_uid": event["uid"],
+            })
+            self._save(self._data)
+            self.notify(f"Logged {fmt_mins(minutes)} to '{task['title']}'", severity="information")
+            self._load_events()
 
     def _on_task_picked(self, task: dict | None):
         """Callback after task picker."""
@@ -1710,6 +1940,7 @@ class CalendarModal(ModalScreen):
         self._pending_log = {
             "event": event,
             "task": task,
+            "from_picker": True,  # Track that this came from picker, not mapping
         }
         self.app.push_screen(CalendarTimeModal(event), self._on_log_time_confirmed)
 
@@ -1720,6 +1951,7 @@ class CalendarModal(ModalScreen):
 
         event = self._pending_log["event"]
         task = self._pending_log["task"]
+        from_picker = self._pending_log.get("from_picker", False)
         del self._pending_log
 
         # Add log entry to existing task with calendar_event_uid
@@ -1736,6 +1968,39 @@ class CalendarModal(ModalScreen):
 
         self.notify(f"Logged {fmt_mins(minutes)} to '{task['title']}'", severity="information")
         self._load_events()
+
+        # If from picker (not mapped), offer to save mapping
+        if from_picker:
+            existing_mapping = get_event_mapping(self._data, event["title"])
+            if not existing_mapping:
+                self._pending_save_mapping = {"event": event, "task": task}
+                self.call_later(self._show_save_mapping_modal)
+
+    def _show_save_mapping_modal(self):
+        """Show the save mapping modal after CalendarTimeModal is dismissed."""
+        if not hasattr(self, '_pending_save_mapping'):
+            return
+        event = self._pending_save_mapping["event"]
+        task = self._pending_save_mapping["task"]
+        self.app.push_screen(
+            SaveMappingConfirmModal(event["title"], task["title"]),
+            self._on_save_mapping_result
+        )
+
+    def _on_save_mapping_result(self, save: bool):
+        """Callback after SaveMappingConfirmModal."""
+        if not hasattr(self, '_pending_save_mapping'):
+            return
+
+        event = self._pending_save_mapping["event"]
+        task = self._pending_save_mapping["task"]
+        del self._pending_save_mapping
+
+        if save:
+            set_event_mapping(self._data, event["title"], task["id"])
+            self._save(self._data)
+            self.notify(f"Mapping saved", severity="information")
+            self._load_events()
 
     def _do_delete(self):
         """Delete the task that was imported from the selected calendar event."""

@@ -48,6 +48,9 @@ Usage:
     wt calendar <days>           — List events from last N days
     wt calendar import <event> [--task <task>]  — Import event (or log to existing task)
     wt calendar setup            — Show Google Calendar setup instructions
+    wt calendar mappings         — List all event-to-task mappings
+    wt calendar map <event> <task>   — Map event title to task for quick logging
+    wt calendar unmap <event>    — Remove an event-to-task mapping
 
     wt arc setup                 — Set up Arc browser integration
     wt arc status                — Show Arc integration status
@@ -142,6 +145,51 @@ def get_imported_calendar_uids(data: dict) -> set:
             if log.get("calendar_event_uid"):
                 uids.add(log["calendar_event_uid"])
     return uids
+
+
+def normalize_event_title(title: str) -> str:
+    """Normalize event title for mapping lookup (lowercase + trimmed)."""
+    return title.strip().lower()
+
+
+def get_event_mapping(data: dict, event_title: str) -> str | None:
+    """Get task ID mapped to an event title, or None if not mapped."""
+    mappings = data.get("config", {}).get("calendar_event_mappings", {})
+    key = normalize_event_title(event_title)
+    # Check exact match first
+    if key in mappings:
+        return mappings[key]
+    # Check all stored keys (normalized)
+    for stored_title, task_id in mappings.items():
+        if normalize_event_title(stored_title) == key:
+            return task_id
+    return None
+
+
+def set_event_mapping(data: dict, event_title: str, task_id: str):
+    """Create or update an event title -> task ID mapping."""
+    if "config" not in data:
+        data["config"] = {}
+    if "calendar_event_mappings" not in data["config"]:
+        data["config"]["calendar_event_mappings"] = {}
+    data["config"]["calendar_event_mappings"][event_title.strip()] = task_id
+
+
+def remove_event_mapping(data: dict, event_title: str) -> bool:
+    """Remove a mapping by event title. Returns True if found and removed."""
+    mappings = data.get("config", {}).get("calendar_event_mappings", {})
+    key = normalize_event_title(event_title)
+    # Find the actual key (may differ in case/whitespace)
+    for stored_title in list(mappings.keys()):
+        if normalize_event_title(stored_title) == key:
+            del mappings[stored_title]
+            return True
+    return False
+
+
+def resolve_task_by_id(data: dict, task_id: str) -> dict | None:
+    """Find a task by its exact ID."""
+    return next((t for t in data.get("tasks", []) if t["id"] == task_id), None)
 
 
 def fmt_mins(mins: float) -> str:
@@ -3179,6 +3227,65 @@ def cmd_calendar(args):
         print()
         return
 
+    if args and args[0].lower() == "mappings":
+        # List all event->task mappings
+        mappings = config.get("calendar_event_mappings", {})
+        if not mappings:
+            print(c("No calendar event mappings configured.", "dim"))
+            print("Use 'wt calendar map \"Event Title\" <task>' to create one.")
+            return
+
+        print(c("\n  Calendar Event Mappings\n", "bold"))
+        for event_title, task_id in mappings.items():
+            task = resolve_task_by_id(data, task_id)
+            if task:
+                print(f"  {c(event_title, 'cyan')} → {task['title']}")
+            else:
+                print(f"  {c(event_title, 'cyan')} → {c(f'[deleted task: {task_id[:12]}...]', 'red')}")
+        print()
+        return
+
+    if args and args[0].lower() == "map":
+        # Create/update mapping: wt calendar map "Event Title" <task>
+        if len(args) < 3:
+            print("Usage: wt calendar map \"Event Title\" <task>")
+            sys.exit(1)
+
+        event_title = args[1]
+        task_query = " ".join(args[2:])
+        task = resolve_task(data, task_query)
+        if not task:
+            print(c(f"No task found matching '{task_query}'", "red"))
+            sys.exit(1)
+
+        # Check if already mapped
+        existing_mapping = get_event_mapping(data, event_title)
+        if existing_mapping:
+            existing_task = resolve_task_by_id(data, existing_mapping)
+            existing_name = existing_task["title"] if existing_task else f"[deleted: {existing_mapping[:12]}]"
+            print(f"Updating mapping: '{event_title}' → '{existing_name}' => '{task['title']}'")
+        else:
+            print(f"Creating mapping: '{event_title}' → '{task['title']}'")
+
+        set_event_mapping(data, event_title, task["id"])
+        save(data)
+        print(c("✓ Mapping saved", "green"))
+        return
+
+    if args and args[0].lower() == "unmap":
+        # Remove mapping: wt calendar unmap "Event Title"
+        if len(args) < 2:
+            print("Usage: wt calendar unmap \"Event Title\"")
+            sys.exit(1)
+
+        event_title = " ".join(args[1:])
+        if remove_event_mapping(data, event_title):
+            save(data)
+            print(c(f"✓ Removed mapping for '{event_title}'", "green"))
+        else:
+            print(c(f"No mapping found for '{event_title}'", "yellow"))
+        return
+
     if args and args[0].lower() == "import":
         # Import mode: wt calendar import <event-title> [--task <task-name>]
         if len(args) < 2:
@@ -3238,15 +3345,70 @@ def cmd_calendar(args):
         # Show event details
         start_dt = datetime.fromtimestamp(event["start_date"])
         end_dt = datetime.fromtimestamp(event["end_date"])
+        duration = event["duration_mins"]
+
+        # Check for mapping if no --task flag provided
+        mapped_task = None
+        if not target_task:
+            mapped_task_id = get_event_mapping(data, event["title"])
+            if mapped_task_id:
+                mapped_task = resolve_task_by_id(data, mapped_task_id)
+                if mapped_task:
+                    # Show quick confirmation for mapped event
+                    print(c(f"\n  Event: {event['title']}", "bold"))
+                    print(f"  Duration: {fmt_mins(duration)}")
+                    print(f"  Mapped to: {c(mapped_task['title'], 'cyan')}")
+                    print()
+                    print(f"  Log {fmt_mins(duration)} to '{mapped_task['title']}'?")
+                    try:
+                        choice = input("  [Y/n/minutes/other]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        sys.exit(0)
+
+                    if choice == "other":
+                        # Fall through to normal flow (unmapped)
+                        mapped_task = None
+                    elif choice == "n":
+                        print(c("Skipped.", "dim"))
+                        return
+                    else:
+                        # Parse minutes or use default
+                        if choice == "" or choice == "y":
+                            log_minutes = duration
+                        else:
+                            try:
+                                log_minutes = float(choice)
+                            except ValueError:
+                                print(c("Invalid input, logging full duration.", "yellow"))
+                                log_minutes = duration
+
+                        # Log to mapped task
+                        mapped_task["logs"].append({
+                            "id": uid(),
+                            "minutes": round(log_minutes, 2),
+                            "note": f"Calendar: {event['title']}",
+                            "at": event["end_date"],
+                            "started_at": event["start_date"],
+                            "ended_at": event["end_date"],
+                            "calendar_event_uid": event["uid"],
+                        })
+                        save(data)
+                        print(c(f"\n✓ Logged {fmt_mins(log_minutes)} to '{mapped_task['title']}'", "green"))
+                        return
+                else:
+                    # Mapped task was deleted, warn user
+                    print(c(f"Warning: Mapped task was deleted. Falling back to normal flow.", "yellow"))
+
+        # Normal flow (no mapping or mapping bypassed)
         print(c(f"\n  Event: {event['title']}", "bold"))
         print(f"  Date:     {start_dt.strftime('%Y-%m-%d')}")
         print(f"  Time:     {start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}")
-        print(f"  Duration: {fmt_mins(event['duration_mins'])}")
+        print(f"  Duration: {fmt_mins(duration)}")
         print(f"  Calendar: {event['calendar_name']}")
         print()
 
         # Prompt for time logging
-        duration = event["duration_mins"]
         print()
         print(f"  Log {fmt_mins(duration)} of time?")
         try:
@@ -3279,6 +3441,19 @@ def cmd_calendar(args):
                 })
                 save(data)
                 print(c(f"\n✓ Logged {fmt_mins(log_minutes)} to '{target_task['title']}'", "green"))
+
+                # Offer to save mapping if not already mapped
+                existing_mapping = get_event_mapping(data, event["title"])
+                if not existing_mapping:
+                    try:
+                        save_mapping = input("  Save mapping for future events? [Y/n]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        return
+                    if save_mapping in ("", "y", "yes"):
+                        set_event_mapping(data, event["title"], target_task["id"])
+                        save(data)
+                        print(c(f"  ✓ Mapping saved: '{event['title']}' → '{target_task['title']}'", "green"))
             else:
                 print(c("No time to log.", "dim"))
         else:
