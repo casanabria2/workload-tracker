@@ -836,6 +836,9 @@ def get_sprint_date_range_for_task(task: dict | None, data: dict):
 
     Returns a (sprint_dict, start_date, end_date) tuple or None if no sprint
     information is available. The returned dates are datetime.date objects.
+    The returned end_date is the *inclusive* last day of the sprint (i.e.
+    sprint["end_date"] - 1 day), since the stored sprint end_date follows the
+    half-open `[start, end)` convention used by find_sprint_for_date.
     """
     from datetime import datetime
 
@@ -854,7 +857,7 @@ def get_sprint_date_range_for_task(task: dict | None, data: dict):
         sprint = _pick(get_all_sprints(data))
     if sprint is None:
         return None
-    return sprint, sprint["start_date"], sprint["end_date"]
+    return sprint, sprint["start_date"], sprint["end_date"] - timedelta(days=1)
 
 
 def log_effective_date(log: dict) -> float:

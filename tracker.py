@@ -2036,7 +2036,7 @@ class CalendarModal(ModalScreen):
 
         # Build table
         table.clear(columns=True)
-        table.add_columns("", "Date", "Time", "Duration", "Title")
+        table.add_columns("", "Date", "Day", "Time", "Duration", "Title")
 
         for event in self._events:
             is_imported = event["uid"] in imported_uids
@@ -2050,11 +2050,12 @@ class CalendarModal(ModalScreen):
                 status = " "
             start_dt = datetime.fromtimestamp(event["start_date"])
             date_str = start_dt.strftime("%m/%d")
+            day_str = start_dt.strftime("%a")
             time_str = start_dt.strftime("%H:%M")
             duration = fmt_mins(event["duration_mins"])
             title = event["title"][:45]
 
-            table.add_row(status, date_str, time_str, duration, title, key=event["uid"])
+            table.add_row(status, date_str, day_str, time_str, duration, title, key=event["uid"])
 
         # Restore cursor position
         if selected_key:
