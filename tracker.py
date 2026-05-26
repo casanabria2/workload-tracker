@@ -190,8 +190,24 @@ class TaskModal(ModalScreen):
             _recent = self._sprints[_start:_current_idx + 1]
         else:
             _recent = self._sprints[-5:]
+
+        # Ensure the task's existing sprint is selectable even if it falls outside
+        # the recent window (e.g. recurrent tasks pointing at an older sprint).
+        task_sprint_id = t.get("sprint_id")
+        if task_sprint_id and not any(s["id"] == task_sprint_id for s in _recent):
+            existing = next((s for s in self._sprints if s["id"] == task_sprint_id), None)
+            if existing is not None:
+                _recent = [existing] + list(_recent)
+            else:
+                _recent = [{"id": task_sprint_id, "title": t.get("sprint") or task_sprint_id}] + list(_recent)
+
         sprint_options = [("(none)", "")] + [(s["title"], s["id"]) for s in reversed(_recent)]
-        default_sprint = t.get("sprint_id", "")
+        default_sprint = task_sprint_id or ""
+        # Final safety net: if the task's sprint is somehow still not in the
+        # options (e.g. self._sprints is empty), fall back to "(none)" so the
+        # Select widget doesn't raise InvalidSelectValueError on mount.
+        if default_sprint and not any(opt[1] == default_sprint for opt in sprint_options):
+            default_sprint = ""
         with Container(id="modal-box"):
             yield Label("Edit task" if self._task_data else "New task")
             yield Input(value=t.get("title", ""), placeholder="Task title...", id="inp-title")
@@ -636,6 +652,64 @@ class ConfirmCloseNoGitHubModal(ModalScreen):
         self.dismiss(True)
 
     @on(Button.Pressed, "#btn-cancel-no-gh")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Confirm Close (Recurrent in Current Sprint)
+# ──────────────────────────────────────────────────────────
+
+class ConfirmCloseRecurrentModal(ModalScreen):
+    """Modal to confirm closing a recurrent task that is in the current sprint."""
+    CSS = """
+    ConfirmCloseRecurrentModal { align: center middle; }
+    #close-recurrent-box {
+        width: 64;
+        height: auto;
+        background: $surface;
+        border: tall $warning;
+        padding: 1 2;
+    }
+    #close-recurrent-box Label { margin-bottom: 1; }
+    #close-recurrent-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, sprint_title: str, logged_mins: float):
+        super().__init__()
+        self._task_title = task_title
+        self._sprint_title = sprint_title
+        self._logged_mins = logged_mins
+
+    def compose(self) -> ComposeResult:
+        with Container(id="close-recurrent-box"):
+            yield Label("[bold yellow]Close Recurrent Task?[/]")
+            yield Label(f"Task: '{self._task_title}'")
+            yield Label(f"[bold]Sprint:[/] {self._sprint_title} [yellow](current)[/]")
+            yield Label(f"[bold]Logged:[/] {fmt_mins(self._logged_mins)}")
+            yield Label("")
+            yield Label("[yellow]This recurrent task is in the current sprint.[/]")
+            yield Label("[yellow]Closing it will end the recurrence for this sprint[/]")
+            yield Label("[yellow]and close the linked GitHub issue.[/]")
+            yield Label("")
+            with Horizontal(id="close-recurrent-actions"):
+                yield Button("Close Anyway  [y]", variant="warning", id="btn-close-recurrent")
+                yield Button("Cancel  [esc]", id="btn-cancel-recurrent")
+
+    def on_mount(self):
+        self.query_one("#btn-cancel-recurrent").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-close-recurrent")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-recurrent")
     def cancel(self):
         self.dismiss(False)
 
@@ -3188,16 +3262,44 @@ class WorkloadTracker(App):
             self._sync_project_status_async(task, "inprogress")
 
     def action_mark_done(self):
-        """Move an In Progress task into Done, running the close workflow."""
+        """Move an In Progress or Recurrent task into Done, running the close workflow."""
         task = self._selected_task()
         if not task:
             return
         current = task.get("status", "todo")
-        if current != "inprogress":
+        if current not in ("inprogress", "recurrent"):
             self.notify(
-                f"Can only mark In Progress tasks as Done (current: {STATUS_LABELS.get(current, current)})",
+                f"Can only mark In Progress or Recurrent tasks as Done (current: {STATUS_LABELS.get(current, current)})",
                 severity="warning",
             )
+            return
+
+        # Recurrent tasks in the current sprint need an extra confirmation
+        # before we close them and their GitHub issue.
+        if current == "recurrent":
+            current_sprint = get_current_sprint(self._data)
+            task_sprint_id = task.get("sprint_id")
+            in_current_sprint = (
+                current_sprint is not None
+                and task_sprint_id is not None
+                and task_sprint_id == current_sprint["id"]
+            )
+            if in_current_sprint:
+                self.push_screen(
+                    ConfirmCloseRecurrentModal(
+                        task["title"],
+                        current_sprint["title"],
+                        task_logged_mins(task),
+                    ),
+                    lambda confirmed: self._on_confirm_close_recurrent(task, confirmed),
+                )
+                return
+
+        self._close_task_with_workflow(task)
+
+    def _on_confirm_close_recurrent(self, task: dict, confirmed: bool):
+        """Handle the extra confirmation for closing a recurrent task in the current sprint."""
+        if not confirmed:
             return
         self._close_task_with_workflow(task)
 
@@ -3342,10 +3444,24 @@ class WorkloadTracker(App):
                 except Exception as e:
                     self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
 
-            # Close the GitHub issue
+            # Close the GitHub issue. Failures here must not prevent the local
+            # status update — the user already confirmed they want the task closed.
             if task.get("github_issue"):
-                if close_github_issue(task["github_issue"]):
-                    self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
+                try:
+                    if close_github_issue(task["github_issue"]):
+                        self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
+                    else:
+                        self.call_from_thread(
+                            self.notify,
+                            f"Failed to close issue {task['github_issue']} (gh returned non-zero). Task marked done locally.",
+                            severity="warning",
+                        )
+                except Exception as e:
+                    self.call_from_thread(
+                        self.notify,
+                        f"Error closing issue {task['github_issue']}: {e}. Task marked done locally.",
+                        severity="warning",
+                    )
 
             # Mark as done
             task["status"] = "done"
