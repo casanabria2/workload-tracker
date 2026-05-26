@@ -1720,6 +1720,25 @@ class SaveMappingConfirmModal(ModalScreen):
 # Modal: Auto-Log Batch (for mapped events on a highlighted task)
 # ──────────────────────────────────────────────────────────
 
+class VisibleCheckbox(Checkbox):
+    """Checkbox that renders its state as an explicit `[X]` / `[ ]` marker.
+
+    Works around Textual versions where the default `Checkbox` indicator glyph
+    (`X`) is identical between checked and unchecked states — the difference
+    being style-based rather than character-based — and the style change isn't
+    visible in the active theme/terminal. Overriding `render()` produces an
+    unambiguous toggle that updates on every value change.
+    """
+
+    def render(self):
+        from rich.text import Text
+        marker = "[X]" if self.value else "[ ]"
+        label_str = str(self.label) if self.label else ""
+        if label_str:
+            return Text.from_markup(f"{marker}  {label_str}")
+        return Text(marker)
+
+
 class AutoLogBatchModal(ModalScreen):
     """Batch-log multiple calendar events to a single task.
 
@@ -1743,12 +1762,11 @@ class AutoLogBatchModal(ModalScreen):
     #auto-log-header { color: $text-muted; margin-bottom: 1; }
     #auto-log-rows { height: auto; max-height: 20; }
     .auto-log-row {
-        height: 3;
+        height: auto;
         margin-bottom: 0;
     }
-    .auto-log-row Checkbox { width: 5; }
-    .auto-log-row Label { width: 1fr; margin-top: 1; }
-    .auto-log-row Input { width: 8; }
+    .auto-log-row Checkbox { width: 1fr; }
+    .auto-log-row Input { width: 10; }
     #auto-log-actions { margin-top: 1; }
     """
 
@@ -1803,8 +1821,7 @@ class AutoLogBatchModal(ModalScreen):
 
                     default_mins = round_up_to_30(event["duration_mins"]) or 30
                     with Horizontal(classes="auto-log-row"):
-                        yield Checkbox(value=not is_imported, id=cb_id)
-                        yield Label(label_text)
+                        yield VisibleCheckbox(label_text, value=not is_imported, id=cb_id)
                         yield Input(
                             value=str(default_mins),
                             id=in_id,
