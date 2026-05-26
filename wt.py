@@ -2141,11 +2141,17 @@ def cmd_delete(args):
         print("Usage: wt delete <task-id or title>"); sys.exit(1)
     data = load()
     task = resolve_task(data, " ".join(args))
+    issue_ref = task.get("github_issue")
     data["tasks"] = [t for t in data["tasks"] if t["id"] != task["id"]]
     if (data.get("active_timer") or {}).get("task_id") == task["id"]:
         data["active_timer"] = None
     save(data)
     print(c(f"✓ Deleted: {task['title']}", "yellow"))
+    if issue_ref:
+        if delete_github_issue(issue_ref):
+            print(c(f"  Deleted GitHub issue: {issue_ref}", "dim"))
+        else:
+            print(c(f"  Warning: Failed to delete GitHub issue {issue_ref} (may need admin permissions)", "yellow"))
 
 
 def cmd_rename(args):

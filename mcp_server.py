@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task
+from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -820,12 +820,19 @@ def delete_task(task_query: str) -> str:
     if not task:
         return f"No task found matching '{task_query}'"
 
+    issue_ref = task.get("github_issue")
     data["tasks"] = [t for t in data["tasks"] if t["id"] != task["id"]]
     if (data.get("active_timer") or {}).get("task_id") == task["id"]:
         data["active_timer"] = None
     save(data)
 
-    return f"Deleted task '{task['title']}'"
+    result = f"Deleted task '{task['title']}'"
+    if issue_ref:
+        if delete_github_issue(issue_ref):
+            result += f"\nDeleted GitHub issue: {issue_ref}"
+        else:
+            result += f"\nWarning: Failed to delete GitHub issue {issue_ref} (may need admin permissions)"
+    return result
 
 
 @mcp.tool()

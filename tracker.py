@@ -2998,6 +2998,7 @@ class WorkloadTracker(App):
         task = next((t for t in self._data["tasks"] if t["id"] == task_id), None)
         if not task:
             return
+        issue_ref = task.get("github_issue")
         if self._is_running(task):
             self._data["active_timer"] = None
         self._data["tasks"] = [t for t in self._data["tasks"] if t["id"] != task_id]
@@ -3005,6 +3006,26 @@ class WorkloadTracker(App):
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
+        if issue_ref:
+            self._bg_start("Deleting GitHub issue")
+            self._delete_orphaned_issue_worker(issue_ref)
+
+    @work(thread=True)
+    def _delete_orphaned_issue_worker(self, issue_ref: str):
+        """Delete a GitHub issue whose task was just deleted."""
+        try:
+            if delete_github_issue(issue_ref):
+                self.call_from_thread(
+                    self.notify, f"Deleted issue: {issue_ref}", severity="information"
+                )
+            else:
+                self.call_from_thread(
+                    self.notify,
+                    f"Failed to delete issue {issue_ref} (may need admin permissions)",
+                    severity="error",
+                )
+        finally:
+            self.call_from_thread(self._bg_end, "Deleting GitHub issue")
 
     def action_toggle_timer(self):
         task = self._selected_task()
