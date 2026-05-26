@@ -152,6 +152,24 @@ def get_imported_calendar_uids(data: dict) -> set:
     return uids
 
 
+def find_calendar_event_owner(data: dict, event_uid: str):
+    """Return ``(task, log)`` for a calendar event UID.
+
+    - If the UID matches a task-level ``calendar_event_uid`` (the whole event
+      was imported as its own task), returns ``(task, None)``.
+    - If the UID matches a log entry's ``calendar_event_uid`` (the event was
+      logged against an existing task), returns ``(task, log)``.
+    - Returns ``(None, None)`` if the UID isn't imported anywhere.
+    """
+    for t in data.get("tasks", []):
+        if t.get("calendar_event_uid") == event_uid:
+            return (t, None)
+        for log in t.get("logs", []):
+            if log.get("calendar_event_uid") == event_uid:
+                return (t, log)
+    return (None, None)
+
+
 def normalize_event_title(title: str) -> str:
     """Normalize event title for mapping lookup (lowercase + trimmed)."""
     return title.strip().lower()

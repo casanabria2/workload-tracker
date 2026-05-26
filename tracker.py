@@ -50,7 +50,7 @@ from wt import (
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
     get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
-    get_imported_calendar_uids, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
+    get_imported_calendar_uids, find_calendar_event_owner, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
     get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
     save_sprints_cache, get_sprint_date_range_for_task,
     resolve_event_to_task, strip_sprint_suffix,
@@ -1717,6 +1717,64 @@ class SaveMappingConfirmModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Transfer Log Confirmation
+# ──────────────────────────────────────────────────────────
+
+class TransferLogConfirmModal(ModalScreen):
+    """Confirm transferring a calendar event log from one task to another.
+
+    Dismisses with ``True`` to transfer, ``False`` to cancel.
+    """
+    CSS = """
+    TransferLogConfirmModal { align: center middle; }
+    #transfer-box {
+        width: 70;
+        height: auto;
+        background: $surface;
+        border: tall $warning;
+        padding: 1 2;
+    }
+    #transfer-box Label { margin-bottom: 1; }
+    #transfer-actions { margin-top: 1; }
+    """
+
+    def __init__(self, event: dict, source_task: dict, dest_task: dict):
+        super().__init__()
+        self._event = event
+        self._source = source_task
+        self._dest = dest_task
+
+    def compose(self) -> ComposeResult:
+        with Container(id="transfer-box"):
+            yield Label("[bold yellow]Event already logged elsewhere[/]")
+            yield Label(f"Event: {self._event['title']}")
+            yield Label(f"Currently logged to: [cyan]{self._source['title']}[/]")
+            yield Label(f"Move to: [cyan]{self._dest['title']}[/]")
+            yield Label("")
+            yield Label("Delete the log entry from the original task and re-log here?")
+            with Horizontal(id="transfer-actions"):
+                yield Button("Transfer", variant="warning", id="btn-transfer-yes")
+                yield Button("Cancel", id="btn-transfer-no")
+
+    def on_mount(self):
+        self.query_one("#btn-transfer-yes", Button).focus()
+
+    def on_key(self, event):
+        if event.key == "escape" or event.key == "n":
+            self.dismiss(False)
+        elif event.key == "enter" or event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-transfer-yes")
+    def on_yes(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-transfer-no")
+    def on_no(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Auto-Log Batch (for mapped events on a highlighted task)
 # ──────────────────────────────────────────────────────────
 
@@ -1974,7 +2032,7 @@ class CalendarModal(ModalScreen):
                 yield Button("Log to task  [l]", variant="success", id="btn-log-to-task")
                 yield Button("Delete  [d]", variant="error", id="btn-delete")
                 yield Button("Close  [Esc]", id="btn-close")
-            yield Label("[dim]\\[i] Import  \\[l] Log  \\[m] Map/unmap  \\[d] Delete  ✓=imported  →=mapped[/]", id="calendar-help")
+            yield Label("[dim]\\[i] Import  \\[l] Log  \\[m] Map/unmap  \\[d] Delete  ✓=here  ⊗=other task  →=mapped[/]", id="calendar-help")
 
     def on_mount(self):
         self._load_events()
@@ -2031,19 +2089,26 @@ class CalendarModal(ModalScreen):
         else:
             self._events = get_calendar_events(days_back=1, calendar_id=calendar_id)
 
-        # Get already imported UIDs
-        imported_uids = get_imported_calendar_uids(self._data)
-
         # Build table
         table.clear(columns=True)
         table.add_columns("", "Date", "Day", "Time", "Duration", "Title")
 
+        highlighted_id = self._highlighted_task["id"] if self._highlighted_task else None
+
         for event in self._events:
-            is_imported = event["uid"] in imported_uids
+            # Determine where (if anywhere) this event has been imported.
+            # When a highlighted task is set we distinguish "✓ here" from
+            # "⊗ elsewhere" so the user can spot mis-routed imports at a glance.
+            owner_task, _owner_log = find_calendar_event_owner(self._data, event["uid"])
             is_mapped = get_event_mapping(self._data, event["title"]) is not None
-            # Show indicators: ✓=imported, →=mapped
-            if is_imported:
-                status = "✓"
+            if owner_task is not None:
+                if highlighted_id and owner_task["id"] == highlighted_id:
+                    status = "✓"
+                elif highlighted_id:
+                    status = "⊗"
+                else:
+                    # No "current" task context — preserve original behaviour.
+                    status = "✓"
             elif is_mapped:
                 status = "→"
             else:
@@ -2201,9 +2266,28 @@ class CalendarModal(ModalScreen):
             self.notify("No event selected", severity="warning")
             return
 
-        # Check if already imported
-        imported_uids = get_imported_calendar_uids(self._data)
-        if event["uid"] in imported_uids:
+        # Determine where (if anywhere) this event is currently logged so we
+        # can either block (same task) or offer to transfer (different task).
+        owner_task, owner_log = find_calendar_event_owner(self._data, event["uid"])
+        dest_task = self._highlighted_task  # may be None (general flow)
+        if owner_task is not None:
+            if dest_task and owner_task["id"] == dest_task["id"]:
+                self.notify("Event already imported to this task", severity="warning")
+                return
+            if dest_task:
+                # Imported to a different task — offer to transfer it here.
+                self._pending_transfer = {
+                    "event": event,
+                    "source": owner_task,
+                    "source_log": owner_log,
+                    "dest": dest_task,
+                }
+                self.app.push_screen(
+                    TransferLogConfirmModal(event, owner_task, dest_task),
+                    self._on_transfer_confirmed,
+                )
+                return
+            # No highlighted task — preserve the old "already imported" block.
             self.notify("Event already imported", severity="warning")
             return
 
@@ -2290,6 +2374,56 @@ class CalendarModal(ModalScreen):
             "event": event,
             "task": task,
             "from_picker": True,  # Track that this came from picker, not mapping
+        }
+        self.app.push_screen(CalendarTimeModal(event), self._on_log_time_confirmed)
+
+    def _on_transfer_confirmed(self, confirmed: bool | None):
+        """Callback after TransferLogConfirmModal.
+
+        On confirmation, removes the calendar event's existing record from
+        the source task (a log entry, or the auto-created task-level marker
+        plus its sole log) and then routes through ``CalendarTimeModal`` to
+        log it against the destination task.
+        """
+        if not confirmed or not hasattr(self, '_pending_transfer'):
+            if hasattr(self, '_pending_transfer'):
+                del self._pending_transfer
+            return
+
+        event = self._pending_transfer["event"]
+        source = self._pending_transfer["source"]
+        source_log = self._pending_transfer["source_log"]
+        dest = self._pending_transfer["dest"]
+        del self._pending_transfer
+
+        if source_log is not None:
+            # Log-level import: drop just the matching log entry.
+            source["logs"] = [l for l in source.get("logs", []) if l.get("id") != source_log["id"]]
+        else:
+            # Task-level import: the whole task was created for this event.
+            # Clear the marker and drop the auto-created log (matched by the
+            # event's timestamps, since task-level logs don't carry the uid).
+            source.pop("calendar_event_uid", None)
+            source["logs"] = [
+                l for l in source.get("logs", [])
+                if not (
+                    l.get("started_at") == event["start_date"]
+                    and l.get("ended_at") == event["end_date"]
+                )
+            ]
+
+        self._save(self._data)
+        self.notify(
+            f"Removed log from '{source['title']}'",
+            severity="information",
+        )
+
+        # Continue with normal log-to-task flow against the destination.
+        self._pending_log = {
+            "event": event,
+            "task": dest,
+            "from_picker": False,
+            "from_highlighted": True,
         }
         self.app.push_screen(CalendarTimeModal(event), self._on_log_time_confirmed)
 
