@@ -54,6 +54,7 @@ from wt import (
     get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
     save_sprints_cache, get_sprint_date_range_for_task,
     resolve_event_to_task, strip_sprint_suffix,
+    get_event_names_for_base, round_up_to_30,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -101,16 +102,20 @@ def load_data() -> dict:
 
 def save_data(data: dict):
     """Save data to disk, preserving roles and config from disk if modified externally."""
-    # Reload roles and config from disk to preserve external changes (e.g., from CLI)
+    # Reload roles and config from disk to preserve external changes (e.g., from CLI).
+    # For config we do a shallow merge — disk fills in keys the TUI doesn't know
+    # about, but in-memory mutations win for keys the TUI did touch (otherwise
+    # things like calendar_event_mappings saved via the calendar modal would be
+    # silently thrown away).
     if DATA_FILE.exists():
         try:
             disk_data = json.loads(DATA_FILE.read_text())
-            # Preserve roles from disk (CLI may have modified them)
             if "roles" in disk_data:
                 data["roles"] = disk_data["roles"]
-            # Preserve config from disk
             if "config" in disk_data:
-                data["config"] = disk_data["config"]
+                merged = dict(disk_data["config"])
+                merged.update(data.get("config", {}))
+                data["config"] = merged
         except Exception:
             pass  # If we can't read, just save what we have
     DATA_FILE.write_text(json.dumps(data, indent=2))
@@ -1463,6 +1468,9 @@ class CalendarTimeModal(ModalScreen):
         super().__init__()
         self._event = event
         self._duration = event["duration_mins"]
+        # Pre-fill the minutes input rounded up to a multiple of 30 to
+        # match the behaviour of the auto-log batch modal.
+        self._default_mins = round_up_to_30(self._duration) or int(self._duration)
 
     def compose(self) -> ComposeResult:
         with Container(id="time-modal-box"):
@@ -1470,7 +1478,7 @@ class CalendarTimeModal(ModalScreen):
             yield Label(f"Duration: {fmt_mins(self._duration)}")
             yield Label("")
             yield Label("Log time (minutes):")
-            yield Input(value=str(int(self._duration)), id="time-input", type="integer")
+            yield Input(value=str(self._default_mins), id="time-input", type="integer")
             with Horizontal(id="time-actions"):
                 yield Button("Confirm", variant="primary", id="btn-confirm")
                 yield Button("Cancel", id="btn-cancel")
@@ -1497,7 +1505,7 @@ class CalendarTimeModal(ModalScreen):
     def _do_confirm(self):
         try:
             time_input = self.query_one("#time-input", Input)
-            minutes = float(time_input.value) if time_input.value else self._duration
+            minutes = float(time_input.value) if time_input.value else self._default_mins
             if minutes <= 0:
                 self.notify("Time must be greater than 0", severity="warning")
                 return
@@ -1709,6 +1717,170 @@ class SaveMappingConfirmModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: Auto-Log Batch (for mapped events on a highlighted task)
+# ──────────────────────────────────────────────────────────
+
+class AutoLogBatchModal(ModalScreen):
+    """Batch-log multiple calendar events to a single task.
+
+    Listed events default to checked (except already-imported events, which
+    are shown with a ✓ indicator and default to unchecked but remain
+    toggleable). The minutes input for each row is pre-filled with the
+    event's duration rounded up to the next multiple of 30.
+    """
+
+    CSS = """
+    AutoLogBatchModal { align: center middle; }
+    #auto-log-box {
+        width: 100;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #auto-log-box Label { margin-bottom: 1; }
+    #auto-log-header { color: $text-muted; margin-bottom: 1; }
+    #auto-log-rows { height: auto; max-height: 20; }
+    .auto-log-row {
+        height: 3;
+        margin-bottom: 0;
+    }
+    .auto-log-row Checkbox { width: 5; }
+    .auto-log-row Label { width: 1fr; margin-top: 1; }
+    .auto-log-row Input { width: 8; }
+    #auto-log-actions { margin-top: 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+    ]
+
+    def __init__(self, task: dict, events: list, data: dict):
+        super().__init__()
+        # NOTE: don't name this `_task` — Textual's MessagePump uses that
+        # attribute internally and will overwrite it on mount.
+        self._highlighted_task = task
+        self._events = events
+        self._data = data
+        # Pre-compute which events are already imported so we can default
+        # those rows to unchecked.
+        self._imported_uids = get_imported_calendar_uids(data)
+        # Maps each row's checkbox/input widget id -> event uid.
+        self._row_ids: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        with Container(id="auto-log-box"):
+            yield Label(f"[bold]Auto-log events to '{self._highlighted_task['title']}'[/]")
+            # Sprint range header (resolved by CalendarModal but recomputed
+            # here so the modal is self-contained).
+            rng = get_sprint_date_range_for_task(self._highlighted_task, self._data)
+            if rng is not None:
+                sprint, start_date, end_date = rng
+                yield Label(
+                    f"[dim]Range: {sprint['title']} ({start_date} → {end_date})[/]",
+                    id="auto-log-header",
+                )
+            else:
+                yield Label("[dim]Range: yesterday + today[/]", id="auto-log-header")
+
+            with ScrollableContainer(id="auto-log-rows"):
+                for idx, event in enumerate(self._events):
+                    is_imported = event["uid"] in self._imported_uids
+                    cb_id = f"auto-cb-{idx}"
+                    in_id = f"auto-min-{idx}"
+                    self._row_ids[cb_id] = event["uid"]
+                    self._row_ids[in_id] = event["uid"]
+
+                    start_dt = datetime.fromtimestamp(event["start_date"])
+                    label_text = (
+                        f"{start_dt.strftime('%m/%d %H:%M')}  "
+                        f"{fmt_mins(event['duration_mins']):>8}  "
+                        f"{event['title']}"
+                    )
+                    if is_imported:
+                        label_text += "  [yellow]✓ already imported[/]"
+
+                    default_mins = round_up_to_30(event["duration_mins"]) or 30
+                    with Horizontal(classes="auto-log-row"):
+                        yield Checkbox(value=not is_imported, id=cb_id)
+                        yield Label(label_text)
+                        yield Input(
+                            value=str(default_mins),
+                            id=in_id,
+                            type="integer",
+                            restrict=r"\d*",
+                        )
+
+            with Horizontal(id="auto-log-actions"):
+                yield Button("Log selected", variant="primary", id="btn-auto-log")
+                yield Button("Cancel  [esc]", id="btn-auto-cancel")
+
+    def on_mount(self):
+        # Focus the primary button so Enter (when not in an Input) submits.
+        self.query_one("#btn-auto-log", Button).focus()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-auto-cancel")
+    def on_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-auto-log")
+    def on_log(self):
+        self._do_log()
+
+    def on_key(self, event):
+        # Space toggles the focused checkbox (Textual's Checkbox handles
+        # space natively when focused, so this is mostly defensive).
+        if event.key == "enter":
+            focused = self.focused
+            # If focus is on an Input or Checkbox, let the widget handle it.
+            if isinstance(focused, (Input, Checkbox)):
+                return
+            event.stop()
+            self._do_log()
+
+    def _do_log(self):
+        logged = 0
+        skipped = 0
+        for idx, event in enumerate(self._events):
+            cb_id = f"auto-cb-{idx}"
+            in_id = f"auto-min-{idx}"
+            try:
+                cb = self.query_one(f"#{cb_id}", Checkbox)
+                inp = self.query_one(f"#{in_id}", Input)
+            except Exception:
+                skipped += 1
+                continue
+            if not cb.value:
+                skipped += 1
+                continue
+            try:
+                minutes = float(inp.value) if inp.value else 0
+            except ValueError:
+                skipped += 1
+                continue
+            if minutes <= 0:
+                skipped += 1
+                continue
+
+            self._highlighted_task.setdefault("logs", []).append({
+                "id": uid(),
+                "minutes": round(minutes, 2),
+                "note": f"Calendar: {event['title']}",
+                "at": event["end_date"],
+                "started_at": event["start_date"],
+                "ended_at": event["end_date"],
+                "calendar_event_uid": event["uid"],
+            })
+            logged += 1
+
+        self.dismiss({"logged": logged, "skipped": skipped})
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Calendar Import
 # ──────────────────────────────────────────────────────────
 
@@ -1744,7 +1916,9 @@ class CalendarModal(ModalScreen):
         super().__init__()
         self._data = data
         self._save = save_callback
-        self._task = task
+        # NOTE: don't name this `_task` — Textual's MessagePump uses that
+        # attribute internally and will overwrite it on mount.
+        self._highlighted_task = task
         self._events = []
         # Resolve the sprint date range up front so the modal can render
         # its header even before _load_events runs.
@@ -1758,7 +1932,7 @@ class CalendarModal(ModalScreen):
 
     def _range_label(self) -> str:
         if self._sprint and self._start_date and self._end_date:
-            source = "task sprint" if (self._task and self._task.get("sprint_id") == self._sprint["id"]) else "current sprint"
+            source = "task sprint" if (self._highlighted_task and self._highlighted_task.get("sprint_id") == self._sprint["id"]) else "current sprint"
             return f"[dim]Range: {self._sprint['title']} ({self._start_date} → {self._end_date}, {source})[/]"
         return "[dim]Range: yesterday + today (no sprint info available)[/]"
 
@@ -1817,7 +1991,7 @@ class CalendarModal(ModalScreen):
         # Refresh the sprint range in case the persisted cache was updated
         # since the modal was constructed (e.g. background sprint fetch finished).
         if self._sprint is None:
-            rng = get_sprint_date_range_for_task(self._task, self._data)
+            rng = get_sprint_date_range_for_task(self._highlighted_task, self._data)
             if rng is not None:
                 self._sprint, self._start_date, self._end_date = rng
                 try:
@@ -1875,6 +2049,48 @@ class CalendarModal(ModalScreen):
             except Exception:
                 pass
 
+        # If a task is highlighted, surface any mapped events in the range
+        # via the batch auto-log modal (one-shot per modal lifetime).
+        self._maybe_trigger_auto_log()
+
+    def _maybe_trigger_auto_log(self):
+        """Push the AutoLogBatchModal if the highlighted task has mapped events.
+
+        Runs at most once per CalendarModal lifetime — guarded by
+        ``_auto_log_shown`` so the Refresh button doesn't re-trigger it.
+        """
+        if not self._highlighted_task:
+            return
+        if getattr(self, "_auto_log_shown", False):
+            return
+        base = strip_sprint_suffix(self._highlighted_task["title"])
+        event_names = get_event_names_for_base(self._data, base)
+        if not event_names:
+            return  # task has no mappings — silent skip
+        lowered = {n.strip().lower() for n in event_names}
+        matches = [e for e in self._events if e["title"].strip().lower() in lowered]
+        self._auto_log_shown = True
+        if not matches:
+            self.notify("No mapped events in this sprint range", severity="information")
+            return
+        self.app.push_screen(
+            AutoLogBatchModal(self._highlighted_task, matches, self._data),
+            self._on_auto_log_batch_done,
+        )
+
+    def _on_auto_log_batch_done(self, result: dict | None):
+        """Callback after AutoLogBatchModal dismisses."""
+        if not result:
+            return
+        logged = result.get("logged", 0)
+        if logged:
+            self._save(self._data)
+            self.notify(
+                f"Logged {logged} event(s) to '{self._highlighted_task['title']}'",
+                severity="information",
+            )
+            self._load_events()
+
     def _get_selected_event(self):
         table = self.query_one("#calendar-table", DataTable)
         if table.cursor_row is None or table.row_count == 0:
@@ -1903,12 +2119,13 @@ class CalendarModal(ModalScreen):
 
         existing_mapping = get_event_mapping(self._data, event["title"])
         if existing_mapping:
-            # Remove existing mapping
+            # Remove existing mapping (value is already the base name)
             remove_event_mapping(self._data, event["title"])
             self._save(self._data)
-            task = resolve_task_by_id(self._data, existing_mapping)
-            task_name = strip_sprint_suffix(task["title"]) if task else f"[deleted: {existing_mapping[:12]}]"
-            self.notify(f"Removed mapping: '{event['title']}' → '{task_name}'", severity="information")
+            self.notify(
+                f"Removed mapping: '{event['title']}' → '{existing_mapping}'",
+                severity="information",
+            )
             self._load_events()
         else:
             # Show task picker to create mapping
@@ -1927,7 +2144,7 @@ class CalendarModal(ModalScreen):
         event = self._pending_map_event
         del self._pending_map_event
 
-        set_event_mapping(self._data, event["title"], task["id"])
+        set_event_mapping(self._data, event["title"], strip_sprint_suffix(task["title"]))
         self._save(self._data)
         self.notify(f"Mapped: '{event['title']}' → '{strip_sprint_suffix(task['title'])}'", severity="information")
         self._load_events()
@@ -1972,6 +2189,19 @@ class CalendarModal(ModalScreen):
             self.notify("Event already imported", severity="warning")
             return
 
+        # Short-circuit: if a task was passed to the modal (modal was opened
+        # from a highlighted task via the `c` keybinding), default to logging
+        # against that task without going through the mapping/picker flow.
+        if self._highlighted_task:
+            self._pending_log = {
+                "event": event,
+                "task": self._highlighted_task,
+                "from_picker": False,
+                "from_highlighted": True,
+            }
+            self.app.push_screen(CalendarTimeModal(event), self._on_log_time_confirmed)
+            return
+
         # Check for mapping (sprint-aware: picks the per-sprint copy when applicable)
         if get_event_mapping(self._data, event["title"]) is not None:
             mapped_task = resolve_event_to_task(self._data, event)
@@ -1984,8 +2214,8 @@ class CalendarModal(ModalScreen):
                 )
                 return
             else:
-                # Mapped task was deleted, warn and continue to normal flow
-                self.notify("Mapped task was deleted, selecting new task", severity="warning")
+                # No candidate task matches the mapped base name anymore.
+                self.notify("Mapped task not found, selecting new task", severity="warning")
 
         # Get non-done tasks
         tasks = [t for t in self._data.get("tasks", []) if t.get("status") != "done"]
@@ -2053,6 +2283,7 @@ class CalendarModal(ModalScreen):
         event = self._pending_log["event"]
         task = self._pending_log["task"]
         from_picker = self._pending_log.get("from_picker", False)
+        from_highlighted = self._pending_log.get("from_highlighted", False)
         del self._pending_log
 
         # Add log entry to existing task with calendar_event_uid
@@ -2070,8 +2301,9 @@ class CalendarModal(ModalScreen):
         self.notify(f"Logged {fmt_mins(minutes)} to '{task['title']}'", severity="information")
         self._load_events()
 
-        # If from picker (not mapped), offer to save mapping
-        if from_picker:
+        # If from picker or from the highlighted-task short-circuit, and the
+        # event isn't already mapped, offer to save a mapping for future use.
+        if (from_picker or from_highlighted):
             existing_mapping = get_event_mapping(self._data, event["title"])
             if not existing_mapping:
                 self._pending_save_mapping = {"event": event, "task": task}
@@ -2098,7 +2330,7 @@ class CalendarModal(ModalScreen):
         del self._pending_save_mapping
 
         if save:
-            set_event_mapping(self._data, event["title"], task["id"])
+            set_event_mapping(self._data, event["title"], strip_sprint_suffix(task["title"]))
             self._save(self._data)
             self.notify(f"Mapping saved", severity="information")
             self._load_events()

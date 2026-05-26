@@ -119,6 +119,10 @@ def load() -> dict:
     # Initialize roles if missing
     if "roles" not in data:
         data["roles"] = DEFAULT_ROLES.copy()
+    # One-time migration of legacy calendar_event_mappings values
+    # (task_id -> base name). Idempotent on subsequent runs.
+    if _migrate_calendar_mappings(data):
+        save(data)
     return data
 
 
@@ -154,26 +158,36 @@ def normalize_event_title(title: str) -> str:
 
 
 def get_event_mapping(data: dict, event_title: str) -> str | None:
-    """Get task ID mapped to an event title, or None if not mapped."""
+    """Get the task base name mapped to an event title, or None if not mapped.
+
+    The stored value is the sprint-suffix-stripped task title (e.g.
+    ``"Stand Up Calls - casanabria"``), not a task id. Use
+    :func:`resolve_event_to_task` to get the actual task dict.
+    """
     mappings = data.get("config", {}).get("calendar_event_mappings", {})
     key = normalize_event_title(event_title)
     # Check exact match first
     if key in mappings:
         return mappings[key]
     # Check all stored keys (normalized)
-    for stored_title, task_id in mappings.items():
+    for stored_title, base_name in mappings.items():
         if normalize_event_title(stored_title) == key:
-            return task_id
+            return base_name
     return None
 
 
-def set_event_mapping(data: dict, event_title: str, task_id: str):
-    """Create or update an event title -> task ID mapping."""
+def set_event_mapping(data: dict, event_title: str, base_name: str):
+    """Create or update an event title -> task base name mapping.
+
+    *base_name* should be the task title with any trailing ``- Sprint XX``
+    suffix removed (use :func:`strip_sprint_suffix`). Many events can map
+    to the same base name; each event name appears at most once.
+    """
     if "config" not in data:
         data["config"] = {}
     if "calendar_event_mappings" not in data["config"]:
         data["config"]["calendar_event_mappings"] = {}
-    data["config"]["calendar_event_mappings"][event_title.strip()] = task_id
+    data["config"]["calendar_event_mappings"][event_title.strip()] = base_name
 
 
 def remove_event_mapping(data: dict, event_title: str) -> bool:
@@ -186,6 +200,63 @@ def remove_event_mapping(data: dict, event_title: str) -> bool:
             del mappings[stored_title]
             return True
     return False
+
+
+def get_event_names_for_base(data: dict, base_name: str) -> list[str]:
+    """Return all event titles mapped to *base_name* (case-insensitive).
+
+    Reverse lookup over the calendar event mappings; used by the TUI's
+    auto-log batch flow to find which calendar events to surface for a
+    highlighted task.
+    """
+    mappings = data.get("config", {}).get("calendar_event_mappings", {})
+    target = (base_name or "").strip().lower()
+    return [event_title for event_title, mapped_base in mappings.items()
+            if (mapped_base or "").strip().lower() == target]
+
+
+# Legacy task ids look like 14 digits + 4 lowercase letters (see uid()).
+_LEGACY_TASK_ID_RE = re.compile(r"^\d{14}[a-z]{4}$")
+
+
+def _migrate_calendar_mappings(data: dict) -> bool:
+    """One-time migration: convert legacy task_id values to base names.
+
+    Older versions of the tracker stored ``event_title -> task_id`` in
+    ``data["config"]["calendar_event_mappings"]``. Now we store
+    ``event_title -> base_name`` (the sprint-suffix-stripped task title)
+    so a single mapping resolves to whichever per-sprint task copy matches
+    the event's date.
+
+    For each entry:
+      * If the value is an existing task id -> replace with its base name.
+      * If the value looks like a legacy task id (orphan) -> drop the entry.
+      * Otherwise leave the value alone (already a base name).
+
+    Returns True if any mutation occurred. Idempotent on repeat runs.
+    """
+    config = data.get("config", {})
+    mappings = config.get("calendar_event_mappings")
+    if not mappings:
+        return False
+    tasks_by_id = {t["id"]: t for t in data.get("tasks", []) if t.get("id")}
+    mutated = False
+    for event_title in list(mappings.keys()):
+        value = mappings[event_title]
+        if not isinstance(value, str):
+            continue
+        task = tasks_by_id.get(value)
+        if task is not None:
+            base_name = strip_sprint_suffix(task.get("title", ""))
+            if base_name and base_name != value:
+                mappings[event_title] = base_name
+                mutated = True
+            continue
+        if _LEGACY_TASK_ID_RE.match(value):
+            # Orphan id (source task deleted) — drop the mapping.
+            del mappings[event_title]
+            mutated = True
+    return mutated
 
 
 def resolve_task_by_id(data: dict, task_id: str) -> dict | None:
@@ -210,50 +281,68 @@ def strip_sprint_suffix(title: str) -> str:
 def resolve_event_to_task(data: dict, event: dict) -> dict | None:
     """Find which task a calendar event should be logged to via its mapping.
 
-    Returns None if no mapping exists or the mapped task has been deleted.
+    The mapping value is a *base name* (sprint-suffix stripped). This function:
+      1. Looks up the base name for ``event["title"]``.
+      2. Collects all non-shadow tasks whose ``strip_sprint_suffix(title)``
+         matches that base name (case-insensitive).
+      3. If the event's ``start_date`` resolves to a sprint, returns the
+         candidate whose ``sprint_id`` matches.
+      4. Otherwise prefers non-done tasks, then the most recent sprint
+         start_date, then ``created_at``.
 
-    When the originally mapped task has a ``- Sprint XX`` suffix, look for a
-    sibling task with the same base name whose sprint covers the event's
-    start date and prefer that one. Falls back to the originally mapped task
-    when no sprint-specific sibling is found.
+    Returns ``None`` if no mapping exists or no candidate tasks remain.
     """
-    mapped_task_id = get_event_mapping(data, event.get("title", ""))
-    if not mapped_task_id:
+    base_name = get_event_mapping(data, event.get("title", ""))
+    if not base_name:
         return None
-    mapped_task = resolve_task_by_id(data, mapped_task_id)
-    if not mapped_task:
+    base_lower = base_name.strip().lower()
+    if not base_lower:
         return None
 
-    base_name = strip_sprint_suffix(mapped_task["title"])
-    if base_name == mapped_task["title"]:
-        # Mapped task isn't sprint-suffixed; nothing smarter to do.
-        return mapped_task
+    candidates = [
+        t for t in data.get("tasks", [])
+        if not t.get("cross_sprint_parent")
+        and strip_sprint_suffix(t.get("title", "")).lower() == base_lower
+    ]
+    if not candidates:
+        return None
 
+    # Try sprint-aware match first.
     start_ts = event.get("start_date")
-    if not start_ts:
-        return mapped_task
-    try:
-        event_date = datetime.fromtimestamp(start_ts).date()
-    except (TypeError, ValueError, OSError):
-        return mapped_task
+    if start_ts:
+        try:
+            event_date = datetime.fromtimestamp(start_ts).date()
+        except (TypeError, ValueError, OSError):
+            event_date = None
+        if event_date:
+            sprints = get_cached_sprints(data)
+            if not sprints:
+                sprints = get_all_sprints(data) or []
+            target_sprint = find_sprint_for_date(sprints, event_date)
+            if target_sprint:
+                for t in candidates:
+                    if t.get("sprint_id") == target_sprint["id"]:
+                        return t
 
-    sprints = get_cached_sprints(data)
-    if not sprints:
-        sprints = get_all_sprints(data) or []
-    target_sprint = find_sprint_for_date(sprints, event_date)
-    if not target_sprint:
-        return mapped_task
+    # Fallback: prefer non-done, then most recent sprint, then created_at.
+    sprints = get_cached_sprints(data) or []
+    sprint_starts = {s["id"]: s.get("start_date") for s in sprints}
 
-    base_lower = base_name.lower()
-    for t in data.get("tasks", []):
-        if t.get("cross_sprint_parent"):
-            continue
-        if strip_sprint_suffix(t.get("title", "")).lower() != base_lower:
-            continue
-        if t.get("sprint_id") == target_sprint["id"]:
-            return t
+    def _sort_key(t):
+        is_done = t.get("status") == "done"
+        sprint_start = sprint_starts.get(t.get("sprint_id"))
+        # Sort newer-first using negative ordinal; fall back to created_at.
+        if sprint_start is not None:
+            try:
+                sprint_score = -sprint_start.toordinal()
+            except AttributeError:
+                sprint_score = 0
+        else:
+            sprint_score = 0
+        created = -(t.get("created_at") or 0)
+        return (is_done, sprint_score, created)
 
-    return mapped_task
+    return sorted(candidates, key=_sort_key)[0]
 
 
 def fmt_mins(mins: float) -> str:
@@ -326,6 +415,23 @@ def mins_to_quarter_hours(mins: float) -> float:
     """Convert minutes to hours, rounded up to nearest 0.25."""
     rounded_mins = round_to_quarter_hours(mins)
     return rounded_mins / 60
+
+
+def round_up_to_30(mins: float) -> int:
+    """Round minutes up to the next multiple of 30.
+
+    Examples:
+        25 -> 30
+        30 -> 30
+        31 -> 60
+        59 -> 60
+        60 -> 60
+        61 -> 90
+    """
+    import math
+    if mins is None or mins <= 0:
+        return 0
+    return int(math.ceil(mins / 30) * 30)
 
 
 def mark_logs_uploaded(task: dict, up_to_time: float = None) -> int:
@@ -3437,14 +3543,8 @@ def cmd_calendar(args):
             return
 
         print(c("\n  Calendar Event Mappings\n", "bold"))
-        for event_title, task_id in mappings.items():
-            task = resolve_task_by_id(data, task_id)
-            if task:
-                # Show the base (non-sprint-suffixed) name so a single mapping
-                # is obviously serving all per-sprint copies of a recurring task.
-                print(f"  {c(event_title, 'cyan')} → {strip_sprint_suffix(task['title'])}")
-            else:
-                print(f"  {c(event_title, 'cyan')} → {c(f'[deleted task: {task_id[:12]}...]', 'red')}")
+        for event_title, base_name in mappings.items():
+            print(f"  {c(event_title, 'cyan')} → {base_name}")
         print()
         return
 
@@ -3461,16 +3561,16 @@ def cmd_calendar(args):
             print(c(f"No task found matching '{task_query}'", "red"))
             sys.exit(1)
 
+        new_base = strip_sprint_suffix(task["title"])
+
         # Check if already mapped
         existing_mapping = get_event_mapping(data, event_title)
         if existing_mapping:
-            existing_task = resolve_task_by_id(data, existing_mapping)
-            existing_name = strip_sprint_suffix(existing_task["title"]) if existing_task else f"[deleted: {existing_mapping[:12]}]"
-            print(f"Updating mapping: '{event_title}' → '{existing_name}' => '{strip_sprint_suffix(task['title'])}'")
+            print(f"Updating mapping: '{event_title}' → '{existing_mapping}' => '{new_base}'")
         else:
-            print(f"Creating mapping: '{event_title}' → '{strip_sprint_suffix(task['title'])}'")
+            print(f"Creating mapping: '{event_title}' → '{new_base}'")
 
-        set_event_mapping(data, event_title, task["id"])
+        set_event_mapping(data, event_title, new_base)
         save(data)
         print(c("✓ Mapping saved", "green"))
         return

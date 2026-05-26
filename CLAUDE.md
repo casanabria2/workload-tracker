@@ -241,12 +241,25 @@ wt config calendar_id your.email@gmail.com  # Use specific calendar (default: pr
 
 **TUI calendar range**: When the modal is opened from the TUI (`c` keybinding), the date range defaults to the selected task's sprint window. If the task has no `sprint_id`, the current sprint is used. If neither is available, it falls back to "yesterday + today". Sprint date ranges are resolved via `get_sprint_date_range_for_task()` against the persisted `config.sprints_cache`, which `_fetch_sprints_worker` in `tracker.py` populates after fetching from GitHub (via `save_sprints_cache()`). The CLI `wt calendar [days]` still uses the `days_back` integer.
 
-**Event ↔ task mapping (sprint-aware)**: `data["config"]["calendar_event_mappings"]` stores `event_title → task_id`. Lookup goes through `resolve_event_to_task(data, event)` in `wt.py`, which:
-1. Reads the mapping via `get_event_mapping()` (case- and whitespace-insensitive).
-2. If the mapped task's title ends in ` - Sprint XX`, strips that suffix with `strip_sprint_suffix()` (regex `\s*-\s*Sprint\s+\d+\s*$`, case-insensitive) and looks for a sibling task with the same base name whose `sprint_id` covers the event's `start_date` (via `get_cached_sprints()` → `find_sprint_for_date()`, with `get_all_sprints()` fallback). `cross_sprint_parent` shadow tasks are skipped.
-3. Falls back to the originally mapped task when no sprint-specific sibling is found.
+**Event ↔ task mapping (sprint-aware, many-to-one)**: `data["config"]["calendar_event_mappings"]` stores `event_title → base_name`, where `base_name` is the task title with any trailing ` - Sprint XX` suffix removed (via `strip_sprint_suffix()`). Many event names can map to the same base name (e.g. `"FE Daily Standup"` and `"Field Engineering Team Call"` → `"Stand Up Calls - casanabria"`); each event name appears at most once.
 
-This means a single mapping like `Carlos / Ana weekly sync → Ana 1:1 calls - casanabria - Sprint 100` automatically routes future occurrences to `… - Sprint 101`, `… - Sprint 102`, etc., based on the event's date. The CLI/TUI `wt calendar import` and TUI `l` (log to task) paths both call `resolve_event_to_task()`. The mappings list (`wt calendar mappings`), `wt calendar map`, and TUI mapping notifications display the base name via `strip_sprint_suffix()` so the conceptual mapping is obvious.
+Lookup goes through `resolve_event_to_task(data, event)` in `wt.py`, which:
+1. Reads the base name via `get_event_mapping()` (case- and whitespace-insensitive on event titles).
+2. Collects all non-shadow tasks whose `strip_sprint_suffix(title)` matches the base name (case-insensitive). Returns `None` if no candidates.
+3. If the event's `start_date` resolves to a sprint via `get_cached_sprints()` → `find_sprint_for_date()` (with `get_all_sprints()` fallback), returns the candidate whose `sprint_id` matches.
+4. Otherwise sorts candidates (prefer non-done, then most recent sprint start_date, then `created_at`) and returns the first.
+
+This means a single mapping like `Carlos / Ana weekly sync → Ana 1:1 calls - casanabria` automatically routes occurrences to `… - Sprint 100`, `… - Sprint 101`, etc., based on the event's date. The CLI/TUI `wt calendar import` and TUI `l` (log to task) paths both call `resolve_event_to_task()`.
+
+**Reverse lookup**: `get_event_names_for_base(data, base_name) -> list[str]` returns every event title mapped to a given base name (case-insensitive). The TUI uses this to surface mapped events for a highlighted task.
+
+**One-time migration**: Older snapshots stored `event_title → task_id`. On every `load()`, `_migrate_calendar_mappings(data)` converts those values to base names (looking up the source task) and drops orphan entries whose task no longer exists. The legacy id shape is detected via `^\d{14}[a-z]{4}$` (matches `uid()`). The migration is idempotent: subsequent runs are no-ops.
+
+**Auto-log batch on `c`**: When the TUI calendar modal is opened from a highlighted task (`c` keybinding), `_load_events()` calls `_maybe_trigger_auto_log()` after populating the table. If the highlighted task's base name has any mapped event names and matching events exist in the sprint range, the `AutoLogBatchModal` is pushed automatically (one-shot, guarded by `_auto_log_shown` so the Refresh button does not re-trigger it). Each row is a `Checkbox` + label + `Input(value=round_up_to_30(duration_mins))`; already-imported events stay visible with a `✓` indicator and default to unchecked.
+
+**Rounding rule**: `round_up_to_30(mins)` rounds minutes up to the next multiple of 30 (e.g. 25 → 30, 31 → 60, 40 → 60, 60 → 60, 61 → 90). Used as the default for both the batch modal and `CalendarTimeModal`. The user can still override per-row.
+
+**Highlighted task `l` short-circuit**: With a highlighted task set on the modal, pressing `l` on any event logs to that task directly (no task picker, no mapped-confirm modal). After confirming time, if the event isn't already mapped, `SaveMappingConfirmModal` offers to remember the mapping (`event_title → strip_sprint_suffix(task.title)`).
 
 ### Task Closing Workflow with GitHub Project Integration
 
@@ -591,11 +604,23 @@ For each sprint, repeat the recipe above with a fresh task title and `--sprint "
 
 ### Map a recurring calendar event to a per-sprint recurrent task
 
-Map once against any one of the sprint copies — `resolve_event_to_task()` will route future occurrences to the sprint whose dates contain the event:
+Map once against any one of the sprint copies — the CLI stores only the base name (sprint suffix stripped), so `resolve_event_to_task()` routes future occurrences to the sprint whose dates contain the event:
 
 ```bash
 wt calendar map "Carlos / Ana weekly sync" "Ana 1:1 calls - casanabria - Sprint 100"
+# Stored as: "Carlos / Ana weekly sync" -> "Ana 1:1 calls - casanabria"
 # All "Ana 1:1 calls - casanabria - Sprint NN" tasks now receive their respective events.
+```
+
+Many events can map to the same base name — useful for the "Stand Up Calls" pattern:
+
+```bash
+wt calendar map "FE Daily Standup" "Stand Up Calls - casanabria - Sprint 100"
+wt calendar map "Field Engineering Team Call" "Stand Up Calls - casanabria - Sprint 100"
+# Both stored as -> "Stand Up Calls - casanabria"
+# In the TUI: highlight a Sprint-NN copy of that task, press `c`, and the
+# AutoLogBatchModal lists every matching event in the sprint range for
+# one-click batch logging.
 ```
 
 To verify resolution for a hypothetical event:
