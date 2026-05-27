@@ -25,6 +25,7 @@ Usage:
 
     wt link <task> <github-issue>  — Link task to GitHub issue
     wt unlink <task>               — Unlink task from GitHub issue
+    wt push <task>                 — Sync task to linked GitHub issue
 
     wt add-issue [url-or-ref] [--role ROLE]  — Create task from GitHub issue
     wt add-issue [--role ROLE]               — Interactive: show assigned issues
@@ -2721,6 +2722,31 @@ def cmd_roles(args):
         sys.exit(1)
 
 
+def cmd_push(args):
+    """Sync logged time and project fields to the linked GitHub issue."""
+    if not args:
+        print("Usage: wt push <task-id or title>")
+        sys.exit(1)
+    data = load()
+    query = " ".join(args)
+    task = resolve_task(data, query)
+    if not task:
+        print(c(f"No task matching '{query}'", "red"))
+        sys.exit(1)
+    issue_ref = task.get("github_issue")
+    if not issue_ref:
+        print(c(f"Task '{task['title']}' has no linked GitHub issue", "red"))
+        sys.exit(1)
+    result = setup_issue_in_project(issue_ref, task, data)
+    save(data)  # persist mark_logs_uploaded side-effect
+    if result["success"]:
+        hours = mins_to_quarter_hours(task_logged_mins_for_sprint(task, get_all_sprints(data)))
+        print(c(f"Pushed '{task['title']}' to {issue_ref}: {hours}h", "green"))
+    else:
+        print(c(f"Push completed with errors: {', '.join(result['errors'])}", "yellow"))
+        sys.exit(1)
+
+
 def cmd_link(args):
     """Link a task to a GitHub issue."""
     if len(args) < 2:
@@ -4463,6 +4489,7 @@ COMMANDS = {
     "notes": cmd_notes,
     "link": cmd_link,
     "unlink": cmd_unlink,
+    "push": cmd_push,
     "config": cmd_config,
     "presence": cmd_presence,
     "roles": cmd_roles,

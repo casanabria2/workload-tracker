@@ -21,6 +21,7 @@ Stream Deck button configs (set URL in "Open URL" action):
     http://localhost:7373/filter/other    — filter to Other
     http://localhost:7373/filter/all      — show all roles
     http://localhost:7373/status          — get current tracker state (JSON)
+    http://localhost:7373/push/<task>     — sync task to its linked GitHub issue
 
 All actions write to ~/.workload_tracker.json (same file as the TUI).
 """
@@ -29,8 +30,15 @@ import json
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import sys
+
+from wt import (
+    load as wt_load,
+    save as wt_save,
+    resolve_task as wt_resolve_task,
+    setup_issue_in_project as wt_setup_issue_in_project,
+)
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 
@@ -167,6 +175,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
             save_data(data)
             self.respond({"action": "logged", "minutes": mins, "task": task["title"]})
 
+        # ── push/<task> ──────────────────────────────────────
+        elif action == "push" and len(parts) > 1:
+            query = unquote("/".join(parts[1:]))  # allow slashes/spaces in task title
+            # Reload via wt's loader so we get the canonical shape
+            wt_data = wt_load()
+            task = wt_resolve_task(wt_data, query)
+            if not task:
+                self.respond({"error": f"No task matching '{query}'"}, 404)
+                return
+            issue_ref = task.get("github_issue")
+            if not issue_ref:
+                self.respond({"error": f"Task '{task['title']}' has no linked GitHub issue"}, 400)
+                return
+            result = wt_setup_issue_in_project(issue_ref, task, wt_data)
+            wt_save(wt_data)
+            if result["success"]:
+                self.respond({"action": "pushed", "task": task["title"], "issue": issue_ref})
+            else:
+                self.respond({
+                    "action": "pushed_with_errors",
+                    "task": task["title"],
+                    "issue": issue_ref,
+                    "errors": result["errors"],
+                }, 207)  # Multi-Status
+
         # ── filter/<role> ────────────────────────────────────
         elif action == "filter":
             role = parts[1] if len(parts) > 1 else "all"
@@ -188,6 +221,7 @@ def main():
     print(f"  Log 30 min     → http://localhost:{port}/log/30")
     print(f"  Log 60 min     → http://localhost:{port}/log/60")
     print(f"  Status         → http://localhost:{port}/status")
+    print(f"  Push to GitHub → http://localhost:{port}/push/<task>")
     print("──────────────────────────────────────────")
     server = HTTPServer(("localhost", port), BridgeHandler)
     try:

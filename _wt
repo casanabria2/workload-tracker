@@ -26,6 +26,7 @@ _wt() {
         'notes:Open notes for a task'
         'link:Link task to GitHub issue'
         'unlink:Unlink task from GitHub issue'
+        'push:Sync task to linked GitHub issue'
         'done:Mark a task as done'
         'delete:Delete a task'
         'del:Delete a task'
@@ -58,7 +59,7 @@ _wt() {
     fi
 
     case "${words[2]}" in
-        start|notes|done|delete|del|rm|log|link)
+        start|notes|done|delete|del|rm|log|link|push)
             local -a tasks
             tasks=("${(@f)$(python3 -c "
 import json

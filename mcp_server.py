@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue
+from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue, setup_issue_in_project, mins_to_quarter_hours, task_logged_mins_for_sprint
 from wt import build_time_report, format_time_report, _parse_last_arg, get_cached_sprints, get_role_ids
 from datetime import timedelta
 
@@ -1020,6 +1020,31 @@ def get_notes_path(task_query: str) -> str:
         notes_path.write_text(f"# {task['title']}\n\n")
 
     return f"Notes file for '{task['title']}':\n{notes_path}"
+
+
+@mcp.tool()
+def push_task_to_github(task_query: str) -> str:
+    """Sync a task's logged time, status, activity, and sprint to its linked GitHub issue.
+
+    Updates all GitHub Project fields that would be set during a close, but
+    does NOT close the issue. The task remains in its current status.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"ERROR: no task matching '{task_query}'"
+    issue_ref = task.get("github_issue")
+    if not issue_ref:
+        return f"ERROR: task '{task['title']}' has no linked GitHub issue"
+    result = setup_issue_in_project(issue_ref, task, data)
+    save(data)
+    if result["success"]:
+        hours = mins_to_quarter_hours(task_logged_mins_for_sprint(task, get_all_sprints(data)))
+        return f"Pushed '{task['title']}' to {issue_ref}: {hours}h"
+    return f"Push completed with errors: {', '.join(result['errors'])}"
 
 
 @mcp.tool()
