@@ -49,6 +49,7 @@ _wt() {
         'sprint:Show sprint info'
         'set-sprint:Set sprint for a task'
         'split-sprint:Split cross-sprint task'
+        'report:Show logged time in a date range'
     )
 
     if (( CURRENT == 2 )); then
@@ -349,6 +350,38 @@ for t in data.get('tasks', []):
                 # Complete sprint names (includes "none")
                 compadd "none"
             fi
+            ;;
+        report)
+            # Complete flag values for the previous flag, otherwise offer flags.
+            case "${words[CURRENT-1]}" in
+                --role)
+                    local -a roles
+                    roles=("${(@f)$(_wt_get_roles)}")
+                    compadd "${roles[@]}"
+                    ;;
+                --sprint)
+                    # Suggest sprint titles from the cache
+                    local -a sprints
+                    sprints=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for s in data.get('config', {}).get('sprints_cache', []):
+    print(s['title'])
+" 2>/dev/null)}")
+                    compadd -Q "${sprints[@]}"
+                    ;;
+                --last)
+                    compadd "7d" "14d" "30d"
+                    ;;
+                *)
+                    _arguments \
+                        '--sprint[Use sprint date range]:sprint' \
+                        '--last[Last N days]:days' \
+                        '--role[Filter by role]:role' \
+                        '--json[Machine-readable JSON output]'
+                    ;;
+            esac
             ;;
     esac
 }

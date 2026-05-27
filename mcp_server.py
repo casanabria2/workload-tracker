@@ -26,6 +26,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue
+from wt import build_time_report, format_time_report, _parse_last_arg, get_cached_sprints, get_role_ids
+from datetime import timedelta
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
@@ -474,6 +476,95 @@ def list_logs(task_query: str) -> str:
         lines.append(f"{log_id}...  {mins:>7}  {note:<30}  {time_range:>13}  {at_str}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def report_time_range(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    sprint: str | None = None,
+    last_days: int | None = None,
+    role: str | None = None,
+    as_json: bool = True,
+) -> str:
+    """Show all logged time between two dates.
+
+    Provide one of: ``start_date`` + ``end_date`` (YYYY-MM-DD), a ``sprint``
+    title (e.g. "Sprint 100"), or ``last_days`` (e.g. 7). If none are given,
+    defaults to the current sprint, falling back to the last 7 days when no
+    current sprint is available.
+
+    Args:
+        start_date: ISO date YYYY-MM-DD (inclusive); requires end_date.
+        end_date:   ISO date YYYY-MM-DD (inclusive); requires start_date.
+        sprint:     Sprint title to use as the date range.
+        last_days:  Number of days back from today (inclusive).
+        role:       Optional role id filter.
+        as_json:    When True (default) returns the structured JSON document
+            documented in CLAUDE.md / wt report --json. When False, returns
+            the same plain-text rendering the CLI prints (no ANSI codes).
+
+    Returns the report as a string.
+    """
+    # Mutual-exclusion check (positional dates vs sprint vs last_days).
+    has_positional = bool(start_date or end_date)
+    if has_positional and (sprint or last_days is not None):
+        return "Error: provide either start_date+end_date, sprint, or last_days (not multiple)."
+    if sprint and last_days is not None:
+        return "Error: provide either start_date+end_date, sprint, or last_days (not multiple)."
+
+    data = load()
+
+    if has_positional:
+        if not (start_date and end_date):
+            return "Error: both start_date and end_date are required when using positional dates."
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError as e:
+            return f"Error: invalid date (expected YYYY-MM-DD): {e}"
+        if end < start:
+            return "Error: end_date must be on or after start_date."
+        resolved_sprint = None
+    elif sprint:
+        sprints = get_cached_sprints(data) or get_all_sprints(data)
+        if not sprints:
+            return "Error: no sprints available (project not configured or query failed)."
+        match = _match_sprint(sprints, sprint)
+        if not match:
+            return f"Error: no sprint matching '{sprint}'."
+        start = match["start_date"]
+        end = match["end_date"] - timedelta(days=1)
+        resolved_sprint = match
+    elif last_days is not None:
+        try:
+            days = _parse_last_arg(str(last_days))
+        except ValueError as e:
+            return f"Error: {e}"
+        today = datetime.now().date()
+        start = today - timedelta(days=days - 1)
+        end = today
+        resolved_sprint = None
+    else:
+        current = get_current_sprint(data)
+        if current:
+            start = current["start_date"]
+            end = current["end_date"] - timedelta(days=1)
+            resolved_sprint = current
+        else:
+            today = datetime.now().date()
+            start = today - timedelta(days=6)
+            end = today
+            resolved_sprint = None
+
+    if role is not None and role not in get_role_ids(data):
+        return f"Error: unknown role '{role}'. Known: {', '.join(get_role_ids(data))}"
+
+    payload = build_time_report(data, start, end, sprint=resolved_sprint, role_id=role)
+
+    if as_json:
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+    return format_time_report(payload, use_color=False)
 
 
 @mcp.tool()

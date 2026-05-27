@@ -11,6 +11,8 @@ Usage:
     wt log <task-id or partial title> <minutes> [note]
     wt notes <task-id or partial title>
     wt status
+    wt report [<start> <end>] [--sprint NAME] [--last Nd] [--role ROLE] [--json]
+                                   — Show logged time in a date range
     wt done <task-id or partial title>
     wt delete <task-id or partial title>
     wt rename <task> <new title>       — Rename a task
@@ -927,6 +929,209 @@ def sprint_summary_for_task(task: dict, sprints: list[dict]) -> list[dict]:
         })
     result.sort(key=lambda x: x["start_date"])
     return result
+
+
+def logs_in_date_range(
+    data: dict,
+    start_date,
+    end_date,
+    role_id: str | None = None,
+) -> list[tuple[dict, dict]]:
+    """Return [(task, log), ...] for every log whose effective date falls in
+    the inclusive range ``[start_date, end_date]``.
+
+    Sorted by effective timestamp ascending. Shadow tasks (with
+    ``cross_sprint_parent``) are skipped because their logs duplicate the
+    original task's logs. Done tasks are included.
+
+    Args:
+        data: The full data dict from ``load()``.
+        start_date: ``datetime.date`` (inclusive lower bound).
+        end_date:   ``datetime.date`` (inclusive upper bound).
+        role_id: Optional role filter; when set, only logs whose owning
+            task has this ``role_id`` are returned.
+    """
+    out: list[tuple[dict, dict]] = []
+    for task in data.get("tasks", []):
+        if task.get("cross_sprint_parent"):
+            continue
+        if role_id is not None and task.get("role_id") != role_id:
+            continue
+        for log in task.get("logs", []):
+            ts = log_effective_date(log)
+            if not ts:
+                continue
+            d = datetime.fromtimestamp(ts).date()
+            if start_date <= d <= end_date:
+                out.append((task, log))
+    out.sort(key=lambda pair: log_effective_date(pair[1]))
+    return out
+
+
+def _parse_last_arg(s: str) -> int:
+    """Parse a ``--last`` value. Accepts ``"7"`` or ``"7d"``; rejects others.
+
+    Returns the integer day count. Raises ``ValueError`` with a clear message
+    when the input is not recognised.
+    """
+    raw = (s or "").strip().lower()
+    if not raw:
+        raise ValueError("--last requires a value, e.g. '7' or '7d'")
+    if raw.endswith("d"):
+        raw = raw[:-1]
+    if not raw.isdigit():
+        raise ValueError(f"--last expected an integer (optionally suffixed 'd'), got '{s}'")
+    days = int(raw)
+    if days <= 0:
+        raise ValueError(f"--last must be a positive integer, got '{s}'")
+    return days
+
+
+def build_time_report(
+    data: dict,
+    start_date,
+    end_date,
+    sprint: dict | None = None,
+    role_id: str | None = None,
+) -> dict:
+    """Build the structured time-report payload (the JSON shape).
+
+    Pure function: doesn't print or load data. Used by both the CLI ``--json``
+    path and the MCP ``report_time_range`` tool so they emit byte-identical
+    documents.
+    """
+    roles = get_roles(data)
+    pairs = logs_in_date_range(data, start_date, end_date, role_id=role_id)
+
+    total_minutes = 0.0
+    task_ids: set[str] = set()
+    by_role_minutes: dict[str, float] = {}
+    log_entries = []
+
+    for task, log in pairs:
+        mins = float(log.get("minutes", 0) or 0)
+        total_minutes += mins
+        task_ids.add(task.get("id", ""))
+        rid = task.get("role_id", "other")
+        by_role_minutes[rid] = by_role_minutes.get(rid, 0.0) + mins
+
+        ts = log_effective_date(log)
+        eff_date = datetime.fromtimestamp(ts).date().isoformat() if ts else None
+
+        log_entries.append({
+            "log_id": log.get("id"),
+            "task_id": task.get("id"),
+            "task_title": task.get("title", ""),
+            "role_id": rid,
+            "role_label": roles.get(rid, rid),
+            "minutes": mins,
+            "note": log.get("note", ""),
+            "at": log.get("at"),
+            "started_at": log.get("started_at"),
+            "ended_at": log.get("ended_at"),
+            "effective_date": eff_date,
+            "calendar_event_uid": log.get("calendar_event_uid"),
+            "uploaded": bool(log.get("uploaded_at")),
+        })
+
+    # Sort role breakdown by minutes desc, then by label for stable output.
+    by_role = sorted(
+        (
+            {
+                "role_id": rid,
+                "role_label": roles.get(rid, rid),
+                "minutes": mins,
+            }
+            for rid, mins in by_role_minutes.items()
+        ),
+        key=lambda r: (-r["minutes"], r["role_label"]),
+    )
+
+    filters = {"role": role_id} if role_id else None
+
+    return {
+        "range": {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "sprint": sprint.get("title") if sprint else None,
+        },
+        "filters": filters,
+        "totals": {
+            "total_minutes": total_minutes,
+            "task_count": len(task_ids),
+            "log_count": len(log_entries),
+            "by_role": by_role,
+        },
+        "logs": log_entries,
+    }
+
+
+def format_time_report(payload: dict, use_color: bool = True) -> str:
+    """Render a :func:`build_time_report` payload as human-readable text.
+
+    When ``use_color`` is False, ANSI sequences are stripped so the output is
+    safe for piping or for the MCP tool's plain-text mode.
+    """
+    def _c(text, *codes):
+        return c(text, *codes) if use_color else str(text)
+
+    rng = payload["range"]
+    totals = payload["totals"]
+    filters = payload.get("filters") or {}
+
+    sprint_label = f"  ({rng['sprint']})" if rng.get("sprint") else ""
+    role_label = ""
+    if filters.get("role"):
+        role_label = f"  [role: {filters['role']}]"
+
+    lines = []
+    lines.append("")
+    lines.append(_c(
+        f"  Time report: {rng['start_date']} → {rng['end_date']}{sprint_label}{role_label}",
+        "bold",
+    ))
+    lines.append(_c(
+        f"  Total: {fmt_mins(totals['total_minutes'])} across "
+        f"{totals['task_count']} tasks, {totals['log_count']} log entries",
+        "dim",
+    ))
+
+    if not payload["logs"]:
+        lines.append("")
+        lines.append(_c("  No logs in range.", "yellow"))
+        lines.append("")
+        return "\n".join(lines)
+
+    # Role breakdown — mirrors cmd_status bar layout.
+    total = totals["total_minutes"] or 0
+    lines.append("")
+    lines.append(_c("  by role:", "bold"))
+    for r in totals["by_role"]:
+        mins = r["minutes"]
+        pct = round(mins / total * 100) if total else 0
+        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        lines.append(f"    {r['role_label']:<25} {bar} {pct:>3}%  {fmt_mins(mins)}")
+
+    lines.append("")
+    lines.append(_c("  Logs (sorted by start time):", "bold"))
+    for entry in payload["logs"]:
+        eff = entry.get("effective_date") or "—"
+        started = entry.get("started_at")
+        ended = entry.get("ended_at")
+        if started and ended:
+            time_range = f"{datetime.fromtimestamp(started).strftime('%H:%M')}-{datetime.fromtimestamp(ended).strftime('%H:%M')}"
+        else:
+            time_range = "—"
+        dur = fmt_mins(entry["minutes"])
+        role_lbl = entry.get("role_label") or entry.get("role_id") or "?"
+        title = (entry.get("task_title") or "")[:35]
+        note = (entry.get("note") or "")[:40]
+        lines.append(
+            f"    {eff}  {time_range:>11}  [{dur:>7}]  {role_lbl:<22}  {title:<37}  {note}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _match_sprint(sprints: list[dict], query: str) -> dict | None:
@@ -4004,6 +4209,116 @@ def cmd_tabs(args):
         sys.exit(1)
 
 
+def _resolve_report_range(data, positional, sprint_query, last_value):
+    """Resolve (start_date, end_date, sprint_dict) for cmd_report / MCP.
+
+    Applies the precedence documented in the plan:
+        positional dates > --sprint > --last > current sprint > last 7 days.
+    Raises ``ValueError`` with a clear message on bad input.
+    """
+    if positional and (sprint_query or last_value is not None):
+        raise ValueError("Provide either positional dates, --sprint, or --last (not multiple).")
+    if sprint_query and last_value is not None:
+        raise ValueError("Provide either positional dates, --sprint, or --last (not multiple).")
+
+    if positional:
+        if len(positional) != 2:
+            raise ValueError("Expected two ISO dates: <start> <end>")
+        try:
+            start = datetime.strptime(positional[0], "%Y-%m-%d").date()
+            end = datetime.strptime(positional[1], "%Y-%m-%d").date()
+        except ValueError as e:
+            raise ValueError(f"Invalid date (expected YYYY-MM-DD): {e}") from None
+        if end < start:
+            raise ValueError("End date must be on or after start date.")
+        return start, end, None
+
+    if sprint_query:
+        sprints = get_cached_sprints(data) or get_all_sprints(data)
+        if not sprints:
+            raise ValueError("No sprints available (project not configured or query failed).")
+        match = _match_sprint(sprints, sprint_query)
+        if not match:
+            raise ValueError(f"No sprint matching '{sprint_query}'.")
+        # Sprint end_date follows the half-open convention; convert to inclusive.
+        return match["start_date"], match["end_date"] - timedelta(days=1), match
+
+    if last_value is not None:
+        days = _parse_last_arg(last_value)
+        today = datetime.now().date()
+        return today - timedelta(days=days - 1), today, None
+
+    # Default: current sprint, then 7-day fallback.
+    current = get_current_sprint(data)
+    if current:
+        return current["start_date"], current["end_date"] - timedelta(days=1), current
+    today = datetime.now().date()
+    return today - timedelta(days=6), today, None
+
+
+def cmd_report(args):
+    """Show logged time across a date range."""
+    positional: list[str] = []
+    sprint_query: str | None = None
+    last_value: str | None = None
+    role_filter: str | None = None
+    as_json = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--sprint":
+            if i + 1 >= len(args):
+                print(c("--sprint requires a value", "red")); sys.exit(1)
+            sprint_query = args[i + 1]
+            i += 2
+        elif a == "--last":
+            if i + 1 >= len(args):
+                print(c("--last requires a value", "red")); sys.exit(1)
+            last_value = args[i + 1]
+            i += 2
+        elif a == "--role":
+            if i + 1 >= len(args):
+                print(c("--role requires a value", "red")); sys.exit(1)
+            role_filter = args[i + 1]
+            i += 2
+        elif a == "--json":
+            as_json = True
+            i += 1
+        elif a in ("-h", "--help"):
+            print("Usage: wt report [<start> <end> | --sprint NAME | --last Nd] [--role ROLE] [--json]")
+            return
+        elif a.startswith("--"):
+            print(c(f"Unknown flag: {a}", "red")); sys.exit(1)
+        else:
+            positional.append(a)
+            i += 1
+
+    data = load()
+
+    try:
+        start_date, end_date, sprint = _resolve_report_range(
+            data, positional, sprint_query, last_value
+        )
+    except ValueError as e:
+        print(c(str(e), "red"), file=sys.stderr)
+        sys.exit(1)
+
+    if role_filter is not None:
+        if role_filter not in get_role_ids(data):
+            print(c(f"Unknown role '{role_filter}'. Known: {', '.join(get_role_ids(data))}", "red"),
+                  file=sys.stderr)
+            sys.exit(1)
+
+    payload = build_time_report(data, start_date, end_date, sprint=sprint, role_id=role_filter)
+
+    if as_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    print(format_time_report(payload, use_color=True))
+
+
 def cmd_sprint(args):
     """Show current sprint info and tasks grouped by sprint."""
     data = load()
@@ -4156,6 +4471,7 @@ COMMANDS = {
     "tabs": cmd_tabs,
     "calendar": cmd_calendar,
     "cal": cmd_calendar,
+    "report": cmd_report,
     "sprint": cmd_sprint,
     "set-sprint": cmd_set_sprint,
     "split-sprint": cmd_split_sprint,
