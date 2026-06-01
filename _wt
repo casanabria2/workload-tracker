@@ -29,6 +29,7 @@ _wt() {
         'push:Sync task to linked GitHub issue'
         'done:Mark a task as done'
         'close-recurrent:Close recurrent tasks from previous sprint(s)'
+        'new-recurrent:Recreate recurring tasks in the current sprint'
         'delete:Delete a task'
         'del:Delete a task'
         'rm:Delete a task'

@@ -119,6 +119,12 @@ wt close-recurrent                 # previous sprint only (default)
 wt close-recurrent --all-previous  # every earlier sprint
 wt close-recurrent --dry-run       # preview without making changes
 
+# Recreate the prior sprint's recurring tasks (open and closed) in the current
+# sprint, each with its own GitHub issue (sprint-suffixed titles get re-suffixed)
+wt new-recurrent                   # previous sprint only (default)
+wt new-recurrent --all-previous    # source every earlier sprint
+wt new-recurrent --dry-run         # preview without creating anything
+
 # Task notes (opens in $EDITOR or GitHub issue)
 wt notes "Banco Galicia"
 

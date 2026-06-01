@@ -18,6 +18,11 @@ Usage:
                                    — Close recurrent tasks (with a GitHub issue)
                                      from the previous sprint; --all-previous
                                      closes every earlier sprint
+    wt new-recurrent [--all-previous] [--dry-run]
+                                   — Recreate the previous sprint's recurring
+                                     tasks (open and closed) in the current
+                                     sprint, each with its own GitHub issue;
+                                     --all-previous sources every earlier sprint
     wt delete <task-id or partial title>
     wt rename <task> <new title>       — Rename a task
 
@@ -1952,6 +1957,215 @@ def close_previous_sprint_recurrent_tasks(data: dict, save_callback, all_previou
     return {"error": None, "current_sprint": current.get("title"), "results": results}
 
 
+def _recurrent_source_sort_key(task: dict, sprints: list[dict]) -> tuple:
+    """Sort key to pick the most recent template among same-base-name sources.
+
+    Prefers the task in the later sprint, then the more recently created one.
+    """
+    sid = task.get("sprint_id")
+    sprint = next((s for s in sprints if s["id"] == sid), None)
+    sprint_start = sprint["start_date"].toordinal() if sprint and sprint.get("start_date") else 0
+    return (sprint_start, task.get("created_at", 0))
+
+
+def _same_recurrent_series(a: str, b: str) -> bool:
+    """Heuristic: do two lower-cased, sprint-suffix-stripped base names refer to
+    the same recurring series?
+
+    Recurring task titles drift across sprints by gaining or losing a trailing
+    qualifier (e.g. 'ad-hoc slack questions - casanabria' in one sprint vs
+    'ad-hoc slack questions' in the next). Treat two base names as the same
+    series when one is the other followed by a word/separator boundary, so
+    current-sprint dedup survives the drift without matching unrelated prefixes.
+    """
+    a, b = a.strip(), b.strip()
+    if a == b:
+        return True
+    lo, hi = sorted((a, b), key=len)
+    if not lo:
+        return False
+    return hi.startswith(lo) and hi[len(lo)] in " -"
+
+
+def find_recurrent_tasks_to_recreate(data: dict, all_previous: bool = False) -> list[dict]:
+    """Plan new current-sprint recurrent tasks from prior-sprint recurring ones.
+
+    A source task in the target sprint(s) is treated as a recurring task when
+    *either* signal holds (so both open and already-closed copies are caught,
+    since closing drops the ``recurrent`` marker):
+
+      - its title carries a trailing ' - Sprint N' suffix (``SPRINT_SUFFIX_RE``),
+        the per-sprint recurring-task naming convention; or
+      - its base name (title with the suffix stripped via ``strip_sprint_suffix``)
+        matches a non-shadow task anywhere in the data that currently has
+        ``status == "recurrent"`` (covers recurring tasks without the suffix).
+
+    Source scope:
+      - By default, only the sprint immediately preceding the current one.
+      - With ``all_previous=True``, every sprint earlier than the current one.
+
+    One creation plan is produced per recurring base name found in the source
+    sprint(s), deduplicated by base name using the most recent matching task as
+    the template. A series that already has a copy in the *current* sprint is
+    skipped (via ``_same_recurrent_series``, which tolerates trailing-qualifier
+    drift), so the command is safe to re-run.
+
+    Returns a list of plan dicts ``{"source", "new_title", "role_id",
+    "description"}``, or an empty list if the current sprint can't be resolved.
+    """
+    sprints = get_all_sprints(data)
+    current = find_sprint_for_date(sprints, datetime.now().date())
+    if not current:
+        return []
+    current_start = current["start_date"]
+
+    # Target source sprint(s): the immediately previous one, or every earlier one.
+    earlier = [s for s in sprints if s["start_date"] < current_start]
+    if all_previous:
+        source_ids = {s["id"] for s in earlier}
+    elif earlier:
+        prev = max(earlier, key=lambda s: s["start_date"])
+        source_ids = {prev["id"]}
+    else:
+        source_ids = set()
+    if not source_ids:
+        return []
+
+    # Exclude cross-sprint shadow tasks throughout.
+    tasks = [t for t in data.get("tasks", []) if not t.get("cross_sprint_parent")]
+
+    # Base names of active recurring series (any task currently 'recurrent').
+    recurring_bases = {
+        strip_sprint_suffix(t["title"]).lower()
+        for t in tasks
+        if t.get("status") == "recurrent"
+    }
+
+    # Base names that already have a copy in the current sprint -> don't recreate.
+    current_bases = [
+        strip_sprint_suffix(t["title"]).lower()
+        for t in tasks
+        if t.get("sprint_id") == current["id"]
+    ]
+
+    # Pick one template task per recurring base name from the source sprint(s).
+    by_base: dict[str, dict] = {}
+    for t in tasks:
+        if t.get("sprint_id") not in source_ids:
+            continue
+        base = strip_sprint_suffix(t["title"]).lower()
+        # Recurring if it carries the per-sprint suffix or shares a base name
+        # with a currently-recurrent task.
+        is_recurring = bool(SPRINT_SUFFIX_RE.search(t["title"])) or base in recurring_bases
+        if not is_recurring:
+            continue
+        if any(_same_recurrent_series(base, cb) for cb in current_bases):
+            continue  # already have a copy of this series in the current sprint
+        chosen = by_base.get(base)
+        if chosen is None or _recurrent_source_sort_key(t, sprints) > _recurrent_source_sort_key(chosen, sprints):
+            by_base[base] = t
+
+    # Suffix for re-titling (e.g. " - Sprint 100").
+    m = re.search(r"Sprint\s+(\d+)", current["title"], re.IGNORECASE)
+    cur_suffix = f" - Sprint {m.group(1)}" if m else f" - {current['title']}"
+
+    plans = []
+    for src in by_base.values():
+        if SPRINT_SUFFIX_RE.search(src["title"]):
+            new_title = strip_sprint_suffix(src["title"]) + cur_suffix
+        else:
+            new_title = src["title"]
+        plans.append({
+            "source": src,
+            "new_title": new_title,
+            "role_id": src.get("role_id", "other"),
+            "description": src.get("description", ""),
+        })
+    plans.sort(key=lambda p: p["new_title"].lower())
+    return plans
+
+
+def create_current_sprint_recurrent_tasks(data: dict, save_callback, all_previous: bool = False) -> dict:
+    """Create current-sprint recurrent tasks from prior-sprint recurring ones.
+
+    For each plan from ``find_recurrent_tasks_to_recreate`` a new task is created
+    with ``status == "recurrent"`` in the current sprint, copying the source's
+    title (re-suffixed with the current sprint when it had a ' - Sprint N'
+    suffix), description and role, but with a fresh id, empty logs, and its own
+    GitHub issue. The issue is created when the role has a configured
+    ``github_repo``; otherwise the GitHub steps are skipped (noted per result).
+
+    Returns a summary dict mirroring ``close_previous_sprint_recurrent_tasks``::
+
+        {"error": str | None, "current_sprint": str | None,
+         "results": [{"title", "role", "issue", "created", "issue_created",
+                      "project_updated", "skipped_github", "error"}]}
+    """
+    current = get_current_sprint(data)
+    if not current:
+        return {
+            "error": "Could not determine the current sprint; aborting to avoid mis-assigning tasks.",
+            "current_sprint": None,
+            "results": [],
+        }
+
+    results = []
+    for plan in find_recurrent_tasks_to_recreate(data, all_previous=all_previous):
+        outcome = {
+            "title": plan["new_title"],
+            "role": plan["role_id"],
+            "issue": None,
+            "created": False,
+            "issue_created": False,
+            "project_updated": False,
+            "skipped_github": False,
+            "error": None,
+        }
+        task = {
+            "id": uid(),
+            "title": plan["new_title"],
+            "description": plan["description"],
+            "role_id": plan["role_id"],
+            "status": "recurrent",
+            "logs": [],
+            "created_at": time.time(),
+            "sprint": current["title"],
+            "sprint_id": current["id"],
+        }
+        data["tasks"].insert(0, task)
+        save_callback(data)
+        outcome["created"] = True
+
+        repo = get_role_repo(task, data)
+        if not repo:
+            # Role has no GitHub integration (e.g. "other") - task only, no issue.
+            outcome["skipped_github"] = True
+            results.append(outcome)
+            continue
+
+        try:
+            issue_ref = create_github_issue(task, repo)
+            task["github_issue"] = issue_ref
+            save_callback(data)
+            outcome["issue"] = issue_ref
+            outcome["issue_created"] = True
+        except Exception as e:  # issue creation is best-effort; keep the task
+            outcome["error"] = f"Failed to create issue: {e}"
+            results.append(outcome)
+            continue
+
+        # Set up project fields (Status/Activity/Sprint/Hours) if configured.
+        if data.get("config", {}).get("github_project_number"):
+            res = setup_issue_in_project(issue_ref, task, data)
+            if res.get("success"):
+                outcome["project_updated"] = True
+            else:
+                outcome["error"] = "; ".join(res.get("errors") or ["project setup failed"])
+        results.append(outcome)
+
+    return {"error": None, "current_sprint": current.get("title"), "results": results}
+
+
 # ── Commands ──────────────────────────────────────────────
 
 def cmd_add(args):
@@ -2613,6 +2827,53 @@ def cmd_close_recurrent(args):
                 bits.append("project updated")
             extra = f" ({', '.join(bits)})" if bits else ""
             print(c(f"✓ {r['title']}  [{r.get('sprint', '?')}]{extra}", "green"))
+            if r.get("error"):
+                print(c(f"  Warning: {r['error']}", "yellow"))
+        else:
+            print(c(f"✗ {r['title']}: {r.get('error')}", "red"))
+
+
+def cmd_new_recurrent(args):
+    # Flags: --all-previous (source recurring tasks from every earlier sprint,
+    # not just the immediately previous one) and --dry-run / -n (preview only).
+    all_previous = "--all-previous" in args or "--all" in args
+    dry_run = "--dry-run" in args or "-n" in args
+
+    data = load()
+    current = get_current_sprint(data)
+    if not current:
+        print(c("Could not determine the current sprint. Aborting.", "red"))
+        sys.exit(1)
+
+    scope = "all previous sprints" if all_previous else "the previous sprint"
+    plans = find_recurrent_tasks_to_recreate(data, all_previous=all_previous)
+
+    if not plans:
+        print(c(f"No recurring tasks from {scope} to recreate for {current['title']}.", "dim"))
+        return
+
+    if dry_run:
+        print(c(f"Would create {len(plans)} recurrent task(s) in {current['title']} (from {scope}):", "yellow"))
+        roles = get_roles(data)
+        for p in plans:
+            repo = get_role_repo(p["source"], data)
+            issue_note = "+ issue" if repo else "no issue (role has no repo)"
+            print(f"  • {p['new_title']}  [{roles.get(p['role_id'], p['role_id'])}]  ({issue_note})")
+        return
+
+    print(c(f"Creating {len(plans)} recurrent task(s) in {current['title']} (from {scope})...", "cyan"))
+    summary = create_current_sprint_recurrent_tasks(data, save, all_previous=all_previous)
+    for r in summary["results"]:
+        if r["created"]:
+            bits = []
+            if r.get("issue_created"):
+                bits.append(f"issue {r.get('issue')}")
+            if r.get("project_updated"):
+                bits.append("project updated")
+            if r.get("skipped_github"):
+                bits.append("no issue (role has no repo)")
+            extra = f" ({', '.join(bits)})" if bits else ""
+            print(c(f"✓ {r['title']}  [{r.get('role', '?')}]{extra}", "green"))
             if r.get("error"):
                 print(c(f"  Warning: {r['error']}", "yellow"))
         else:
@@ -4631,6 +4892,7 @@ COMMANDS = {
     "merge-logs": cmd_merge_logs,
     "done": cmd_done,
     "close-recurrent": cmd_close_recurrent,
+    "new-recurrent": cmd_new_recurrent,
     "delete": cmd_delete,
     "del": cmd_delete,
     "rm": cmd_delete,

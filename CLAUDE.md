@@ -38,7 +38,7 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, report, sprint, set-sprint, split-sprint.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, report, sprint, set-sprint, split-sprint.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`, `/push/<task>`.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
@@ -381,6 +381,60 @@ close_previous_recurrent_tasks(dry_run=True)           # preview without changes
 **Key functions in wt.py:**
 - `find_recurrent_tasks_to_close(data, all_previous=False) -> list[dict]` — selection logic (network call via `get_all_sprints` to resolve current/previous sprint).
 - `close_previous_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — closes each via `close_task()`; returns `{error, current_sprint, results: [{task_id, title, sprint, issue, success, issue_closed, project_updated, error}]}`.
+
+### Recreating recurrent tasks for the current sprint
+
+The counterpart to `close-recurrent`: at the start of a new sprint, the
+`new-recurrent` feature recreates the previous sprint's recurring tasks in the
+**current** sprint, each with a fresh GitHub issue. It runs each new task
+through `create_github_issue()` + `setup_issue_in_project()` (Status=In
+Progress, Activity, Sprint, Hours), exactly like `wt add --create-issue`.
+
+**Identifying recurring tasks (dual signal):** because closing a recurrent task
+sets `status="done"` and drops the `recurrent` marker, selection can't rely on
+status alone. A source task in the target sprint(s) is treated as recurring when
+**either**:
+- its title carries the per-sprint ` - Sprint N` suffix (`SPRINT_SUFFIX_RE`) —
+  this is the recurring-task naming convention and is the only signal for a
+  series whose copies are *all* closed (e.g. `General Demo Kit maintenance -
+  Sprint 100`); **or**
+- its base name (`strip_sprint_suffix(title)`) matches some non-shadow task
+  anywhere that currently has `status == "recurrent"` (covers recurring tasks
+  without the suffix).
+
+This picks up **open and closed** copies. Non-recurring one-offs (e.g. `SLO
+Workshop Quarterly Sync`, `CAP audit cleanup`) lack the suffix and are ignored.
+
+**What gets copied:** title, description, role. The new task gets a fresh `id`,
+empty `logs`, `status="recurrent"`, the current sprint's `sprint`/`sprint_id`,
+and its own `github_issue`. If the source title ended in ` - Sprint N`, the new
+title is re-suffixed with the current sprint (` - Sprint M`); titles without the
+suffix are copied verbatim.
+
+**Scope / safety:**
+- Default targets only the sprint immediately before the current one;
+  `--all-previous` sources every earlier sprint (deduped to one new task per base
+  name, most-recent source as template).
+- A series that already has a copy in the current sprint is skipped, so the
+  command is **safe to re-run** (won't double-create). Dedup uses
+  `_same_recurrent_series()`, a prefix-boundary match that tolerates
+  trailing-qualifier drift (e.g. `Ad-hoc Slack Questions - casanabria` in the
+  previous sprint vs `Ad-hoc Slack Questions` in the current one).
+- Aborts (empty result) if the current sprint can't be resolved.
+- Roles without a `github_repo` (e.g. `other`) still get a task created, but the
+  GitHub issue step is skipped and noted per result.
+
+**CLI:**
+```bash
+wt new-recurrent                 # previous sprint only (default)
+wt new-recurrent --all-previous  # every earlier sprint
+wt new-recurrent --dry-run       # preview; combine with --all-previous
+```
+
+**Key functions in wt.py:**
+- `find_recurrent_tasks_to_recreate(data, all_previous=False) -> list[dict]` — planning/selection (suffix-or-recurrent detection, dedup, current-sprint skip); returns plan dicts `{source, new_title, role_id, description}`.
+- `_same_recurrent_series(a, b) -> bool` — prefix-boundary helper used for drift-tolerant current-sprint dedup.
+- `create_current_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — creates each task + issue; returns `{error, current_sprint, results: [{title, role, issue, created, issue_created, project_updated, skipped_github, error}]}`.
 
 ### Sprint Tracking
 
