@@ -81,6 +81,8 @@ python3 tracker.py
 | `3`       | Filter: Strategic Deals                     |
 | `4`       | Filter: Other                               |
 | `0`       | Filter: All roles                           |
+| `a`       | Toggle showing done tasks                   |
+| `r`       | Reload data from disk and refresh screen    |
 | `Tab`     | Switch between Task Board / Overview        |
 | `↑ ↓`     | Navigate tasks                              |
 | `q`       | Quit                                        |
@@ -111,6 +113,11 @@ wt log "DemoKit PR" 30
 
 # Update status
 wt done "DemoKit PR"
+
+# Close recurrent tasks (that have a GitHub issue) from a prior sprint
+wt close-recurrent                 # previous sprint only (default)
+wt close-recurrent --all-previous  # every earlier sprint
+wt close-recurrent --dry-run       # preview without making changes
 
 # Task notes (opens in $EDITOR or GitHub issue)
 wt notes "Banco Galicia"
@@ -228,6 +235,7 @@ Allows Claude (via Claude Code or Claude Desktop) to interact directly with task
 | `stop_timer` | Stop the running timer |
 | `log_time` | Log time manually to a task |
 | `set_task_status` | Change task status (todo/inprogress/done) |
+| `close_previous_recurrent_tasks` | Close recurrent tasks (with a GitHub issue) from the previous sprint, or all earlier sprints with `all_previous=True` |
 | `delete_task` | Delete a task |
 | `get_status` | Get time summary by role |
 | `get_notes_path` | Get notes location (GitHub issue or local file path) |

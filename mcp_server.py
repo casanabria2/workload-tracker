@@ -27,6 +27,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue, setup_issue_in_project, mins_to_quarter_hours, task_logged_mins_for_sprint
 from wt import build_time_report, format_time_report, _parse_last_arg, get_cached_sprints, get_role_ids
+from wt import find_recurrent_tasks_to_close, close_previous_sprint_recurrent_tasks
 from datetime import timedelta
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -897,6 +898,55 @@ def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:
     result_lines.insert(0, f"Closed '{task['title']}'")
 
     return "\n".join(result_lines)
+
+
+@mcp.tool()
+def close_previous_recurrent_tasks(all_previous: bool = False, dry_run: bool = False) -> str:
+    """Close recurrent tasks from a prior sprint by updating their GitHub issues.
+
+    Finds every task with status 'recurrent' that is linked to a GitHub issue and
+    belongs to a prior sprint, then closes each one: the GitHub Project fields are
+    updated (Status=Done, Hours, Activity, Sprint, Type) and the issue is closed.
+    Recurrent tasks without a linked GitHub issue are ignored.
+
+    Args:
+        all_previous: If False (default), only close tasks from the sprint
+            immediately before the current one. If True, close tasks from every
+            sprint earlier than the current one.
+        dry_run: If True, only list the tasks that would be closed without making
+            any changes.
+    """
+    data = load()
+    current = get_current_sprint(data)
+    if not current:
+        return "ERROR: could not determine the current sprint; aborting."
+
+    scope = "all previous sprints" if all_previous else "the previous sprint"
+    tasks = find_recurrent_tasks_to_close(data, all_previous=all_previous)
+
+    if not tasks:
+        return f"No recurrent tasks from {scope} to close (current: {current['title']})."
+
+    if dry_run:
+        lines = [f"Would close {len(tasks)} recurrent task(s) from {scope}:"]
+        for t in tasks:
+            lines.append(f"  - {t['title']} [{t.get('sprint', '?')}] {t.get('github_issue')}")
+        return "\n".join(lines)
+
+    summary = close_previous_sprint_recurrent_tasks(data, save, all_previous=all_previous)
+    lines = [f"Closed recurrent tasks from {scope} (current: {summary['current_sprint']}):"]
+    for r in summary["results"]:
+        if r["success"]:
+            bits = []
+            if r.get("issue_closed"):
+                bits.append("issue closed")
+            if r.get("project_updated"):
+                bits.append("project updated")
+            extra = f" ({', '.join(bits)})" if bits else ""
+            lines.append(f"  ✓ {r['title']} [{r.get('sprint', '?')}]{extra}")
+        else:
+            lines.append(f"  ✗ {r['title']}: {r.get('error')}")
+    return "\n".join(lines)
 
 
 @mcp.tool()

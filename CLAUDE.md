@@ -38,10 +38,10 @@ Install dependencies: `pip install -r requirements.txt`
 Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, sprint, set-sprint, split-sprint.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, report, sprint, set-sprint, split-sprint.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`, `/push/<task>`.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
@@ -104,6 +104,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 - `TaskModal` (edit modal) injects the task's existing `sprint_id` into the sprint Select options when it falls outside the rendered window of "current + previous 4". Without this, recurrent tasks pointing at old sprints (e.g. Sprint 95 with current = Sprint 100) crash on mount with `InvalidSelectValueError` because Textual's `Select` is strict about values being in its option list.
 - TUI board layout: the task board is split into two tables — non-recurrent tasks at the top, recurrent tasks at the bottom. Role filter and `_selected_task()` work against whichever table is focused.
 - Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI)
+- `r` (TUI) reloads the data file from disk and re-renders the table, sidebar, and overview (`action_refresh`). Use it to pick up changes made by other processes (CLI, MCP server, Stream Deck bridge) without quitting and relaunching.
 
 ### Key Patterns
 
@@ -341,6 +342,45 @@ set_task_status("My task", "done", create_issue=True)
 set_role_repo("demokit", "grafana/field-eng-demo-kit")
 set_role_repo("other")  # Clear repo (disables GitHub integration for role)
 ```
+
+### Bulk-closing recurrent tasks from previous sprints
+
+Recurrent tasks (`status == "recurrent"`) intentionally span sprints, so each
+sprint typically has its own per-sprint copy (e.g. `Stand Up Calls - casanabria
+- Sprint 100`). Once a sprint ends, its recurrent copies should be closed. The
+`close-recurrent` feature does this in one shot, running each qualifying task
+through the standard `close_task()` workflow (updates the GitHub issue's project
+fields — Status=Done, Hours, Activity, Sprint, Type — and closes the issue).
+
+**A task qualifies only if it:**
+- has `status == "recurrent"`,
+- has a linked `github_issue` (tasks without one are skipped entirely),
+- is not a cross-sprint shadow (`cross_sprint_parent` unset), and
+- has a `sprint_id` matching a target sprint.
+
+**Scope (default vs. opt-in):** by default only the sprint *immediately before*
+the current one is targeted. Pass `--all-previous` (CLI) / `all_previous=True`
+(MCP) to target every sprint earlier than the current one. If the current sprint
+can't be resolved, the operation aborts (returns empty) to avoid closing
+current-sprint tasks.
+
+**CLI:**
+```bash
+wt close-recurrent                 # previous sprint only (default)
+wt close-recurrent --all-previous  # every earlier sprint
+wt close-recurrent --dry-run       # preview; combine with --all-previous
+```
+
+**MCP:**
+```python
+close_previous_recurrent_tasks()                       # previous sprint only
+close_previous_recurrent_tasks(all_previous=True)      # every earlier sprint
+close_previous_recurrent_tasks(dry_run=True)           # preview without changes
+```
+
+**Key functions in wt.py:**
+- `find_recurrent_tasks_to_close(data, all_previous=False) -> list[dict]` — selection logic (network call via `get_all_sprints` to resolve current/previous sprint).
+- `close_previous_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — closes each via `close_task()`; returns `{error, current_sprint, results: [{task_id, title, sprint, issue, success, issue_closed, project_updated, error}]}`.
 
 ### Sprint Tracking
 

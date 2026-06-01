@@ -2629,6 +2629,7 @@ class WorkloadTracker(App):
         Binding("c",   "import_calendar", "Calendar"),
         Binding("i",   "open_terminal", "iTerm"),
         Binding("a",   "toggle_show_done", "Show done"),
+        Binding("r",   "refresh",     "Refresh"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
         Binding("3",   "filter_role_3", "Strategic",show=False),
@@ -3122,6 +3123,18 @@ class WorkloadTracker(App):
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
+
+    def action_refresh(self):
+        """Reload data from disk and re-render the screen.
+
+        Lets the user pick up changes made by other processes (CLI, MCP server,
+        Stream Deck bridge) without quitting and relaunching the TUI.
+        """
+        self._data = load_data()
+        self._populate_table()
+        self._refresh_sidebar()
+        self._refresh_overview()
+        self.notify("Reloaded from disk", severity="information")
 
     def action_open_terminal(self):
         """Open iTerm2 terminal for the selected task."""

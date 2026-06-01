@@ -14,6 +14,10 @@ Usage:
     wt report [<start> <end>] [--sprint NAME] [--last Nd] [--role ROLE] [--json]
                                    — Show logged time in a date range
     wt done <task-id or partial title>
+    wt close-recurrent [--all-previous] [--dry-run]
+                                   — Close recurrent tasks (with a GitHub issue)
+                                     from the previous sprint; --all-previous
+                                     closes every earlier sprint
     wt delete <task-id or partial title>
     wt rename <task> <new title>       — Rename a task
 
@@ -1844,6 +1848,110 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     return result
 
 
+def find_recurrent_tasks_to_close(data: dict, all_previous: bool = False) -> list[dict]:
+    """Return recurrent tasks linked to a GitHub issue that belong to a prior sprint.
+
+    A task qualifies when all of the following hold:
+      - ``status == "recurrent"``
+      - it has a linked ``github_issue`` (tasks without one are excluded)
+      - it is not a cross-sprint shadow task (``cross_sprint_parent`` unset)
+      - its ``sprint_id`` matches one of the target sprints
+
+    Target sprints:
+      - By default, only the sprint immediately preceding the current one.
+      - With ``all_previous=True``, every sprint earlier than the current one.
+
+    Returns an empty list if the current sprint cannot be resolved, to avoid
+    mistakenly treating every recurrent task as belonging to a previous sprint.
+    """
+    from datetime import datetime
+
+    sprints = get_all_sprints(data)
+    current = find_sprint_for_date(sprints, datetime.now().date())
+    if not current:
+        return []
+    current_start = current["start_date"]
+
+    earlier = [s for s in sprints if s["start_date"] < current_start]
+    if all_previous:
+        target_ids = {s["id"] for s in earlier}
+    elif earlier:
+        # Only the sprint immediately before the current one.
+        prev = max(earlier, key=lambda s: s["start_date"])
+        target_ids = {prev["id"]}
+    else:
+        target_ids = set()
+
+    out = []
+    for t in data.get("tasks", []):
+        if t.get("status") != "recurrent":
+            continue
+        if not t.get("github_issue"):
+            continue
+        if t.get("cross_sprint_parent"):
+            continue
+        sprint_id = t.get("sprint_id")
+        if not sprint_id or sprint_id not in target_ids:
+            continue
+        out.append(t)
+    return out
+
+
+def close_previous_sprint_recurrent_tasks(data: dict, save_callback, all_previous: bool = False) -> dict:
+    """Close recurrent tasks from a prior sprint that have a linked GitHub issue.
+
+    By default only tasks from the sprint immediately before the current one are
+    closed; pass ``all_previous=True`` to also close tasks from earlier sprints.
+
+    Each qualifying task (see ``find_recurrent_tasks_to_close``) is run through
+    ``close_task()`` without prompt/comment callbacks, which updates the GitHub
+    issue's project fields (Status=Done, Hours, Activity, Sprint, Type) and closes
+    the issue.
+
+    Returns a summary dict::
+
+        {
+          "error": str | None,          # set if the current sprint can't be resolved
+          "current_sprint": str | None, # current sprint title
+          "results": [                  # one entry per task attempted
+            {"task_id", "title", "sprint", "issue",
+             "success", "issue_closed", "project_updated", "error"}
+          ],
+        }
+    """
+    current = get_current_sprint(data)
+    if not current:
+        return {
+            "error": "Could not determine the current sprint; aborting to avoid closing current tasks.",
+            "current_sprint": None,
+            "results": [],
+        }
+
+    results = []
+    for task in find_recurrent_tasks_to_close(data, all_previous=all_previous):
+        outcome = {
+            "task_id": task["id"],
+            "title": task["title"],
+            "sprint": task.get("sprint"),
+            "issue": task.get("github_issue"),
+            "success": False,
+            "issue_closed": False,
+            "project_updated": False,
+            "error": None,
+        }
+        try:
+            r = close_task(task, data, save_callback)
+            outcome["success"] = r.get("success", False)
+            outcome["issue_closed"] = r.get("issue_closed", False)
+            outcome["project_updated"] = r.get("project_updated", False)
+            outcome["error"] = r.get("error")
+        except Exception as e:  # close_task is best-effort; isolate per-task failures
+            outcome["error"] = str(e)
+        results.append(outcome)
+
+    return {"error": None, "current_sprint": current.get("title"), "results": results}
+
+
 # ── Commands ──────────────────────────────────────────────
 
 def cmd_add(args):
@@ -2467,6 +2575,48 @@ def cmd_done(args):
                     print(c("  Restart Arc to apply changes.", "yellow"))
         except ImportError:
             pass
+
+
+def cmd_close_recurrent(args):
+    # Flags: --all-previous (close every earlier sprint, not just the immediately
+    # previous one) and --dry-run / -n (preview without making changes).
+    all_previous = "--all-previous" in args or "--all" in args
+    dry_run = "--dry-run" in args or "-n" in args
+
+    data = load()
+    current = get_current_sprint(data)
+    if not current:
+        print(c("Could not determine the current sprint. Aborting.", "red"))
+        sys.exit(1)
+
+    scope = "all previous sprints" if all_previous else "the previous sprint"
+    tasks = find_recurrent_tasks_to_close(data, all_previous=all_previous)
+
+    if not tasks:
+        print(c(f"No recurrent tasks from {scope} to close (current: {current['title']}).", "dim"))
+        return
+
+    if dry_run:
+        print(c(f"Would close {len(tasks)} recurrent task(s) from {scope}:", "yellow"))
+        for t in tasks:
+            print(f"  • {t['title']}  [{t.get('sprint', '?')}]  {t.get('github_issue')}")
+        return
+
+    print(c(f"Closing {len(tasks)} recurrent task(s) from {scope}...", "cyan"))
+    summary = close_previous_sprint_recurrent_tasks(data, save, all_previous=all_previous)
+    for r in summary["results"]:
+        if r["success"]:
+            bits = []
+            if r.get("issue_closed"):
+                bits.append("issue closed")
+            if r.get("project_updated"):
+                bits.append("project updated")
+            extra = f" ({', '.join(bits)})" if bits else ""
+            print(c(f"✓ {r['title']}  [{r.get('sprint', '?')}]{extra}", "green"))
+            if r.get("error"):
+                print(c(f"  Warning: {r['error']}", "yellow"))
+        else:
+            print(c(f"✗ {r['title']}: {r.get('error')}", "red"))
 
 
 def cmd_delete(args):
@@ -4480,6 +4630,7 @@ COMMANDS = {
     "split-log": cmd_split_log,
     "merge-logs": cmd_merge_logs,
     "done": cmd_done,
+    "close-recurrent": cmd_close_recurrent,
     "delete": cmd_delete,
     "del": cmd_delete,
     "rm": cmd_delete,

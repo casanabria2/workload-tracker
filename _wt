@@ -28,6 +28,7 @@ _wt() {
         'unlink:Unlink task from GitHub issue'
         'push:Sync task to linked GitHub issue'
         'done:Mark a task as done'
+        'close-recurrent:Close recurrent tasks from previous sprint(s)'
         'delete:Delete a task'
         'del:Delete a task'
         'rm:Delete a task'
