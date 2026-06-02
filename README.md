@@ -6,9 +6,8 @@ Keyboard-first task tracker with time logging, built around your four Field Engi
 
 ```
 workload_tracker/
-├── tracker.py          — Full TUI (Textual), keyboard-driven
+├── tracker.py          — Full TUI (Textual), keyboard-driven; also hosts the HTTP bridge
 ├── wt.py               — CLI for quick terminal commands
-├── streamdeck_bridge.py— HTTP bridge for Stream Deck buttons
 ├── mcp_server.py       — MCP server for Claude integration
 ├── _wt                 — Zsh completion script
 └── requirements.txt
@@ -28,7 +27,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Make scripts executable
-chmod +x tracker.py wt.py streamdeck_bridge.py
+chmod +x tracker.py wt.py
 
 # Add wt CLI to PATH (symlink to ~/.local/bin)
 mkdir -p ~/.local/bin
@@ -147,17 +146,19 @@ wt roles delete myteam          # delete role (must have no tasks)
 
 ---
 
-## Stream Deck — streamdeck_bridge.py
+## Stream Deck — built into tracker.py
 
-Run the bridge alongside your TUI:
+The HTTP bridge runs **inside the TUI** on a background thread, so there's no
+separate process to launch. Just run the tracker — the bridge listens on
+`http://localhost:7373` for as long as the TUI is open, and its actions mutate
+the same in-memory data the UI shows (changes appear live, no refresh needed):
 
 ```bash
-# Terminal 1
 python3 tracker.py
-
-# Terminal 2
-python3 streamdeck_bridge.py
 ```
+
+If port 7373 is already in use (e.g. a stale standalone bridge), the TUI shows
+a warning notification and starts without the bridge.
 
 ### Button configuration
 
@@ -176,33 +177,42 @@ In Stream Deck software, use **"Open URL"** action with these URLs:
 
 The timer toggle will:
 - **Start**: timer on the most recently added in-progress task
-- **Stop**: commit elapsed time as a log entry
+- **Stop**: commit elapsed time as a log entry (identical to the TUI `t`-key
+  stop — same `"Timer session"` log note, GitHub hours sync, and Arc cleanup)
 
-### Auto-start bridge on login (macOS)
+### API contract
 
-Create `~/Library/LaunchAgents/com.carlos.workload-bridge.plist`:
+The bridge serves JSON on `http://127.0.0.1:7373`. Beyond the Stream Deck
+buttons above, these endpoints are intended for a companion client app (e.g. a
+menu-bar timer). All state changes mutate the live in-memory data and refresh
+the TUI.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.carlos.workload-bridge</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/carlos/workload_tracker/streamdeck_bridge.py</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>
-```
+| Method & path        | Body                | Response                                                                              |
+|----------------------|---------------------|---------------------------------------------------------------------------------------|
+| `GET /status`        | —                   | `{ "active_timer": { "task_id", "title", "role", "started_at" } }` — `null` when idle |
+| `GET /tasks`         | —                   | `{ "tasks": [ { "id", "title", "role", "status" } ] }` (non-done, non-shadow)         |
+| `POST /timer/start`  | `{ "task_id": "…" }`| `{ "action": "started", "task": "…" }`                                                |
+| `POST /timer/stop`   | —                   | `{ "action": "stopped", "task": "…", "logged_minutes": 8.0 }`                         |
 
-Then: `launchctl load ~/Library/LaunchAgents/com.carlos.workload-bridge.plist`
+`started_at` is raw epoch seconds (e.g. `1780339520.71`) so the client can tick
+elapsed locally between polls. `/status` also includes convenience fields
+(`elapsed`, `tasks` count, `time_by_role`) that clients may ignore.
+
+`POST /timer/start` stops any already-running timer first (with the same stop
+semantics as above), then starts the new one.
+
+### Reachable vs. idle
+
+The bridge only listens while `tracker.py` is open. A client should treat a
+**connection error** (refused/timeout) as a distinct "tracker unreachable"
+state — not the same as a successful `GET /status` returning
+`active_timer: null`, which means the tracker is up but idle.
+
+### Availability
+
+The bridge is available whenever `tracker.py` is running, so there's no longer
+a separate bridge daemon to auto-start. Keep the TUI open (e.g. in a dedicated
+terminal or tmux session) and the Stream Deck buttons will work.
 
 ---
 

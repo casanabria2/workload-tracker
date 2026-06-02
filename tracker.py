@@ -29,8 +29,10 @@ import json
 import time
 import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -45,6 +47,7 @@ from textual.reactive import reactive
 
 from idle_detector import get_idle_seconds
 from wt import (
+    load as wt_load, save as wt_save, resolve_task,
     get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, delete_github_issue,
     sync_project_status, get_role_activity, update_project_activity, get_calendar_events,
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
@@ -59,6 +62,11 @@ from wt import (
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
+
+# Port for the in-process HTTP bridge (Stream Deck / Hammerspoon / curl).
+# The server runs on a background thread inside the TUI and mutates the
+# already-loaded in-memory data, so external callers stay in sync with the UI.
+BRIDGE_PORT = 7373
 
 DEFAULT_ROLES = [
     {"id": "demokit",   "label": "Managing DemoKit",  "color": "blue"},
@@ -2572,6 +2580,110 @@ class CalendarModal(ModalScreen):
 # Main App
 # ──────────────────────────────────────────────────────────
 
+class _BridgeHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the in-process Stream Deck / Hammerspoon bridge.
+
+    Runs on a background thread (see ``WorkloadTracker._start_bridge_server``).
+    All state changes are marshalled onto the Textual event loop via
+    ``App.call_from_thread`` so they mutate the live in-memory ``self._data``
+    and refresh the UI, rather than writing to disk behind the TUI's back.
+
+    Bridge methods return a plain dict; an optional ``_status`` key overrides
+    the HTTP status code (popped before the body is serialised).
+    """
+
+    @property
+    def app(self) -> "WorkloadTracker":
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        # Silence the default stderr access log; it would corrupt the TUI.
+        pass
+
+    def respond(self, body: dict, status: int = 200):
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        path = urlparse(self.path).path.strip("/")
+        parts = path.split("/")
+        action = parts[0] if parts else ""
+
+        try:
+            if action == "status":
+                body = self.app.call_from_thread(self.app._bridge_status)
+            elif action == "tasks":
+                body = self.app.call_from_thread(self.app._bridge_list_tasks)
+            elif action == "timer" and len(parts) > 1 and parts[1] == "toggle":
+                body = self.app.call_from_thread(self.app._bridge_toggle_timer)
+            elif action == "log" and len(parts) > 1:
+                try:
+                    mins = float(parts[1])
+                except ValueError:
+                    self.respond({"error": "Invalid minutes"}, 400)
+                    return
+                body = self.app.call_from_thread(self.app._bridge_log, mins)
+            elif action == "push" and len(parts) > 1:
+                # Network call (gh) — runs on this handler thread so it never
+                # blocks the event loop; it reloads the UI when done.
+                query = unquote("/".join(parts[1:]))
+                body = self.app._bridge_push(query)
+            elif action == "filter":
+                role = parts[1] if len(parts) > 1 else "all"
+                body = {"action": "filter", "role": role,
+                        "note": "Use keyboard 1-4 in TUI to filter"}
+            else:
+                self.respond({"error": f"Unknown action: {action}"}, 404)
+                return
+        except Exception as exc:  # keep the bridge alive on unexpected errors
+            self.respond({"error": str(exc)}, 500)
+            return
+
+        status = body.pop("_status", 200)
+        self.respond(body, status)
+
+    def _read_json_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode() or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def do_POST(self):
+        path = urlparse(self.path).path.strip("/")
+        parts = path.split("/")
+
+        try:
+            if parts[:2] == ["timer", "start"]:
+                task_id = self._read_json_body().get("task_id")
+                if not task_id:
+                    self.respond({"error": "Missing 'task_id' in body"}, 400)
+                    return
+                body = self.app.call_from_thread(self.app._bridge_start_timer, task_id)
+            elif parts[:2] == ["timer", "stop"]:
+                body = self.app.call_from_thread(self.app._bridge_stop_timer)
+            else:
+                self.respond({"error": f"Unknown action: {path}"}, 404)
+                return
+        except Exception as exc:  # keep the bridge alive on unexpected errors
+            self.respond({"error": str(exc)}, 500)
+            return
+
+        status = body.pop("_status", 200)
+        self.respond(body, status)
+
+
 class WorkloadTracker(App):
     CSS = """
     Screen { background: $background; }
@@ -2650,6 +2762,7 @@ class WorkloadTracker(App):
         self._bg_tasks: set[str] = set()
         self._sprints_cache: list[dict] = []
         self._sprints_fetched = False
+        self._bridge_server: Optional[HTTPServer] = None
 
     def _bg_start(self, label: str):
         """Show a background operation in the header subtitle."""
@@ -2698,6 +2811,36 @@ class WorkloadTracker(App):
         self._focus_running_task()
         self.set_interval(1, self._tick)
         self._fetch_sprints_worker()
+        self._start_bridge_server()
+
+    def on_unmount(self):
+        """Shut down the HTTP bridge so the port is released on quit."""
+        if self._bridge_server is not None:
+            # shutdown() must be called from a thread other than the one
+            # running serve_forever(); we're on the event loop thread here.
+            self._bridge_server.shutdown()
+            self._bridge_server = None
+
+    @work(thread=True)
+    def _start_bridge_server(self):
+        """Serve the Stream Deck / Hammerspoon HTTP bridge on a daemon thread."""
+        try:
+            # Threaded so a slow request (e.g. a gh push) never blocks the
+            # client's frequent /status polls. Mutations are still serialized
+            # onto the event loop via call_from_thread.
+            server = ThreadingHTTPServer(("localhost", BRIDGE_PORT), _BridgeHandler)
+        except OSError as exc:
+            # Most likely the port is already taken (e.g. a stale standalone
+            # bridge still running). Warn but don't crash the TUI.
+            self.call_from_thread(
+                self.notify,
+                f"HTTP bridge unavailable on :{BRIDGE_PORT} ({exc})",
+                severity="warning",
+            )
+            return
+        server.app = self  # type: ignore[attr-defined]
+        self._bridge_server = server
+        server.serve_forever()
 
     @work(thread=True)
     def _fetch_sprints_worker(self):
@@ -3127,8 +3270,9 @@ class WorkloadTracker(App):
     def action_refresh(self):
         """Reload data from disk and re-render the screen.
 
-        Lets the user pick up changes made by other processes (CLI, MCP server,
-        Stream Deck bridge) without quitting and relaunching the TUI.
+        Lets the user pick up changes made by other processes (CLI, MCP server)
+        without quitting and relaunching the TUI. (The HTTP bridge runs in this
+        same process and refreshes the UI itself, so it doesn't need this.)
         """
         self._data = load_data()
         self._populate_table()
@@ -3498,31 +3642,51 @@ class WorkloadTracker(App):
         finally:
             self.call_from_thread(self._bg_end, "Deleting GitHub issue")
 
+    def _commit_active_timer(self, note: str = "Timer session") -> tuple[Optional[dict], float]:
+        """Stop the running timer and commit its elapsed minutes.
+
+        Single source of truth for "stop the timer": used by the TUI 't'-key
+        stop and the HTTP bridge alike, so they behave identically — log the
+        session (if long enough), persist, sync GitHub hours for a linked task,
+        and run Arc tab cleanup. Returns the stopped task (or None) and the
+        minutes logged (0.0 if the session was too short to record).
+        """
+        at = self._data.get("active_timer")
+        if not at:
+            return None, 0.0
+        task = next((t for t in self._data["tasks"] if t["id"] == at["task_id"]), None)
+        logged = 0.0
+        if task:
+            started_at = at["started_at"]
+            ended_at = time.time()
+            elapsed = (ended_at - started_at) / 60
+            if elapsed > 0.1:
+                logged = round(elapsed, 2)
+                task.setdefault("logs", []).append({
+                    "id": uid(), "minutes": logged,
+                    "note": note, "at": ended_at,
+                    "started_at": started_at, "ended_at": ended_at,
+                })
+        self._data["active_timer"] = None
+        save_data(self._data)
+
+        # Sync hours to GitHub project if task has linked issue
+        if task and task.get("github_issue"):
+            self._sync_task_hours_async(task)
+
+        # Arc integration: tab cleanup
+        if task:
+            self._arc_tab_cleanup(task)
+        return task, logged
+
     def action_toggle_timer(self):
         task = self._selected_task()
         if not task:
             return
         at = self._data.get("active_timer")
         if at and at.get("task_id") == task["id"]:
-            # Stop timer — commit minutes
-            started_at = at["started_at"]
-            ended_at = time.time()
-            elapsed = (ended_at - started_at) / 60
-            if elapsed > 0.1:
-                task.setdefault("logs", []).append({
-                    "id": uid(), "minutes": round(elapsed, 2),
-                    "note": "Timer session", "at": ended_at,
-                    "started_at": started_at, "ended_at": ended_at
-                })
-            self._data["active_timer"] = None
-            save_data(self._data)
-
-            # Sync hours to GitHub project if task has linked issue
-            if task.get("github_issue"):
-                self._sync_task_hours_async(task)
-
-            # Arc integration: tab cleanup
-            self._arc_tab_cleanup(task)
+            # Stop timer on the selected task (shared with the HTTP bridge).
+            self._commit_active_timer()
         else:
             # Stop any running timer first
             stopped_task = None
@@ -3902,6 +4066,175 @@ class WorkloadTracker(App):
                 self.call_from_thread(self.notify, f"Project status: {status_label}", severity="information")
         finally:
             self.call_from_thread(self._bg_end, "Syncing status")
+
+    # ── HTTP bridge actions ───────────────────────────────
+    # These run on the event loop (via call_from_thread) so they may safely
+    # touch self._data and refresh widgets. Each returns a JSON-able dict;
+    # an optional "_status" key sets the HTTP status code.
+
+    def _bridge_refresh_ui(self):
+        """Re-render the board, sidebar, and overview after a bridge change."""
+        self._populate_table()
+        self._refresh_sidebar()
+        self._refresh_overview()
+
+    def _bridge_reload(self):
+        """Reload from disk and re-render (used after external gh writes)."""
+        self._data = load_data()
+        self._bridge_refresh_ui()
+
+    def _bridge_status(self) -> dict:
+        tasks = self._data.get("tasks", [])
+        at = self._data.get("active_timer")
+
+        by_role: dict[str, float] = {}
+        for task in tasks:
+            rid = task.get("role_id", "other")
+            logged = task_logged_mins(task)
+            live = (time.time() - at["started_at"]) / 60 if at and at.get("task_id") == task["id"] else 0
+            by_role[rid] = by_role.get(rid, 0) + logged + live
+
+        active_timer = None
+        if at:
+            t = next((t for t in tasks if t["id"] == at.get("task_id")), None)
+            if t:
+                # Raw epoch `started_at` lets the client tick elapsed locally
+                # between polls; `elapsed` is a convenience pre-formatted value.
+                active_timer = {
+                    "task_id": t["id"],
+                    "title": t["title"],
+                    "role": t.get("role_id"),
+                    "started_at": at["started_at"],
+                    "elapsed": fmt_mins((time.time() - at["started_at"]) / 60),
+                }
+
+        return {
+            "active_timer": active_timer,
+            "tasks": len(tasks),
+            "time_by_role": {k: fmt_mins(v) for k, v in by_role.items()},
+        }
+
+    def _bridge_list_tasks(self) -> dict:
+        """Non-done, non-shadow tasks for the client's task picker."""
+        tasks = []
+        for t in self._data.get("tasks", []):
+            if t.get("status") == "done" or t.get("cross_sprint_parent"):
+                continue
+            tasks.append({
+                "id": t["id"],
+                "title": t["title"],
+                "role": t.get("role_id"),
+                "status": t.get("status"),
+            })
+        return {"tasks": tasks}
+
+    def _bridge_start_timer(self, task_id: str) -> dict:
+        target = next((t for t in self._data.get("tasks", []) if t["id"] == task_id), None)
+        if not target:
+            return {"error": f"No task with id '{task_id}'", "_status": 404}
+
+        at = self._data.get("active_timer")
+        if at and at.get("task_id") == task_id:
+            return {"action": "started", "task": target["title"]}  # already running
+
+        # Switching tasks: stop the previous timer with the t-key stop semantics.
+        if at:
+            self._commit_active_timer()
+
+        # Note: unlike the TUI start, the bridge does NOT focus the Arc space
+        # (no _arc_on_task_started) — starting remotely shouldn't reshuffle the
+        # browser. Stopping still runs Arc cleanup via _commit_active_timer.
+        self._data["active_timer"] = {"task_id": target["id"], "started_at": time.time()}
+        save_data(self._data)
+        self._bridge_refresh_ui()
+        return {"action": "started", "task": target["title"]}
+
+    def _bridge_stop_timer(self) -> dict:
+        if not self._data.get("active_timer"):
+            return {"error": "No timer running", "_status": 404}
+        task, logged = self._commit_active_timer()
+        self._bridge_refresh_ui()
+        return {
+            "action": "stopped",
+            "task": task["title"] if task else "?",
+            "logged_minutes": logged,
+        }
+
+    def _bridge_toggle_timer(self) -> dict:
+        at = self._data.get("active_timer")
+        if at:
+            # Stop with the same behavior as the TUI 't'-key stop.
+            task, logged = self._commit_active_timer()
+            self._bridge_refresh_ui()
+            return {
+                "action": "stopped",
+                "task": task["title"] if task else "?",
+                "logged_minutes": logged,
+            }
+
+        # Start the timer on the most-recently-added in-progress task.
+        inprogress = [t for t in self._data.get("tasks", []) if t.get("status") == "inprogress"]
+        if not inprogress:
+            return {"error": "No in-progress tasks found", "_status": 404}
+        target = inprogress[0]
+        # See _bridge_start_timer: no Arc focus on a bridge-initiated start.
+        self._data["active_timer"] = {"task_id": target["id"], "started_at": time.time()}
+        save_data(self._data)
+        self._bridge_refresh_ui()
+        return {"action": "started", "task": target["title"]}
+
+    def _bridge_log(self, mins: float) -> dict:
+        tasks = self._data.get("tasks", [])
+        at = self._data.get("active_timer")
+
+        # Log to the active timer's task, else the first in-progress task.
+        target_id = at["task_id"] if at else None
+        if not target_id:
+            inprogress = [t for t in tasks if t.get("status") == "inprogress"]
+            if inprogress:
+                target_id = inprogress[0]["id"]
+
+        task = next((t for t in tasks if t["id"] == target_id), None) if target_id else None
+        if not task:
+            return {"error": "No active task to log to", "_status": 404}
+
+        task.setdefault("logs", []).append({
+            "id": uid(), "minutes": mins,
+            "note": f"Stream Deck ({int(mins)}m)", "at": time.time(),
+        })
+        save_data(self._data)
+        self._bridge_refresh_ui()
+        return {"action": "logged", "minutes": mins, "task": task["title"]}
+
+    def _bridge_push(self, query: str) -> dict:
+        """Sync a task to its linked GitHub issue.
+
+        Runs on the HTTP handler thread (not the event loop) because it shells
+        out to ``gh``; it reloads the TUI from disk when finished.
+        """
+        wt_data = wt_load()
+        task = resolve_task(wt_data, query)
+        if not task:
+            return {"error": f"No task matching '{query}'", "_status": 404}
+
+        issue_ref = task.get("github_issue")
+        if not issue_ref:
+            return {"error": f"Task '{task['title']}' has no linked GitHub issue", "_status": 400}
+
+        result = setup_issue_in_project(issue_ref, task, wt_data)
+        wt_save(wt_data)
+        # Pull the gh-side changes back into the live TUI.
+        self.call_from_thread(self._bridge_reload)
+
+        if result["success"]:
+            return {"action": "pushed", "task": task["title"], "issue": issue_ref}
+        return {
+            "action": "pushed_with_errors",
+            "task": task["title"],
+            "issue": issue_ref,
+            "errors": result["errors"],
+            "_status": 207,  # Multi-Status
+        }
 
 
 if __name__ == "__main__":

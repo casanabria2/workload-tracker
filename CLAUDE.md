@@ -24,23 +24,22 @@ python3 tracker.py
 # CLI companion
 python3 wt.py <command>
 
-# Stream Deck HTTP bridge (runs on localhost:7373)
-python3 streamdeck_bridge.py
-
 # MCP server for Claude integration
 python3 mcp_server.py
 ```
+
+The Stream Deck HTTP bridge (localhost:7373) is no longer a separate process —
+it runs on a background thread inside `tracker.py` while the TUI is open.
 
 Install dependencies: `pip install -r requirements.txt`
 
 ## Architecture
 
-Five single-file Python tools sharing one data file (`~/.workload_tracker.json`):
+Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 
-- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates.
+- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`, or `null`), `GET /tasks` (non-done, non-shadow picker list), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the browser; the TUI `t`-key start still focuses Arc. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
 - **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, report, sprint, set-sprint, split-sprint.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
-- **streamdeck_bridge.py** — HTTP server exposing actions at `/timer/toggle`, `/log/<minutes>`, `/status`, `/filter/<role>`, `/push/<task>`.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
@@ -104,7 +103,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 - `TaskModal` (edit modal) injects the task's existing `sprint_id` into the sprint Select options when it falls outside the rendered window of "current + previous 4". Without this, recurrent tasks pointing at old sprints (e.g. Sprint 95 with current = Sprint 100) crash on mount with `InvalidSelectValueError` because Textual's `Select` is strict about values being in its option list.
 - TUI board layout: the task board is split into two tables — non-recurrent tasks at the top, recurrent tasks at the bottom. Role filter and `_selected_task()` work against whichever table is focused.
 - Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI)
-- `r` (TUI) reloads the data file from disk and re-renders the table, sidebar, and overview (`action_refresh`). Use it to pick up changes made by other processes (CLI, MCP server, Stream Deck bridge) without quitting and relaunching.
+- `r` (TUI) reloads the data file from disk and re-renders the table, sidebar, and overview (`action_refresh`). Use it to pick up changes made by other processes (CLI, MCP server) without quitting and relaunching. (The HTTP bridge now runs in-process and refreshes the UI itself.)
 
 ### Key Patterns
 
@@ -539,7 +538,8 @@ rename_task("old name", "new name")  # Updates GitHub issue title if linked
 ## Known Limitations
 
 - TUI reads `active_timer` on launch but timer display may need manual refresh to start ticking
-- Stream Deck `/filter/<role>` endpoint doesn't sync to TUI (separate processes)
+- Stream Deck `/filter/<role>` endpoint doesn't drive the TUI's role filter; it just echoes the requested role (the other bridge actions do update the live UI now that the bridge runs in-process)
+- The HTTP bridge needs the TUI running; with `tracker.py` closed, Stream Deck / Hammerspoon buttons have nothing to talk to
 - No export/report functionality
 - Arc integration requires Arc to be quit for folder changes
 - Arc Sync may interfere with sidebar JSON modifications
