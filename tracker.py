@@ -143,6 +143,21 @@ def task_logged_mins(task: dict) -> float:
     return sum(l.get("minutes", 0) for l in task.get("logs", []))
 
 
+def task_last_logged_at(task: dict) -> Optional[float]:
+    """Epoch seconds of the task's most recent time-log entry, or None.
+
+    Uses each log's ``at`` timestamp (the canonical record time, always set on
+    timer sessions and manual logs); falls back to ``ended_at``/``started_at``
+    for any legacy entry missing ``at``. Returns None when the task has no logs.
+    """
+    stamps = [
+        ts
+        for l in task.get("logs", [])
+        if (ts := l.get("at") or l.get("ended_at") or l.get("started_at")) is not None
+    ]
+    return max(stamps) if stamps else None
+
+
 def task_live_mins(task: dict, active_timer: Optional[dict]) -> float:
     if active_timer and active_timer.get("task_id") == task["id"]:
         return (time.time() - active_timer["started_at"]) / 60
@@ -4125,6 +4140,7 @@ class WorkloadTracker(App):
                 "title": t["title"],
                 "role": t.get("role_id"),
                 "status": t.get("status"),
+                "last_logged_at": task_last_logged_at(t),
             })
         return {"tasks": tasks}
 
