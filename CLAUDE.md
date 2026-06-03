@@ -93,7 +93,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 
 ### Domain Constants
 
-- **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`.
+- **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`. Current roles also include `testing` (`casanabria2/workload-tracker`), `iron infusion` (label `iron`, `grafana/field-eng`, activity `Iron Infusion`), `appenv-deployment` (label `Managing AppEnv Deployments`, color `red`, `grafana/field-eng-appenv-deployment`, activity `AppEnv`), and `brokkr` (label `Brokkr`, color `cyan`, `grafana/brokkr`, activity `Brokkr`). Note `wt roles add` always seeds `color: white`; there's no `set-color` subcommand, so non-default colors are set directly via `wt.load()`/`save()`.
 - **Statuses**: `todo`, `inprogress`, `recurrent`, `done`
 - Done tasks are hidden by default in all list views (CLI, TUI, MCP)
 - `recurrent` is for tasks that intentionally span sprints (e.g. recurring meetings, on-call). They are excluded from cross-sprint split detection.
