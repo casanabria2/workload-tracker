@@ -320,6 +320,77 @@ class TaskModal(ModalScreen):
 
 
 # ──────────────────────────────────────────────────────────
+# Modal: New task from an existing GitHub issue
+# ──────────────────────────────────────────────────────────
+
+class AddIssueModal(ModalScreen):
+    """Collect an existing GitHub issue ref + role (+ optional folder).
+
+    On submit, dismisses with ``{issue_ref, role_id, local_folder}``; the caller
+    fetches the issue title and creates a To Do task linked to it.
+    """
+
+    CSS = """
+    AddIssueModal {
+        align: center middle;
+    }
+    #modal-box {
+        width: 80;
+        height: auto;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #modal-box Label { margin-bottom: 1; }
+    #modal-box Input, #modal-box Select { margin-bottom: 1; }
+    #modal-box Horizontal { margin-bottom: 1; height: auto; }
+    #modal-actions { margin-top: 1; }
+    """
+
+    def __init__(self, roles: Optional[list] = None):
+        super().__init__()
+        self._roles = roles or []
+
+    def compose(self) -> ComposeResult:
+        role_options = [(r["label"], r["id"]) for r in self._roles]
+        default_role = self._roles[0]["id"] if self._roles else "other"
+        with Container(id="modal-box"):
+            yield Label("New task from GitHub issue")
+            yield Input(placeholder="Issue: owner/repo#123, URL, or number", id="inp-issue")
+            yield Select(role_options, value=default_role, id="sel-role", prompt="Select role")
+            yield Input(placeholder="Local folder path (optional, e.g., ~/dev/myproject)", id="inp-local-folder")
+            with Horizontal(id="modal-actions"):
+                yield Button("Create  [s]", variant="primary", id="btn-save")
+                yield Button("Cancel  [esc]", id="btn-cancel")
+
+    def on_mount(self):
+        self.query_one("#inp-issue").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(None)
+        elif event.key == "s" and not isinstance(self.focused, Input):
+            self._save()
+
+    @on(Button.Pressed, "#btn-save")
+    def save(self):
+        self._save()
+
+    @on(Button.Pressed, "#btn-cancel")
+    def cancel(self):
+        self.dismiss(None)
+
+    def _save(self):
+        issue_ref = self.query_one("#inp-issue").value.strip()
+        if not issue_ref:
+            self.query_one("#inp-issue").focus()
+            return
+        role_id = self.query_one("#sel-role").value or "other"
+        local_folder = self.query_one("#inp-local-folder").value.strip() or None
+        self.dismiss({"issue_ref": issue_ref, "role_id": role_id, "local_folder": local_folder})
+
+
+# ──────────────────────────────────────────────────────────
 # Modal: Tab Cleanup (Arc Integration)
 # ──────────────────────────────────────────────────────────
 
@@ -2743,6 +2814,7 @@ class WorkloadTracker(App):
 
     BINDINGS = [
         Binding("n",   "new_task",    "New task"),
+        Binding("G",   "add_issue_task", "New from issue"),
         Binding("e",   "edit_task",   "Edit"),
         Binding("d",   "delete_task", "Delete"),
         Binding("t",   "toggle_timer","Timer"),
@@ -3271,6 +3343,52 @@ class WorkloadTracker(App):
     def action_new_task(self):
         roles = get_roles(self._data)
         self.push_screen(TaskModal(roles=roles, sprints=self._sprints_cache), self._on_task_saved)
+
+    def action_add_issue_task(self):
+        """Create a new To Do task from an existing GitHub issue."""
+        roles = get_roles(self._data)
+        self.push_screen(AddIssueModal(roles=roles), self._on_add_issue_submitted)
+
+    def _on_add_issue_submitted(self, result: Optional[dict]):
+        if not result:
+            return
+        self._create_task_from_issue_worker(
+            result["issue_ref"], result["role_id"], result.get("local_folder")
+        )
+
+    @work(thread=True)
+    def _create_task_from_issue_worker(self, issue_ref: str, role_id: str, local_folder: Optional[str]):
+        """Fetch the issue and create a linked To Do task in a background thread."""
+        from wt import create_task_from_issue
+        self.call_from_thread(self._bg_start, "Creating task from issue")
+        try:
+            res = create_task_from_issue(
+                self._data, issue_ref, role_id=role_id,
+                local_folder=local_folder, status="todo",
+            )
+            if res["error"]:
+                self.call_from_thread(self.notify, res["error"], severity="error")
+                return
+            if res["existed"]:
+                t = res["task"]
+                self.call_from_thread(
+                    self.notify, f"Task already exists: {t['title']}", severity="warning"
+                )
+                return
+            save_data(self._data)
+            task = res["task"]
+            self.call_from_thread(
+                self.notify,
+                f"Created: {task['title']} ({task['github_issue']})",
+                severity="information",
+            )
+            self.call_from_thread(self._populate_table)
+            self.call_from_thread(self._refresh_sidebar)
+            self.call_from_thread(self._refresh_overview)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Failed to create task: {e}", severity="error")
+        finally:
+            self.call_from_thread(self._bg_end, "Creating task from issue")
 
     def action_import_calendar(self):
         task = self._selected_task()

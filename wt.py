@@ -36,8 +36,10 @@ Usage:
     wt unlink <task>               — Unlink task from GitHub issue
     wt push <task>                 — Sync task to linked GitHub issue
 
-    wt add-issue [url-or-ref] [--role ROLE]  — Create task from GitHub issue
-    wt add-issue [--role ROLE]               — Interactive: show assigned issues
+    wt add-issue <owner/repo#N|url|N> [--role ROLE] [--folder PATH]
+                                   — Create a To Do task from an existing
+                                     GitHub issue (links to it)
+    wt add-issue [--role ROLE]     — Interactive: pick from your assigned issues
 
     wt config                    — Show all config
     wt config <key>              — Show config value
@@ -3330,19 +3332,95 @@ def cmd_presence(args):
         sys.exit(1)
 
 
+def create_task_from_issue(
+    data: dict,
+    issue_ref: str,
+    role_id: str = "other",
+    local_folder: str | None = None,
+    status: str = "todo",
+    assign_sprint: bool = True,
+) -> dict:
+    """Create a task linked to an *existing* GitHub issue.
+
+    Fetches the issue title via `gh`, builds a task with the given role/status,
+    optionally records a validated `local_folder`, and assigns the current
+    sprint. The task is inserted into ``data["tasks"]`` but **not** persisted —
+    the caller is responsible for calling ``save(data)``.
+
+    Returns a result dict ``{task, error, existed}``:
+      - ``error``  — non-None message if the issue/folder is invalid (no task created)
+      - ``existed`` — True if a task is already linked to this issue (``task`` is it)
+    """
+    issue_ref = normalize_issue_ref(issue_ref, data)
+
+    # Validate the local folder up front so we never create a half-set task.
+    folder_str = None
+    if local_folder:
+        folder = Path(local_folder).expanduser()
+        if not folder.exists():
+            return {"task": None, "error": f"Folder does not exist: {local_folder}", "existed": False}
+        if not folder.is_dir():
+            return {"task": None, "error": f"Path is not a directory: {local_folder}", "existed": False}
+        folder_str = str(folder.resolve())
+
+    # Fetch issue details (also validates existence/access).
+    result = subprocess.run(
+        ["gh", "issue", "view", *gh_issue_args(issue_ref), "--json", "number,title,state,url"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return {"task": None, "error": f"Could not find GitHub issue: {issue_ref}", "existed": False}
+    issue_info = json.loads(result.stdout)
+
+    # Don't create a duplicate if a task is already linked to this issue.
+    for t in data["tasks"]:
+        if t.get("github_issue") == issue_ref:
+            return {"task": t, "error": None, "existed": True}
+
+    task = {
+        "id": uid(),
+        "title": issue_info["title"],
+        "description": "",
+        "role_id": role_id,
+        "status": status,
+        "logs": [],
+        "created_at": time.time(),
+        "github_issue": issue_ref,
+    }
+    if folder_str:
+        task["local_folder"] = folder_str
+
+    # Best-effort current-sprint assignment (network call; don't fail the task).
+    if assign_sprint:
+        try:
+            current_sprint = get_current_sprint(data)
+            if current_sprint:
+                task["sprint"] = current_sprint["title"]
+                task["sprint_id"] = current_sprint["id"]
+        except Exception:
+            pass
+
+    data["tasks"].insert(0, task)
+    return {"task": task, "error": None, "existed": False}
+
+
 def cmd_add_issue(args):
-    """Create a task from a GitHub issue."""
+    """Create a task from an existing GitHub issue (status: To Do)."""
     data = load()
     roles = get_roles(data)
     role_ids = get_role_ids(data)
 
-    # Parse --role flag
+    # Parse flags
     role_id = None
+    local_folder = None
     remaining_args = []
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
             role_id = resolve_role(data, args[i + 1])
+            i += 2
+        elif args[i] == "--folder" and i + 1 < len(args):
+            local_folder = args[i + 1]
             i += 2
         else:
             remaining_args.append(args[i])
@@ -3350,7 +3428,7 @@ def cmd_add_issue(args):
 
     if remaining_args:
         # Direct mode: create from URL/ref (normalize handles bare numbers)
-        issue_ref = normalize_issue_ref(remaining_args[0], data)
+        issue_ref = remaining_args[0]
     else:
         # Interactive mode: list assigned issues
         repo = data.get("config", {}).get("github_repo")
@@ -3432,51 +3510,32 @@ def cmd_add_issue(args):
             else:
                 role_id = "other"
 
-    # Fetch issue details
-    result = subprocess.run(
-        ["gh", "issue", "view", *gh_issue_args(issue_ref), "--json", "number,title,state,url"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(c(f"Could not find GitHub issue: {issue_ref}", "red"))
-        print(c("  Make sure the issue exists and you have access.", "dim"))
-        sys.exit(1)
-
-    issue_info = json.loads(result.stdout)
-
-    # Map GitHub state to task status
-    # OPEN -> inprogress (user is working on it), CLOSED -> done
-    gh_state = issue_info.get("state", "OPEN").upper()
-    status = "done" if gh_state == "CLOSED" else "inprogress"
-
-    # Check if task already exists for this issue
-    for t in data["tasks"]:
-        if t.get("github_issue") == issue_ref:
-            print(c(f"Task already exists for {issue_ref}:", "yellow"))
-            print(f"  {t['title']} (id: {t['id']})")
-            sys.exit(0)
-
     # Default to 'other' if no role specified
     if role_id is None:
         role_id = "other"
 
-    task = {
-        "id": uid(),
-        "title": issue_info["title"],
-        "description": "",
-        "role_id": role_id,
-        "status": status,
-        "logs": [],
-        "created_at": time.time(),
-        "github_issue": issue_ref,
-    }
-    data["tasks"].insert(0, task)
-    save(data)
+    # Create the task (status: To Do) linked to the existing issue.
+    res = create_task_from_issue(
+        data, issue_ref, role_id=role_id, local_folder=local_folder, status="todo"
+    )
+    if res["error"]:
+        print(c(res["error"], "red"))
+        print(c("  Make sure the issue exists and you have access.", "dim"))
+        sys.exit(1)
+    if res["existed"]:
+        t = res["task"]
+        print(c("Task already exists for this issue:", "yellow"))
+        print(f"  {t['title']} (id: {t['id']})")
+        sys.exit(0)
 
+    save(data)
+    task = res["task"]
     print(c(f"✓ Created: {task['title']}", "green"))
-    print(f"  [{roles.get(role_id, role_id)}] [{STATUS_LABELS.get(status, status)}]")
+    print(f"  [{roles.get(role_id, role_id)}] [{STATUS_LABELS.get(task['status'], task['status'])}]")
     print(c(f"  id: {task['id']}", "dim"))
-    print(c(f"  GitHub: {issue_ref}", "cyan"))
+    print(c(f"  GitHub: {task['github_issue']}", "cyan"))
+    if task.get("local_folder"):
+        print(c(f"  Folder: {task['local_folder']}", "dim"))
 
 
 def _cli_tab_cleanup_prompt(unrelated_tabs):

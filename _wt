@@ -95,6 +95,13 @@ for t in data.get('tasks', []):
                 '--sprint[Sprint]:sprint:(none)' \
                 '--create-issue[Also create a linked GitHub issue]'
             ;;
+        add-issue)
+            local -a roles
+            roles=("${(@f)$(_wt_get_roles)}")
+            _arguments \
+                "--role[Role]:role:(${roles[*]})" \
+                '--folder[Local folder path]:folder:_files -/'
+            ;;
         list|ls)
             local -a roles
             roles=("${(@f)$(_wt_get_roles)}")
