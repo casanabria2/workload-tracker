@@ -51,8 +51,8 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 > synced copy. If `ls` works but the file is still empty, it's a dataless iCloud
 > placeholder — force a download with `brctl download ~/WorkloadTracker/.workload_tracker.json`.
 
-- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`, or `null`), `GET /tasks` (non-done, non-shadow picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the browser; the TUI `t`-key start still focuses Arc. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs, presence, config, calendar, report, sprint, set-sprint, split-sprint.
+- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done, non-shadow picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still focuses Arc. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, split-sprint.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
@@ -189,6 +189,64 @@ Key classes in `iterm_manager.py`:
 - `TmuxManager` — Create/kill tmux sessions with 3-pane layout (uses `main-horizontal`)
 - `ItermAppleScript` — Open iTerm2 windows via AppleScript, position with Hammerspoon
 - `TaskTerminalManager` — Main orchestrator, manages folders and sessions
+
+### Task Browser Windows (Safari)
+
+Each task remembers an ordered list of browser tab URLs and opens them in a
+**dedicated Safari window** (one OS window per task) while its timer runs.
+Implemented in `browser_window.py` (`SafariWindowManager`). **Arc is
+intentionally not used for this feature** (Arc remains only for the legacy
+on-stop tab-cleanup path gated by `tab_cleanup_enabled`).
+
+**Data model (per task, optional/back-compatible — read via `task.get(...)`):**
+- `tabs: list[str]` — ordered tab URLs.
+- `active_window_id: int | None` — Safari window id while the window is open.
+
+**Behavior:**
+- **Timer start** (CLI `wt start`, TUI `t`, HTTP bridge `POST /timer/start` and
+  `/timer/toggle` — i.e. the Stream Deck / menu-bar monitor; MCP `start_timer`
+  not wired): opens (or focuses) the task's window from its saved `tabs`. A start
+  with no saved tabs is a no-op. (Unlike the Arc-space focus, a bridge-initiated
+  start *does* open the Safari window — `_bridge_start_timer` /
+  `_bridge_toggle_timer` call `_browser_on_task_started`.)
+- **Timer stop** (CLI `wt stop`, TUI): snapshots the window's current tabs back
+  into `tabs`, then closes the window and clears `active_window_id`.
+- **Task switch**: the prior task's tabs are snapshotted + its window closed,
+  then the new task's window opens. Shared helper `_browser_switch()` in `wt.py`;
+  `_browser_on_task_started()` / `_browser_on_task_stopped()` in `tracker.py`.
+- All browser calls run inline and are wrapped in try/except + `ImportError`
+  guards — a missing module or a gone/zombie window never aborts the timer flow.
+
+**CLI:** `wt tabs save|open|list|clear|close [task]` (task arg defaults to the
+active-timer task). **TUI:** `w` snapshots the current Safari window into the
+selected/active task. **MCP:** `save_task_tabs`, `open_task_window`,
+`list_task_tabs`, `clear_task_tabs`.
+
+**macOS Automation permission:** first run triggers a one-time prompt (System
+Settings → Privacy & Security → Automation). This feature uses only direct
+Safari scripting (no System Events), so the Automation grant suffices — no
+Accessibility grant is needed.
+
+**Corrected Safari window/tab template** (the original spec template was wrong —
+Safari raises `-10024` if you `make new tab` in the *document*; tabs must be made
+in the *window*):
+```applescript
+tell application "Safari"
+    make new document with properties {URL:"URL_1"}
+    tell front window
+        make new tab with properties {URL:"URL_2"}
+        make new tab with properties {URL:"URL_3"}
+    end tell
+    return id of front window
+end tell
+```
+
+**Known limitation (cosmetic):** closing a Safari window leaves a bounded,
+invisible empty "zombie" window (`visible=false`, `tabs=0`); `saving no` does not
+prevent it. The next `make new document` recycles it, so the count stays ~1, and
+they clear on Safari restart. `window_exists()` therefore treats a window as
+valid only when it exists **and** has `> 0` tabs, and we null `active_window_id`
+on close so a zombie is never re-referenced.
 
 ### Time Log Management
 

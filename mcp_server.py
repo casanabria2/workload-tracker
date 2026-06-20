@@ -408,6 +408,87 @@ def stop_timer() -> str:
 
 
 @mcp.tool()
+def save_task_tabs(task_query: str) -> str:
+    """Snapshot the current Safari window's tabs into a task.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+    try:
+        from browser_window import SafariWindowManager
+    except ImportError as e:
+        return f"Error: {e}"
+    mgr = SafariWindowManager()
+    urls = mgr.snapshot_task_tabs(task)
+    save(data)
+    if urls:
+        return f"Saved {len(urls)} tab(s) to '{task['title']}'"
+    return "No tabs found in the current Safari window."
+
+
+@mcp.tool()
+def open_task_window(task_query: str) -> str:
+    """Open (or focus) the dedicated Safari window for a task.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+    try:
+        from browser_window import SafariWindowManager
+    except ImportError as e:
+        return f"Error: {e}"
+    mgr = SafariWindowManager()
+    window_id = mgr.open_task_window(task)
+    save(data)
+    if window_id is not None:
+        return f"Opened Safari window for '{task['title']}'"
+    return f"Task '{task['title']}' has no saved tabs. Use save_task_tabs() first."
+
+
+@mcp.tool()
+def list_task_tabs(task_query: str) -> str:
+    """List the saved tab URLs for a task.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+    tabs = task.get("tabs") or []
+    if not tabs:
+        return f"No saved tabs for '{task['title']}'"
+    lines = [f"Tabs for '{task['title']}':"]
+    lines.extend(f"  - {url}" for url in tabs)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def clear_task_tabs(task_query: str) -> str:
+    """Clear the saved tab URLs for a task.
+
+    Args:
+        task_query: Task ID or partial title
+    """
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+    task["tabs"] = []
+    save(data)
+    return f"Cleared saved tabs for '{task['title']}'"
+
+
+@mcp.tool()
 def log_time(task_query: str, minutes: float, note: str = "Manual entry") -> str:
     """Log time to a task manually.
 

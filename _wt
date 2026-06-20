@@ -322,7 +322,7 @@ for t in data.get('tasks', []):
         tabs)
             if (( CURRENT == 3 )); then
                 local -a subcommands
-                subcommands=('list:List tabs in current task folder' 'cleanup:Clean up unrelated tabs' 'restore:Restore archived tabs')
+                subcommands=('save:Snapshot current Safari window into task' 'open:Open or focus the task window' 'list:List saved tab URLs' 'clear:Clear saved tabs' 'close:Snapshot then close the task window')
                 _describe -t subcommands 'tabs subcommand' subcommands
             fi
             ;;

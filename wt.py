@@ -85,6 +85,7 @@ Tasks linked to GitHub issues use the issue for notes instead.
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -2353,6 +2354,41 @@ def cmd_list(args):
     print()
 
 
+def _browser_switch(data, prev_task, new_task):
+    """Snapshot+close the previous task's Safari window, open the new task's.
+
+    Wrapped so a missing module or a gone/zombie window never aborts the timer
+    flow. Mutates ``active_window_id`` on the affected tasks; the caller saves.
+    Returns True if any task's window id changed.
+    """
+    changed = False
+    try:
+        from browser_window import SafariWindowManager
+    except ImportError:
+        return False
+
+    mgr = SafariWindowManager()
+
+    if prev_task and prev_task.get("active_window_id") is not None:
+        try:
+            mgr.snapshot_task_tabs(prev_task)
+            mgr.close_window(prev_task["active_window_id"])
+        except Exception as exc:  # noqa: BLE001 - never abort the timer
+            logging.warning("browser snapshot/close failed: %s", exc)
+        prev_task["active_window_id"] = None
+        changed = True
+
+    if new_task and (new_task.get("tabs")):
+        try:
+            window_id = mgr.open_task_window(new_task)
+            if window_id is not None:
+                changed = True
+        except Exception as exc:  # noqa: BLE001 - never abort the timer
+            logging.warning("browser open failed: %s", exc)
+
+    return changed
+
+
 def cmd_start(args):
     if not args:
         print("Usage: wt start <task-id or title>"); sys.exit(1)
@@ -2361,6 +2397,7 @@ def cmd_start(args):
     at = data.get("active_timer")
 
     # Stop current timer
+    prev = None
     if at:
         prev = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
         if prev:
@@ -2378,6 +2415,10 @@ def cmd_start(args):
     data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
     save(data)
     print(c(f"▶  Started: {task['title']}", "green"))
+
+    # Safari window integration: snapshot+close prior task's window, open new one
+    if _browser_switch(data, prev, task):
+        save(data)
 
     # Arc integration: focus the Workload Tracker space
     if data.get("config", {}).get("arc_space_id"):
@@ -2409,6 +2450,10 @@ def cmd_stop(args):
     data["active_timer"] = None
     save(data)
     print(c(f"⏹  Stopped: {task['title'] if task else '?'}  ({fmt_mins(elapsed)})", "yellow"))
+
+    # Safari window integration: snapshot+close the stopped task's window
+    if task and _browser_switch(data, task, None):
+        save(data)
 
     # Arc integration: tab cleanup
     if task and data.get("config", {}).get("tab_cleanup_enabled"):
@@ -4608,100 +4653,90 @@ def cmd_calendar(args):
     print()
 
 
+def _resolve_tabs_task(data, query_args):
+    """Resolve the task for a `wt tabs` subcommand.
+
+    Uses the joined ``query_args`` as a fuzzy query when provided; otherwise
+    falls back to the active-timer task. Returns the task dict or None.
+    """
+    if query_args:
+        return resolve_task(data, " ".join(query_args))
+    at = data.get("active_timer")
+    if not at:
+        return None
+    return next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
+
+
 def cmd_tabs(args):
-    """List or manage tabs for the current task."""
+    """Manage a task's dedicated Safari window of saved tab URLs.
+
+    Subcommands (task arg defaults to the active-timer task):
+        save  [task]  — snapshot the current Safari window into task["tabs"]
+        open  [task]  — open (or focus) the task's window
+        list  [task]  — print the saved tab URLs
+        clear [task]  — empty task["tabs"]
+        close [task]  — snapshot then close the task's window
+    """
     try:
-        from arc_browser import TaskTabManager, ArcAppleScript
+        from browser_window import SafariWindowManager
     except ImportError as e:
         print(c(f"Error: {e}", "red"))
         sys.exit(1)
 
     data = load()
-    at = data.get("active_timer")
-
     subcmd = args[0].lower() if args else "list"
+    query_args = args[1:]
 
-    if subcmd == "list":
-        if not at:
-            print(c("No active timer. Start a task first.", "dim"))
-            return
+    task = _resolve_tabs_task(data, query_args)
+    if not task:
+        print(c("No task specified and no active timer.", "dim"))
+        return
 
-        task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
-        if not task:
-            print(c("Active task not found.", "red"))
-            return
+    mgr = SafariWindowManager()
 
-        folder_id = task.get("arc_folder_id")
-        if not folder_id:
-            print(c(f"Task '{task['title']}' has no Arc folder.", "dim"))
-            return
+    if subcmd == "save":
+        urls = mgr.snapshot_task_tabs(task)
+        save(data)
+        if urls:
+            print(c(f"✓ Saved {len(urls)} tab(s) to '{task['title']}'", "green"))
+        else:
+            print(c("No tabs found in the current Safari window.", "dim"))
 
-        from arc_browser import ArcSidebarManager
-        sidebar = ArcSidebarManager()
-        tabs = sidebar.get_tabs_in_folder(folder_id)
+    elif subcmd == "open":
+        window_id = mgr.open_task_window(task)
+        save(data)
+        if window_id is not None:
+            print(c(f"✓ Opened Safari window for '{task['title']}'", "green"))
+        else:
+            print(c(f"Task '{task['title']}' has no saved tabs. Use 'wt tabs save' first.", "dim"))
 
+    elif subcmd == "list":
+        tabs = task.get("tabs") or []
         if not tabs:
-            print(c(f"No tabs in folder for '{task['title']}'", "dim"))
+            print(c(f"No saved tabs for '{task['title']}'", "dim"))
             return
-
         print(c(f"\n  Tabs for: {task['title']}\n", "bold"))
-        for tab in tabs:
-            print(f"  • {tab['title'][:50]}")
-            print(c(f"    {tab['url'][:60]}", "dim"))
+        for url in tabs:
+            print(f"  • {url}")
         print()
 
-    elif subcmd == "cleanup":
-        if not at:
-            print(c("No active timer. Start a task first.", "dim"))
-            return
+    elif subcmd == "clear":
+        task["tabs"] = []
+        save(data)
+        print(c(f"✓ Cleared saved tabs for '{task['title']}'", "green"))
 
-        task = next((t for t in data["tasks"] if t["id"] == at["task_id"]), None)
-        if not task:
-            print(c("Active task not found.", "red"))
-            return
-
-        manager = TaskTabManager(data)
-        print(f"Analyzing tabs for '{task['title']}'...")
-        result = manager.on_task_stopped(task, prompt_callback=_cli_tab_cleanup_prompt)
-
-        if result.get("error"):
-            print(c(f"Error: {result['error']}", "red"))
-        elif result.get("tabs_closed"):
-            print(c(f"✓ Closed {result['tabs_closed']} tabs", "green"))
-        elif not result.get("unrelated_tabs"):
-            print(c("All tabs appear related to the task.", "green"))
-
-    elif subcmd == "restore":
-        # Restore archived tabs for a task
-        if len(args) < 2:
-            print("Usage: wt tabs restore <task-id or title>")
-            return
-
-        task = resolve_task(data, " ".join(args[1:]))
-        archived = task.get("archived_tabs", [])
-        if not archived:
-            print(c(f"No archived tabs for '{task['title']}'", "dim"))
-            return
-
-        print(c(f"\n  Archived tabs for: {task['title']}\n", "bold"))
-        for i, tab in enumerate(archived, 1):
-            print(f"  {i}. {tab['title'][:50]}")
-            print(c(f"     {tab['url'][:60]}", "dim"))
-
-        try:
-            response = input("\n  Open these tabs? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-
-        if response not in ("n", "no"):
-            applescript = ArcAppleScript()
-            opened = applescript.open_urls([t["url"] for t in archived])
-            print(c(f"✓ Opened {opened} tabs", "green"))
+    elif subcmd == "close":
+        mgr.snapshot_task_tabs(task)
+        window_id = task.get("active_window_id")
+        if window_id is not None:
+            mgr.close_window(window_id)
+        task["active_window_id"] = None
+        save(data)
+        print(c(f"✓ Closed Safari window for '{task['title']}'", "green"))
 
     else:
         print(c(f"Unknown tabs subcommand: {subcmd}", "red"))
-        print("Usage: wt tabs [list|cleanup|restore <task>]")
+        print("Usage: wt tabs [save|open|list|clear|close] [task]")
         sys.exit(1)
 
 
