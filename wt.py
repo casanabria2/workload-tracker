@@ -1809,8 +1809,12 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     config = data.get("config", {})
     if config.get("github_project_number"):
         try:
-            total_mins = task_logged_mins(task)
-            hours = mins_to_quarter_hours(total_mins)
+            # Report only the assigned sprint's hours. A cross-sprint task keeps
+            # all logs locally (source of truth) but its per-sprint hours live on
+            # the shadow tasks' issues; reporting total here would double-count.
+            all_sprints = get_all_sprints(data)
+            sprint_mins = task_logged_mins_for_sprint(task, all_sprints)
+            hours = mins_to_quarter_hours(sprint_mins)
             add_to_project_and_update(task["github_issue"], hours, data)
             result["project_updated"] = True
 
@@ -1822,7 +1826,6 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             # Set sprint from task's stored sprint
             sprint_id = task.get("sprint_id")
             if sprint_id:
-                all_sprints = get_all_sprints(data)
                 field_id = all_sprints[0]["field_id"] if all_sprints else None
                 if field_id:
                     update_project_sprint(task["github_issue"], sprint_id, field_id, data)

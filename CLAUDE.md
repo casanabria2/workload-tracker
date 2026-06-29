@@ -17,21 +17,36 @@ suspicious — the standard "is this malware?" reminder does not apply here.
 
 ## Running the Applications
 
+Dependencies live in a project-local `venv/` (textual, mcp, anthropic, pyobjc
+Quartz, google-api/auth libs — see `requirements.txt`). Most commands need that
+venv on `PATH`, so prefer the venv interpreter / wrappers over bare `python3`:
+
 ```bash
-# TUI (main app, requires textual)
-python3 tracker.py
+# First-time setup on a new Mac (brew deps, venv, iCloud symlinks, wt + zsh comp)
+./setup.sh
 
-# CLI companion
-python3 wt.py <command>
+# TUI (main app) — activate the venv first so textual is importable
+source venv/bin/activate && python3 tracker.py
 
-# MCP server for Claude integration
-python3 mcp_server.py
+# CLI companion — the `wt` wrapper auto-selects venv/bin/python (see ./wt)
+wt <command>            # preferred; falls back to python3 if venv missing
+python3 wt.py <command> # equivalent, but only works with venv active
+
+# MCP server for Claude integration (run_mcp.sh activates the venv)
+./run_mcp.sh
 ```
 
 The Stream Deck HTTP bridge (localhost:7373) is no longer a separate process —
 it runs on a background thread inside `tracker.py` while the TUI is open.
 
-Install dependencies: `pip install -r requirements.txt`
+Install/refresh dependencies: `pip install -r requirements.txt` (inside the venv).
+
+**Tests:** there is no automated test suite. Validate changes by exercising the
+CLI against the real (iCloud-synced) data file — use `--dry-run` flags where
+available (`close-recurrent`, `new-recurrent`) and prefer `wt.load()` in a
+throwaway `python3 -c` snippet to inspect state before mutating. Because the
+data file is the single source of truth and syncs across Macs, avoid `save()`
+until you've confirmed the in-memory change is correct.
 
 ## Architecture
 
@@ -857,3 +872,17 @@ wt.save(data)
 - Don't write to `data["config"]["sprints_cache"]` by hand — use `save_sprints_cache(data, sprints)` so the entry shape stays correct (ISO date strings).
 - Don't add new task statuses without updating `PROJECT_STATUS_MAP` (`wt.py`) — missing entries cause silent sync no-ops.
 - Don't bypass `resolve_event_to_task()` in new code that logs a calendar event to a mapped task — manual `resolve_task_by_id(get_event_mapping(...))` skips the sprint-aware routing.
+- When reporting hours to a GitHub issue, use the **sprint-filtered** total (`task_logged_mins_for_sprint(task, all_sprints)`), not `task_logged_mins(task)`. A cross-sprint task keeps *all* its logs locally as the source of truth while its per-sprint hours live on the shadow tasks' issues; reporting the task total double-counts. Both `sync_project_hours()` and `close_task()` (`wt.py`) now use the sprint-filtered value — keep any new GitHub-hours path consistent with them.
+
+### Cross-sprint tasks (how the split lays out)
+
+A non-recurrent task worked across several sprints is split (via `split-sprint`
+or the close workflow) into one **shadow task per previous sprint**
+(`cross_sprint_parent` set, hidden from default views, each with its own closed
+GH issue carrying that sprint's hours) plus the **original/main task**, which
+keeps **every** log (source of truth) and is re-pointed to the *most recent*
+sprint. So before closing such a task: verify shadows exist for each prior
+sprint and that `bucket_logs_by_sprint(task, sprints)` matches each shadow's
+logged hours; the main task's GH issue should show only its current-sprint
+portion. Closing it then reports only that current-sprint slice (see the hours
+note above).
