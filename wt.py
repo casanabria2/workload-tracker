@@ -1202,6 +1202,16 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
     main_sprint_info = summary[-1]
     previous_sprints = summary[:-1]
 
+    # Idempotency: the main task keeps all its logs (source of truth), so a
+    # re-split would otherwise re-detect the same previous sprints and create
+    # duplicate shadow tasks/issues. Skip any previous sprint that already has
+    # a shadow task for this parent.
+    existing_shadow_sprint_ids = {
+        t.get("sprint_id")
+        for t in data.get("tasks", [])
+        if t.get("cross_sprint_parent") == task["id"]
+    }
+
     repo = get_role_repo(task, data)
     config = data.get("config", {})
     has_project = bool(config.get("github_project_number"))
@@ -1217,6 +1227,17 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
 
     for sprint_info in previous_sprints:
         sprint_label = sprint_info["sprint_title"]
+
+        # Skip sprints that were already split off into a shadow task.
+        if sprint_info["sprint_id"] in existing_shadow_sprint_ids:
+            result["sprint_tasks_created"].append({
+                "sprint": sprint_label,
+                "total_mins": sprint_info["total_mins"],
+                "issue_ref": None,
+                "skipped": "shadow already exists",
+            })
+            continue
+
         shadow_title = f"{task['title']} ({sprint_label})"
         shadow_task = {
             "id": uid(),
@@ -2831,6 +2852,9 @@ def cmd_done(args):
             if result.get("split_performed"):
                 sr = result.get("split_result") or {}
                 for st in sr.get("sprint_tasks_created", []):
+                    if st.get("skipped"):
+                        print(c(f"  Split: {st['sprint']} → skipped ({st['skipped']})", "dim"))
+                        continue
                     issue = st.get("issue_ref") or "no issue"
                     print(c(f"  Split: {st['sprint']} → {fmt_mins(st['total_mins'])} ({issue})", "dim"))
                 if sr.get("main_sprint"):
@@ -4973,13 +4997,32 @@ def cmd_split_sprint(args):
         print(c(f"Task '{task['title']}' only has time in {sprint_name}. No split needed.", "dim"))
         return
 
+    # Sprints already split off into shadow tasks won't be recreated.
+    existing_shadow_sprint_ids = {
+        t.get("sprint_id")
+        for t in data.get("tasks", [])
+        if t.get("cross_sprint_parent") == task["id"]
+    }
+
     # Show breakdown
     print(c(f"\n  Sprint breakdown for: {task['title']}\n", "bold"))
     for s in summary:
-        marker = " ← current" if s == summary[-1] else ""
+        if s == summary[-1]:
+            marker = " ← current"
+        elif s["sprint_id"] in existing_shadow_sprint_ids:
+            marker = " (already split)"
+        else:
+            marker = ""
         print(f"    {s['sprint_title']:<20} {fmt_mins(s['total_mins']):<10} ({len(s['logs'])} logs){marker}")
 
-    print(f"\n  This will create {len(summary) - 1} shadow task(s) for previous sprints.")
+    to_create = sum(
+        1 for s in summary[:-1]
+        if s["sprint_id"] not in existing_shadow_sprint_ids
+    )
+    if to_create == 0:
+        print(c("\n  All previous sprints are already split. Nothing to do.", "dim"))
+        return
+    print(f"\n  This will create {to_create} shadow task(s) for previous sprints.")
     try:
         response = input("  Proceed? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -4994,6 +5037,9 @@ def cmd_split_sprint(args):
     result = split_cross_sprint_task(task, data, save, all_sprints, progress_callback=on_progress)
     if result.get("success"):
         for st in result.get("sprint_tasks_created", []):
+            if st.get("skipped"):
+                print(c(f"  • {st['sprint']}: skipped ({st['skipped']})", "dim"))
+                continue
             issue = st.get("issue_ref", "no issue")
             print(c(f"  ✓ {st['sprint']}: {fmt_mins(st['total_mins'])} → {issue}", "green"))
         print(c(f"  ✓ Main task updated to {result.get('main_sprint', '?')}", "green"))
