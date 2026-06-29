@@ -1772,6 +1772,8 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
         "project_updated": False,
         "skipped_github": False,
         "comment_added": False,
+        "split_performed": False,
+        "split_result": None,
         "error": None
     }
 
@@ -1805,6 +1807,23 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             result["error"] = f"Failed to create issue: {e}"
             return result
 
+    # 2.5. If the task spans multiple sprints, split it first so each sprint's
+    # hours land on their own (shadow) issue. The split re-points this task to
+    # its most recent sprint with only that sprint's hours, which keeps the
+    # project-hours sync below from over-reporting. Shadow tasks (already split,
+    # carry cross_sprint_parent) must never re-split, and recurrent tasks
+    # intentionally span sprints so they are excluded from cross-sprint splitting.
+    all_sprints = get_all_sprints(data)
+    if not task.get("cross_sprint_parent") and task.get("status") != "recurrent":
+        summary = sprint_summary_for_task(task, all_sprints)
+        if len(summary) > 1:
+            split_res = split_cross_sprint_task(task, data, save_callback, all_sprints)
+            result["split_performed"] = True
+            result["split_result"] = split_res
+            if not split_res.get("success"):
+                result["error"] = f"Cross-sprint split failed: {split_res.get('error')}"
+                return result
+
     # 3. Add to project and update fields
     config = data.get("config", {})
     if config.get("github_project_number"):
@@ -1812,7 +1831,6 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             # Report only the assigned sprint's hours. A cross-sprint task keeps
             # all logs locally (source of truth) but its per-sprint hours live on
             # the shadow tasks' issues; reporting total here would double-count.
-            all_sprints = get_all_sprints(data)
             sprint_mins = task_logged_mins_for_sprint(task, all_sprints)
             hours = mins_to_quarter_hours(sprint_mins)
             add_to_project_and_update(task["github_issue"], hours, data)
@@ -2810,6 +2828,13 @@ def cmd_done(args):
         if result["skipped_github"]:
             print(c(f"  (No GitHub integration for this role)", "dim"))
         else:
+            if result.get("split_performed"):
+                sr = result.get("split_result") or {}
+                for st in sr.get("sprint_tasks_created", []):
+                    issue = st.get("issue_ref") or "no issue"
+                    print(c(f"  Split: {st['sprint']} → {fmt_mins(st['total_mins'])} ({issue})", "dim"))
+                if sr.get("main_sprint"):
+                    print(c(f"  Main task kept on {sr['main_sprint']}", "dim"))
             if result["issue_created"]:
                 print(c(f"  Created issue: {task['github_issue']}", "dim"))
             if result.get("comment_added"):
@@ -2817,8 +2842,10 @@ def cmd_done(args):
             if result["issue_closed"]:
                 print(c(f"  Closed issue: {task['github_issue']}", "dim"))
             if result["project_updated"]:
-                hours = round(sum(l.get("minutes", 0) for l in task.get("logs", [])) / 60)
-                print(c(f"  Updated project (Status: Done, Hours: {hours})", "dim"))
+                # Report the sprint-filtered hours actually synced (a cross-sprint
+                # task keeps all logs locally but only reports its current sprint).
+                synced = mins_to_quarter_hours(task_logged_mins_for_sprint(task, get_all_sprints(data)))
+                print(c(f"  Updated project (Status: Done, Hours: {synced})", "dim"))
             elif result.get("error"):
                 print(c(f"  Warning: {result['error']}", "yellow"))
     else:
