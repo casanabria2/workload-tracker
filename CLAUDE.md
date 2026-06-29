@@ -383,9 +383,22 @@ wt roles set-repo testing casanabria2/workload-tracker  # for testing
 2. If the role **has a configured repo**:
    - Task must have a linked GitHub issue
    - If no issue exists, user is prompted to create one (with local notes as body)
+   - **Cross-sprint auto-split**: if the task's logs span more than one sprint,
+     `close_task()` runs `split_cross_sprint_task()` *before* reporting hours, so
+     each prior sprint's hours land on their own shadow issue and only the most
+     recent sprint's hours are reported on the main issue (see "Cross-sprint
+     split workflow" below). Shadow tasks (`cross_sprint_parent` set) and
+     `recurrent` tasks are skipped. A failed split aborts the close (the task is
+     **not** marked done) so hours can't be mis-reported.
    - Issue is added to the configured GitHub project (if configured)
-   - Project item is updated with Status=Done and logged hours
+   - Project item is updated with Status=Done and the **sprint-filtered** hours
+     (`task_logged_mins_for_sprint`), not the task's total
    - **GitHub issue is automatically closed**
+
+   The CLI `wt done` prints the split breakdown (each `Sprint N → Xh (issue)`
+   line plus `Main task kept on Sprint M`) and the sprint-filtered hours synced.
+   `close_task()` returns `split_performed: bool` and `split_result: dict`
+   alongside the existing keys.
 
 **Configuration:**
 
@@ -552,6 +565,12 @@ When a task has logs in multiple sprints (detected via log timestamps):
 2. **Main task**: updated to most recent sprint with only that sprint's hours on GH
 3. Shadow tasks have `cross_sprint_parent` field → hidden from all default views
 4. Original task keeps ALL logs (source of truth)
+
+**Triggers:** the split runs from three places — the explicit `wt split-sprint`
+command, the TUI split action, and **automatically inside `close_task()`** when
+you close a multi-sprint task (see "Close Workflow" above). The close-time split
+skips shadow tasks (`cross_sprint_parent` set) and `recurrent` tasks, and aborts
+the close if the split fails.
 
 **Auto-detection:** TUI checks for cross-sprint tasks on mount and shows a notification.
 
@@ -876,13 +895,18 @@ wt.save(data)
 
 ### Cross-sprint tasks (how the split lays out)
 
-A non-recurrent task worked across several sprints is split (via `split-sprint`
-or the close workflow) into one **shadow task per previous sprint**
-(`cross_sprint_parent` set, hidden from default views, each with its own closed
-GH issue carrying that sprint's hours) plus the **original/main task**, which
-keeps **every** log (source of truth) and is re-pointed to the *most recent*
-sprint. So before closing such a task: verify shadows exist for each prior
-sprint and that `bucket_logs_by_sprint(task, sprints)` matches each shadow's
-logged hours; the main task's GH issue should show only its current-sprint
-portion. Closing it then reports only that current-sprint slice (see the hours
-note above).
+A non-recurrent task worked across several sprints is split (via `split-sprint`,
+the TUI split action, or **automatically when you close it** — see "Close
+Workflow") into one **shadow task per previous sprint** (`cross_sprint_parent`
+set, hidden from default views, each with its own closed GH issue carrying that
+sprint's hours) plus the **original/main task**, which keeps **every** log
+(source of truth) and is re-pointed to the *most recent* sprint.
+
+Because `close_task()` now splits on the fly, you usually just run `wt done
+<task>` and it does the right thing: prior-sprint shadows are created + closed,
+the main issue is re-pointed to the latest sprint with only that sprint's hours,
+and the task is marked done. To audit afterwards, check that
+`bucket_logs_by_sprint(task, sprints)` matches each shadow's logged hours and
+that the main GH issue shows only its current-sprint portion. The split is
+skipped for `recurrent` tasks and already-split shadows, and a split failure
+aborts the close (task stays open) so hours are never mis-reported.
