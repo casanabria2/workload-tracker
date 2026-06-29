@@ -572,6 +572,20 @@ you close a multi-sprint task (see "Close Workflow" above). The close-time split
 skips shadow tasks (`cross_sprint_parent` set) and `recurrent` tasks, and aborts
 the close if the split fails.
 
+**Idempotency:** the main task keeps ALL its logs (step 4), so its
+`sprint_summary_for_task()` still spans multiple sprints *after* a split — a
+naive re-run would re-detect the same previous sprints and create duplicate
+shadow tasks/issues. `split_cross_sprint_task()` guards against this: before the
+per-sprint loop it collects the `sprint_id`s of existing shadows
+(`cross_sprint_parent == task["id"]`) and skips any previous sprint that already
+has one (recording a `{"skipped": "shadow already exists"}` result entry instead
+of creating a duplicate). So both `wt split-sprint` and a second `wt done` are
+safe to re-run; only sprints without a shadow get one, and the main-task
+re-point + hours-sync are no-ops when nothing changed. The `wt split-sprint`
+preview reflects this — already-split sprints are marked `(already split)`, the
+"will create N shadow task(s)" count excludes them, and it short-circuits with
+"All previous sprints are already split. Nothing to do." when none remain.
+
 **Auto-detection:** TUI checks for cross-sprint tasks on mount and shows a notification.
 
 **Key functions in wt.py:**
