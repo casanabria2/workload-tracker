@@ -14,6 +14,25 @@ All snippets assume the repo venv (`source venv/bin/activate`) or the `wt`
 wrapper, and use `wt.load()` / `wt.save()` — the data file is the iCloud-synced
 source of truth, so never `save()` until the in-memory change is verified.
 
+## Gotcha — a running TUI can clobber direct file writes
+
+The TUI holds the whole data file in memory and rewrites it on its own saves —
+including the **background GitHub hours sync that fires seconds after a bridge
+timer stop**. A direct `wt.save()` landing between two TUI saves is silently
+lost (observed live: meeting logs written right after `POST /timer/stop` were
+wiped by the stop's async hours sync). When the TUI is open (bridge answers on
+`curl -s http://localhost:7373/status`):
+
+1. Stop the timer via the bridge (`POST /timer/stop`, empty body — it computes
+   the elapsed time itself), never `wt stop`, so the TUI stays in sync.
+2. Let the stop's background GitHub sync settle (~10s) before any direct
+   `wt.save()`.
+3. After every direct write, re-read the file (`wt.load()`) and verify the
+   change stuck before building on it; re-apply if it was clobbered (the
+   `calendar_event_uid` duplicate guard makes re-applying safe).
+4. Tell Carlos to press `r` in the TUI immediately after the last write, before
+   he touches the TUI again.
+
 ## State: `config.closed_days`
 
 A sorted, deduped list of ISO dates (`"2026-07-22"`) in
@@ -43,9 +62,10 @@ print([d.isoformat() for d in pending])
   mention it to Carlos and offer to include it.
 - Process pending days **oldest first**, one full pass (Steps 1–4) per day.
 - If today is the only pending day, this is the normal single-day flow.
-- If an **active timer** is running while closing *today*, remind Carlos to
-  stop it first (`t` in the TUI / `wt stop`) — running time isn't in `logs[]`
-  yet, so the summary would undercount.
+- If an **active timer** is running while closing *today*, it must be stopped
+  first — running time isn't in `logs[]` yet, so the summary would undercount.
+  With the TUI open, stop it via the bridge (`POST /timer/stop`) after
+  confirming with Carlos; otherwise `wt stop`. See the clobber gotcha above.
 
 ## Step 1 — Day summary (read-only)
 
