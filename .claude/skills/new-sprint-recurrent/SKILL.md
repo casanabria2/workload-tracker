@@ -43,10 +43,11 @@ baseline.
 
 ## What the command does per task
 
-Copies title/description/role from the previous sprint's copy, re-suffixes the
-title to the current sprint, sets `status="recurrent"` + current
+Copies title/description/role plus the per-task GitHub fields
+(`github_repo`/`activity`/`type`) from the previous sprint's copy, re-suffixes
+the title to the current sprint, sets `status="recurrent"` + current
 `sprint`/`sprint_id`, creates a GitHub issue via `create_github_issue()` and
-sets project fields (Status=In Progress, Activity, Sprint, Hours) via
+sets project fields (Status=In Progress, Activity, Type, Sprint, Hours) via
 `setup_issue_in_project()`.
 
 ## Safety / failure modes
@@ -57,7 +58,7 @@ sets project fields (Status=In Progress, Activity, Sprint, Hours) via
   for `get_all_sprints`). Check `gh auth status` and network.
 - `--all-previous` sources every earlier sprint instead of just the previous
   one — only needed after skipping a sprint.
-- Roles without a `github_repo` get a task but no issue (noted per result).
+- Source tasks without a `github_repo` get a new task but no issue (noted per result).
 - If a task is created but its issue step fails, re-running skips the task
   (already exists); link an issue manually with `wt link <task> owner/repo#N`
   or create one via the `new-task-with-issue` flow guidance.

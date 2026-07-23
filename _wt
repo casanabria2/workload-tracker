@@ -13,6 +13,33 @@ except:
 " 2>/dev/null
 }
 
+# Cached GitHub Project option lists (config.project_options_cache).
+# Usage: _wt_get_project_options activity|type
+_wt_get_project_options() {
+    python3 -c "
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+    for o in data.get('config', {}).get('project_options_cache', {}).get(sys.argv[1], []):
+        print(o)
+except:
+    pass
+" "$1" 2>/dev/null
+}
+
+_wt_complete_tasks() {
+    local -a tasks
+    tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    print(t['title'])
+" 2>/dev/null)}")
+    compadd -Q "${tasks[@]}"
+}
+
 _wt() {
     local -a commands
     commands=(
@@ -52,6 +79,9 @@ _wt() {
         'sprint:Show sprint info'
         'set-sprint:Set sprint for a task'
         'split-sprint:Split cross-sprint task'
+        'set-repo:Set GitHub repo for a task'
+        'set-activity:Set GitHub Project activity for a task'
+        'set-type:Set GitHub Project type for a task'
         'report:Show logged time in a date range'
     )
 
@@ -86,14 +116,33 @@ for t in data.get('tasks', []):
             compadd -Q "${tasks[@]}"
             ;;
         add)
-            local -a roles
-            roles=("${(@f)$(_wt_get_roles)}")
-            _arguments \
-                "--role[Role]:role:(${roles[*]})" \
-                '--status[Status]:status:(todo inprogress recurrent done)' \
-                '--desc[Description]:' \
-                '--sprint[Sprint]:sprint:(none)' \
-                '--create-issue[Also create a linked GitHub issue]'
+            # Complete values for the previous flag first (activity/type options
+            # contain spaces, so array-based compadd instead of inline lists).
+            case "${words[CURRENT-1]}" in
+                --activity)
+                    local -a activities
+                    activities=("${(@f)$(_wt_get_project_options activity)}")
+                    compadd -Q "${activities[@]}"
+                    ;;
+                --type)
+                    local -a types
+                    types=("${(@f)$(_wt_get_project_options type)}")
+                    compadd -Q "${types[@]}"
+                    ;;
+                *)
+                    local -a roles
+                    roles=("${(@f)$(_wt_get_roles)}")
+                    _arguments \
+                        "--role[Role]:role:(${roles[*]})" \
+                        '--status[Status]:status:(todo inprogress recurrent done)' \
+                        '--desc[Description]:' \
+                        '--sprint[Sprint]:sprint:(none)' \
+                        '--repo[GitHub repo (owner/repo)]:' \
+                        '--activity[GitHub Project activity]:' \
+                        '--type[GitHub Project type]:' \
+                        '--create-issue[Also create a linked GitHub issue]'
+                    ;;
+            esac
             ;;
         add-issue)
             local -a roles
@@ -117,16 +166,39 @@ for t in data.get('tasks', []):
         roles)
             if (( CURRENT == 3 )); then
                 local -a subcommands
-                subcommands=('add:Add a new role' 'update:Update role label' 'delete:Delete a role' 'set-repo:Set GitHub repo for role' 'set-activity:Set activity for role' 'set-type:Set type for role')
+                subcommands=('add:Add a new role' 'update:Update role label' 'delete:Delete a role')
                 _describe -t subcommands 'roles subcommand' subcommands
             elif (( CURRENT == 4 )); then
                 case "${words[3]}" in
-                    update|delete|del|rm|set-repo|set-activity|set-type)
+                    update|delete|del|rm)
                         local -a roles
                         roles=("${(@f)$(_wt_get_roles)}")
                         compadd "${roles[@]}"
                         ;;
                 esac
+            fi
+            ;;
+        set-repo)
+            if (( CURRENT == 3 )); then
+                _wt_complete_tasks
+            fi
+            ;;
+        set-activity)
+            if (( CURRENT == 3 )); then
+                _wt_complete_tasks
+            elif (( CURRENT == 4 )); then
+                local -a activities
+                activities=("${(@f)$(_wt_get_project_options activity)}")
+                compadd -Q "${activities[@]}"
+            fi
+            ;;
+        set-type)
+            if (( CURRENT == 3 )); then
+                _wt_complete_tasks
+            elif (( CURRENT == 4 )); then
+                local -a types
+                types=("${(@f)$(_wt_get_project_options type)}")
+                compadd -Q "${types[@]}"
             fi
             ;;
         calendar|cal)

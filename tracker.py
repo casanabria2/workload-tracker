@@ -49,8 +49,9 @@ from textual.reactive import reactive
 from idle_detector import get_idle_seconds
 from wt import (
     load as wt_load, save as wt_save, resolve_task,
-    get_role_repo, create_github_issue, add_to_project_and_update, close_github_issue, delete_github_issue,
-    sync_project_status, get_role_activity, update_project_activity, get_calendar_events,
+    get_task_repo, create_github_issue, add_to_project_and_update, close_github_issue, delete_github_issue,
+    sync_project_status, get_task_activity, get_task_type, update_project_activity, update_project_type,
+    get_calendar_events,
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
     get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
@@ -59,6 +60,7 @@ from wt import (
     save_sprints_cache, get_sprint_date_range_for_task,
     resolve_event_to_task, strip_sprint_suffix,
     get_event_names_for_base, round_up_to_30,
+    get_project_info, get_cached_project_options, _migrate_role_github_fields,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -106,6 +108,10 @@ def load_data() -> dict:
     data.setdefault("active_timer", None)
     if "roles" not in data:
         data["roles"] = [r.copy() for r in DEFAULT_ROLES]
+    # Move role github fields onto tasks (idempotent). Persist with a direct
+    # write — save_data() would resurrect the stripped role fields from disk.
+    if _migrate_role_github_fields(data):
+        DATA_FILE.write_text(json.dumps(data, indent=2))
     return data
 
 
@@ -194,11 +200,14 @@ class TaskModal(ModalScreen):
     #modal-actions { margin-top: 1; }
     """
 
-    def __init__(self, task_data: Optional[dict] = None, roles: Optional[list] = None, sprints: Optional[list] = None):
+    def __init__(self, task_data: Optional[dict] = None, roles: Optional[list] = None, sprints: Optional[list] = None,
+                 options: Optional[dict] = None):
         super().__init__()
         self._task_data = task_data
         self._roles = roles or []
         self._sprints = sprints or []
+        # Cached GitHub Project option lists: {"activity": [...], "type": [...]}
+        self._options = options or {}
         self._is_new = task_data is None
 
     def compose(self) -> ComposeResult:
@@ -237,6 +246,19 @@ class TaskModal(ModalScreen):
         # Select widget doesn't raise InvalidSelectValueError on mount.
         if default_sprint and not any(opt[1] == default_sprint for opt in sprint_options):
             default_sprint = ""
+
+        # GitHub Project Activity/Type selects from the cached option lists.
+        # A stored value missing from the cache is injected so the Select
+        # doesn't raise InvalidSelectValueError (same pattern as sprints).
+        def _option_select(key: str) -> tuple[list, str]:
+            opts = [("(none)", "")] + [(o, o) for o in self._options.get(key, [])]
+            current = t.get(key, "") or ""
+            if current and not any(v == current for _, v in opts):
+                opts.insert(1, (current, current))
+            return opts, current
+
+        activity_options, default_activity = _option_select("activity")
+        type_options, default_type = _option_select("type")
         with Container(id="modal-box"):
             yield Label("Edit task" if self._task_data else "New task")
             yield Input(value=t.get("title", ""), placeholder="Task title...", id="inp-title")
@@ -245,6 +267,9 @@ class TaskModal(ModalScreen):
             yield Select(status_options, value=t.get("status", "todo"), id="sel-status", prompt="Select status")
             yield Select(sprint_options, value=default_sprint, id="sel-sprint", prompt="Select sprint")
             yield Input(value=t.get("local_folder", ""), placeholder="Local folder path (optional, e.g., ~/dev/myproject)", id="inp-local-folder")
+            yield Input(value=t.get("github_repo", ""), placeholder="GitHub repo (owner/repo, optional)", id="inp-repo")
+            yield Select(activity_options, value=default_activity, id="sel-activity", prompt="Select activity")
+            yield Select(type_options, value=default_type, id="sel-type", prompt="Select type")
             if self._is_new:
                 with Horizontal():
                     yield Switch(value=False, id="chk-github")
@@ -303,9 +328,19 @@ class TaskModal(ModalScreen):
             if sprint:
                 result["sprint"] = sprint["title"]
                 result["sprint_id"] = sprint["id"]
+        # GitHub fields (per task; empty widget value clears the field)
+        github_repo = self.query_one("#inp-repo").value.strip()
+        if github_repo:
+            result["github_repo"] = github_repo
+        activity = self.query_one("#sel-activity").value
+        if activity:
+            result["activity"] = activity
+        type_val = self.query_one("#sel-type").value
+        if type_val:
+            result["type"] = type_val
         # Preserve additional fields from existing task
         if self._task_data:
-            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid", "sprint", "sprint_id"):
+            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid", "sprint", "sprint_id", "tabs", "active_window_id", "cross_sprint_parent"):
                 if key in self._task_data and key not in result:
                     result[key] = self._task_data[key]
             # Track if title changed for GitHub issue update
@@ -731,7 +766,7 @@ class ConfirmCloseNoGitHubModal(ModalScreen):
             yield Label(f"[bold]Logged:[/] {fmt_mins(self._logged_mins)}")
             yield Label("")
             yield Label("[yellow]No GitHub issue linked.[/]")
-            yield Label("[yellow]No repo configured for this role.[/]")
+            yield Label("[yellow]No repo set on this task.[/]")
             yield Label("[dim]Time will only be recorded locally.[/]")
             yield Label("")
             with Horizontal(id="close-no-gh-actions"):
@@ -2944,6 +2979,16 @@ class WorkloadTracker(App):
             # can resolve sprint ranges without waiting for a GitHub round-trip.
             if sprints:
                 save_sprints_cache(self._data, sprints)
+
+            # Refresh the Activity/Type option lists for the task edit modal
+            # (get_project_info writes config.project_options_cache in memory).
+            if self._data.get("config", {}).get("github_project_number"):
+                try:
+                    get_project_info(self._data)
+                except Exception:
+                    pass
+
+            if sprints or self._data.get("config", {}).get("project_options_cache"):
                 save_data(self._data)
 
             # Auto-detect cross-sprint tasks
@@ -3344,7 +3389,8 @@ class WorkloadTracker(App):
 
     def action_new_task(self):
         roles = get_roles(self._data)
-        self.push_screen(TaskModal(roles=roles, sprints=self._sprints_cache), self._on_task_saved)
+        self.push_screen(TaskModal(roles=roles, sprints=self._sprints_cache,
+                                   options=get_cached_project_options(self._data)), self._on_task_saved)
 
     def action_add_issue_task(self):
         """Create a new To Do task from an existing GitHub issue."""
@@ -3466,7 +3512,8 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if task:
             roles = get_roles(self._data)
-            self.push_screen(TaskModal(task_data=task, roles=roles, sprints=self._sprints_cache), self._on_task_saved)
+            self.push_screen(TaskModal(task_data=task, roles=roles, sprints=self._sprints_cache,
+                                       options=get_cached_project_options(self._data)), self._on_task_saved)
 
     def _on_task_saved(self, result: Optional[dict]):
         if not result:
@@ -3529,10 +3576,10 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _create_github_issue_for_task(self, task: dict, refresh_ui: bool = False):
         """Create GitHub issue for a task and set up project fields in background thread."""
-        repo = get_role_repo(task, self._data)
+        repo = get_task_repo(task)
         if not repo:
             self.call_from_thread(
-                self.notify, "No GitHub repo configured for this role", severity="warning"
+                self.notify, "No GitHub repo set on this task (edit with 'e')", severity="warning"
             )
             return
         self.call_from_thread(self._bg_start, "Creating GitHub issue")
@@ -3578,13 +3625,13 @@ class WorkloadTracker(App):
             self._sync_existing_issue(task)
             return
 
-        repo = get_role_repo(task, self._data)
+        repo = get_task_repo(task)
         if not repo:
-            self.notify("No GitHub repo configured for this role", severity="warning")
+            self.notify("No GitHub repo set on this task (edit with 'e')", severity="warning")
             return
         # Show modal with project field preview
         logged_mins = task_logged_mins(task)
-        activity = get_role_activity(task, self._data)
+        activity = get_task_activity(task)
         sprint = get_current_sprint(self._data)
         sprint_title = sprint["title"] if sprint else None
         status = task.get("status", "todo")
@@ -3596,7 +3643,7 @@ class WorkloadTracker(App):
     def _sync_existing_issue(self, task: dict):
         """Sync project fields for an existing GitHub issue."""
         logged_mins = task_logged_mins(task)
-        activity = get_role_activity(task, self._data)
+        activity = get_task_activity(task)
         sprint = get_current_sprint(self._data)
         sprint_title = sprint["title"] if sprint else None
         status = task.get("status", "todo")
@@ -4074,19 +4121,19 @@ class WorkloadTracker(App):
 
     def _close_task_with_workflow(self, task: dict):
         """Handle the task closing workflow with GitHub integration."""
-        # Check if role has a GitHub repo
-        repo = get_role_repo(task, self._data)
+        # Check if the task has a GitHub repo
+        repo = get_task_repo(task)
 
         # If task already has a GitHub issue, always show confirmation and update project
         if task.get("github_issue"):
             self._fetch_gh_hours_and_confirm_close(task)
             return
 
-        # Task has no GitHub issue - check if role has a repo to create one
+        # Task has no GitHub issue - check if it has a repo to create one
         if repo:
             # Prompt to create issue with project field preview
             logged_mins = task_logged_mins(task)
-            activity = get_role_activity(task, self._data)
+            activity = get_task_activity(task)
             sprint = get_current_sprint(self._data)
             sprint_title = sprint["title"] if sprint else None
             self.push_screen(
@@ -4147,7 +4194,7 @@ class WorkloadTracker(App):
     def _on_create_issue_for_close(self, task: dict, repo: str, confirmed: bool):
         """Handle response from create issue modal during close workflow."""
         if not confirmed:
-            self.notify("Task must have GitHub issue to close (role requires it)", severity="warning")
+            self.notify("Task must have GitHub issue to close (task has a repo configured)", severity="warning")
             return
 
         # Run blocking GitHub operations in a worker thread
@@ -4156,7 +4203,7 @@ class WorkloadTracker(App):
     def _on_create_issue_response(self, task: dict, repo: str, create: bool):
         """Handle response from create issue modal."""
         if not create:
-            self.notify("Task must have GitHub issue to close (role requires it)", severity="warning")
+            self.notify("Task must have GitHub issue to close (task has a repo configured)", severity="warning")
             return
 
         # Run blocking GitHub operations in a worker thread
@@ -4196,10 +4243,15 @@ class WorkloadTracker(App):
                     mark_logs_uploaded(task)
                     save_data(self._data)
 
-                    # Set activity if role has one configured
-                    activity = get_role_activity(task, self._data)
+                    # Set activity if the task has one
+                    activity = get_task_activity(task)
                     if activity:
                         update_project_activity(task["github_issue"], activity, self._data)
+
+                    # Set type if the task has one
+                    type_val = get_task_type(task)
+                    if type_val:
+                        update_project_type(task["github_issue"], type_val, self._data)
 
                     # Set sprint from task's stored sprint
                     sprint_id = task.get("sprint_id")

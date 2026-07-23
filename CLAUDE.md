@@ -67,19 +67,21 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 > placeholder — force a download with `brctl download ~/WorkloadTracker/.workload_tracker.json`.
 
 - **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done, non-shadow picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still focuses Arc. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, split-sprint.
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, split-sprint, set-repo, set-activity, set-type.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_role_repo, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
 ### Data Model
 
 Plain JSON with three top-level keys:
-- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `calendar_event_uid`, `sprint`, `sprint_id`, `cross_sprint_parent`
+- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `github_repo`, `activity`, `type`, `calendar_event_uid`, `sprint`, `sprint_id`, `cross_sprint_parent`
 - `active_timer` — `{task_id, started_at}` or null
-- `roles[]` — Each role has: id, label, color, and optionally `github_repo`. Roles are user-configurable via `wt roles` commands.
+- `roles[]` — Each role has: id, label, color. Roles are pure categorization, user-configurable via `wt roles` commands. GitHub repo/activity/type are **per-task** fields (`wt set-repo/set-activity/set-type <task> ...`), not role fields.
 - `config.sprints_cache[]` — Persisted list of `{id, title, start_date, end_date, field_id}` written by `save_sprints_cache()` after the TUI fetches sprints from GitHub. Used by `get_sprint_date_range_for_task()` to avoid network calls (e.g. for the calendar modal's default range).
+- `config.project_options_cache` — `{"activity": [...], "type": [...]}` — the GitHub Project's Activity/Type option names, written by `save_project_options_cache()` whenever `get_project_info()` fetches project fields (persisted on the caller's next `save()`). The TUI edit modal's Activity/Type Selects and CLI/MCP validation read it via `get_cached_project_options()`.
+- `config.role_fields_migrated_to_tasks` — one-time flag set by `_migrate_role_github_fields()` (runs on every `load()`), which copied the legacy role-level `github_repo`/`activity`/`type` onto tasks and now strips those keys from roles on sight. The copy step never re-runs, so role fields re-introduced by an old wt.py on another Mac are just stripped, never re-copied.
 
 Time tracking: `logs[]` array of log entries. Timer sessions auto-commit as log entries when stopped.
 
@@ -122,7 +124,7 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 
 ### Domain Constants
 
-- **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`. Current roles also include `testing` (`casanabria2/workload-tracker`), `iron infusion` (label `iron`, `grafana/field-eng`, activity `Iron Infusion`), `appenv-deployment` (label `Managing AppEnv Deployments`, color `red`, `grafana/field-eng-appenv-deployment`, activity `AppEnv`), and `brokkr` (label `Brokkr`, color `cyan`, `grafana/brokkr`, activity `Brokkr`). Note `wt roles add` always seeds `color: white`; there's no `set-color` subcommand, so non-default colors are set directly via `wt.load()`/`save()`.
+- **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`. Current roles also include `testing`, `iron infusion` (label `iron`), `appenv-deployment` (label `Managing AppEnv Deployments`, color `red`), and `brokkr` (label `Brokkr`, color `cyan`). Roles carry **no** GitHub configuration — repo/activity/type live on each task (the historical role values were migrated onto their tasks by `_migrate_role_github_fields`). Note `wt roles add` always seeds `color: white`; there's no `set-color` subcommand, so non-default colors are set directly via `wt.load()`/`save()`.
 - **Statuses**: `todo`, `inprogress`, `recurrent`, `done`
 - Done tasks are hidden by default in all list views (CLI, TUI, MCP)
 - `recurrent` is for tasks that intentionally span sprints (e.g. recurring meetings, on-call). They are excluded from cross-sprint split detection.
@@ -363,24 +365,25 @@ This means a single mapping like `Carlos / Ana weekly sync → Ana 1:1 calls - c
 
 ### Task Closing Workflow with GitHub Project Integration
 
-When a task is marked as "done" (via CLI `wt done`, TUI `D` keybinding, or MCP `set_task_status`), a workflow triggers based on the role's GitHub repo configuration:
+When a task is marked as "done" (via CLI `wt done`, TUI `D` keybinding, or MCP `set_task_status`), a workflow triggers based on the **task's** `github_repo` field:
 
-**Role → Repository Mapping:**
+**Per-task GitHub fields:**
 
-Each role can have an optional `github_repo` field:
+Each task can carry an optional `github_repo`, `activity`, and `type` (independent of its role):
 
 ```bash
-wt roles set-repo demokit grafana/field-eng-demo-kit
-wt roles set-repo demos grafana/field-eng
-wt roles set-repo strategic grafana/field-eng
-wt roles set-repo testing casanabria2/workload-tracker  # for testing
-# "other" role has no repo (skips GitHub integration)
+wt set-repo "My task" grafana/field-eng-demo-kit   # owner/repo; omit value to clear
+wt set-activity "My task" "Demo Kit Maintenance"   # validated against project_options_cache
+wt set-type "My task" "Feature"                    # validated against project_options_cache
+# Tasks without a repo skip GitHub integration entirely
 ```
+
+Linking an issue (`wt link`, MCP `link_github_issue`, `wt add-issue`, `create_task_from_issue`) auto-sets `github_repo` from the issue ref when the task has none.
 
 **Close Workflow:**
 
-1. If the role has **no configured repo**: Task is simply marked as done (no GitHub integration)
-2. If the role **has a configured repo**:
+1. If the task has **no repo**: Task is simply marked as done (no GitHub integration)
+2. If the task **has a repo**:
    - Task must have a linked GitHub issue
    - If no issue exists, user is prompted to create one (with local notes as body)
    - **Cross-sprint auto-split**: if the task's logs span more than one sprint,
@@ -391,8 +394,9 @@ wt roles set-repo testing casanabria2/workload-tracker  # for testing
      `recurrent` tasks are skipped. A failed split aborts the close (the task is
      **not** marked done) so hours can't be mis-reported.
    - Issue is added to the configured GitHub project (if configured)
-   - Project item is updated with Status=Done and the **sprint-filtered** hours
-     (`task_logged_mins_for_sprint`), not the task's total
+   - Project item is updated with Status=Done, the task's Activity/Type (when
+     set), and the **sprint-filtered** hours (`task_logged_mins_for_sprint`),
+     not the task's total
    - **GitHub issue is automatically closed**
 
    The CLI `wt done` prints the split breakdown (each `Sprint N → Xh (issue)`
@@ -416,9 +420,14 @@ Config values in `~/.workload_tracker.json`:
     "github_project_number": 123
   },
   "roles": [
-    {"id": "demokit", "label": "Managing DemoKit", "color": "blue", "github_repo": "grafana/field-eng-demo-kit"},
-    {"id": "demos", "label": "Demos & Workshops", "color": "green", "github_repo": "grafana/field-eng"},
+    {"id": "demokit", "label": "Managing DemoKit", "color": "blue"},
+    {"id": "demos", "label": "Demos & Workshops", "color": "green"},
     {"id": "other", "label": "Other", "color": "white"}
+  ],
+  "tasks": [
+    {"id": "…", "title": "My task", "role_id": "demokit",
+     "github_repo": "grafana/field-eng-demo-kit",
+     "activity": "Demo Kit Maintenance", "type": "Feature", "...": "..."}
   ]
 }
 ```
@@ -437,9 +446,11 @@ set_task_status("My task", "done")
 # Close and auto-create issue if missing
 set_task_status("My task", "done", create_issue=True)
 
-# Configure role repos
-set_role_repo("demokit", "grafana/field-eng-demo-kit")
-set_role_repo("other")  # Clear repo (disables GitHub integration for role)
+# Configure per-task GitHub fields
+set_task_repo("My task", "grafana/field-eng-demo-kit")
+set_task_repo("My task")  # Clear repo (disables GitHub integration for the task)
+set_task_activity("My task", "Demo Kit Maintenance")
+set_task_type("My task", "Feature")
 ```
 
 ### Bulk-closing recurrent tasks from previous sprints
@@ -520,8 +531,9 @@ suffix are copied verbatim.
   trailing-qualifier drift (e.g. `Ad-hoc Slack Questions - casanabria` in the
   previous sprint vs `Ad-hoc Slack Questions` in the current one).
 - Aborts (empty result) if the current sprint can't be resolved.
-- Roles without a `github_repo` (e.g. `other`) still get a task created, but the
-  GitHub issue step is skipped and noted per result.
+- Source tasks without a `github_repo` still get a new task created, but the
+  GitHub issue step is skipped and noted per result. New copies inherit the
+  source task's `github_repo`/`activity`/`type`.
 
 **CLI:**
 ```bash
@@ -531,7 +543,7 @@ wt new-recurrent --dry-run       # preview; combine with --all-previous
 ```
 
 **Key functions in wt.py:**
-- `find_recurrent_tasks_to_recreate(data, all_previous=False) -> list[dict]` — planning/selection (suffix-or-recurrent detection, dedup, current-sprint skip); returns plan dicts `{source, new_title, role_id, description}`.
+- `find_recurrent_tasks_to_recreate(data, all_previous=False) -> list[dict]` — planning/selection (suffix-or-recurrent detection, dedup, current-sprint skip); returns plan dicts `{source, new_title, role_id, description}` plus the source's `github_repo`/`activity`/`type` when set.
 - `_same_recurrent_series(a, b) -> bool` — prefix-boundary helper used for drift-tolerant current-sprint dedup.
 - `create_current_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — creates each task + issue; returns `{error, current_sprint, results: [{title, role, issue, created, issue_created, project_updated, skipped_github, error}]}`.
 
@@ -758,16 +770,19 @@ Authoritative signatures (use these instead of guessing — see live values via 
 
 **GitHub integration** (the signature footguns)
 - `create_github_issue(task: dict, repo: str) -> str` — **NOT** `(title, body, repo)`; body is read from `notes_path(task["id"])`
-- `setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict` — adds to project, sets Status/Activity/Sprint/Hours
+- `setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict` — adds to project, sets Status/Activity/Type/Sprint/Hours (Activity/Type read from the task)
 - `add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict`
 - `sync_project_status(issue_ref, status, data, project_info=None, item_id=None) -> bool` — silently no-ops for statuses missing from `PROJECT_STATUS_MAP`
 - `sync_project_hours(issue_ref, task, data, save_callback=None) -> bool`
 - `update_project_activity(issue_ref, activity, data, project_info=None, item_id=None) -> bool`
+- `update_project_type(issue_ref, type_val, data, project_info=None, item_id=None) -> bool`
 - `get_project_hours(issue_ref, data) -> float | None`
 - `close_github_issue(issue_ref) -> bool`
 - `delete_github_issue(issue_ref) -> bool`
-- `get_role_repo(task, data) -> str | None`
-- `get_role_activity(task, data) -> str | None`
+- `get_task_repo(task) -> str | None` — reads `task["github_repo"]` (single-arg; roles carry no GitHub fields anymore)
+- `get_task_activity(task) -> str | None` / `get_task_type(task) -> str | None`
+- `save_project_options_cache(data, project_info) -> None` — caller must `save(data)`; invoked automatically by `get_project_info()`
+- `get_cached_project_options(data) -> dict` — `{"activity": [...], "type": [...]}` or `{}`
 
 **Sprints**
 - `get_all_sprints(data) -> list[dict]` — network call each time; entries have `id, title, start_date, end_date, field_id`
@@ -798,18 +813,22 @@ Authoritative signatures (use these instead of guessing — see live values via 
 
 Use the `--create-issue` flag on `wt add`. The CLI creates the task, opens
 the issue via `gh`, and adds it to the configured GitHub Project with
-Status/Activity/Sprint/Hours all set. **Do not** shell out to `gh issue
+Status/Activity/Type/Sprint/Hours all set. **Do not** shell out to `gh issue
 create` or write ad-hoc Python — the flag is the supported entry point and
-matches the TUI's behaviour. The role must have a `github_repo` configured
-(set via `wt roles set-repo <role> owner/repo`); the CLI fails fast otherwise.
+matches the TUI's behaviour. `--create-issue` requires `--repo owner/repo`
+(the repo is stored on the task); the CLI fails fast otherwise. Optional
+`--activity` / `--type` set the GitHub Project fields (validated against
+`config.project_options_cache` when populated).
 
 ```bash
 # Standard case (auto-assigns to current sprint)
-python3 wt.py add "Refactor login flow" --role demokit --create-issue
+python3 wt.py add "Refactor login flow" --role demokit \
+    --repo grafana/field-eng-demo-kit --activity "Demo Kit Maintenance" --create-issue
 
 # Sprint-suffixed recurrent task (the Ana 1:1 backfill pattern)
 python3 wt.py add "Ana 1:1 calls - casanabria - Sprint 95" \
-    --role other --status recurrent --sprint "Sprint 95" --create-issue
+    --role other --status recurrent --sprint "Sprint 95" \
+    --repo grafana/field-eng --create-issue
 ```
 
 For multi-sprint backfills, loop in shell (don't parallelize — the JSON file
@@ -818,7 +837,8 @@ is read-modify-written each invocation):
 ```bash
 for s in "Sprint 95" "Sprint 96" "Sprint 97"; do
     python3 wt.py add "Ana 1:1 calls - casanabria - $s" \
-        --role other --status recurrent --sprint "$s" --create-issue
+        --role other --status recurrent --sprint "$s" \
+        --repo grafana/field-eng --create-issue
 done
 ```
 

@@ -4,7 +4,8 @@ wt — Workload Tracker CLI
 Quick command-line interface to manage tasks without launching the full TUI.
 
 Usage:
-    wt add "Task title" --role strategic --status inprogress [--sprint NN] [--create-issue]
+    wt add "Task title" --role strategic --status inprogress [--sprint NN]
+                        [--repo owner/repo] [--activity ACT] [--type TYPE] [--create-issue]
     wt list [--role strategic] [--all]
     wt start <task-id or partial title>
     wt stop
@@ -54,9 +55,10 @@ Usage:
     wt roles add <id> <label>         — Add a new role
     wt roles update <id> <label>      — Update role label
     wt roles delete <id>              — Delete a role
-    wt roles set-repo <id> [repo]     — Set/clear GitHub repo for a role
-    wt roles set-activity <id> [act]  — Set/clear GitHub Project activity for a role
-    wt roles set-type <id> [type]     — Set/clear GitHub Project type for a role
+
+    wt set-repo <task> [repo]         — Set/clear GitHub repo for a task
+    wt set-activity <task> [act]      — Set/clear GitHub Project activity for a task
+    wt set-type <task> [type]         — Set/clear GitHub Project type for a task
 
     wt calendar                  — List events from yesterday & today
     wt calendar <days>           — List events from last N days
@@ -136,7 +138,11 @@ def load() -> dict:
         data["roles"] = DEFAULT_ROLES.copy()
     # One-time migration of legacy calendar_event_mappings values
     # (task_id -> base name). Idempotent on subsequent runs.
-    if _migrate_calendar_mappings(data):
+    mutated = _migrate_calendar_mappings(data)
+    # Move github_repo/activity/type from roles onto tasks (one-time copy,
+    # roles stripped on every load). Idempotent on subsequent runs.
+    mutated = _migrate_role_github_fields(data) or mutated
+    if mutated:
         save(data)
     return data
 
@@ -289,6 +295,49 @@ def _migrate_calendar_mappings(data: dict) -> bool:
             # Orphan id (source task deleted) — drop the mapping.
             del mappings[event_title]
             mutated = True
+    return mutated
+
+
+# GitHub-related fields that used to live on role dicts and now live on tasks.
+_ROLE_GITHUB_FIELDS = ("github_repo", "activity", "type")
+
+
+def _migrate_role_github_fields(data: dict) -> bool:
+    """Move github_repo/activity/type from role dicts onto tasks.
+
+    Roles used to carry the GitHub repo and the GitHub Project
+    Activity/Type values for all their tasks. These are now per-task
+    fields, so:
+
+      * Copy step (one-time, guarded by
+        ``config["role_fields_migrated_to_tasks"]``): copy each role's
+        fields onto its tasks when the task doesn't already have them.
+        The guard means role fields re-introduced later (e.g. by an old
+        wt.py on another Mac) are never re-copied onto tasks that are
+        intentionally left without a repo/activity.
+      * Strip step (every load): remove the three fields from role dicts.
+
+    Returns True if any mutation occurred. Idempotent on repeat runs.
+    """
+    mutated = False
+    config = data.setdefault("config", {})
+    roles = data.get("roles", [])
+    if not config.get("role_fields_migrated_to_tasks"):
+        role_by_id = {r["id"]: r for r in roles}
+        for task in data.get("tasks", []):
+            role = role_by_id.get(task.get("role_id", "other"))
+            if not role:
+                continue
+            for key in _ROLE_GITHUB_FIELDS:
+                if role.get(key) and key not in task:
+                    task[key] = role[key]
+        config["role_fields_migrated_to_tasks"] = True
+        mutated = True
+    for role in roles:
+        for key in _ROLE_GITHUB_FIELDS:
+            if key in role:
+                del role[key]
+                mutated = True
     return mutated
 
 
@@ -550,8 +599,8 @@ def normalize_issue_ref(issue_ref: str, data: dict, task: dict = None) -> str:
     """Normalize issue reference, using default repo for bare numbers.
 
     Handles:
-      - "262" -> "owner/repo#262" (uses task's role repo, then config github_repo)
-      - "#262" -> "owner/repo#262" (uses task's role repo, then config github_repo)
+      - "262" -> "owner/repo#262" (uses task's repo, then config github_repo)
+      - "#262" -> "owner/repo#262" (uses task's repo, then config github_repo)
       - "owner/repo#262" -> "owner/repo#262"
       - "https://github.com/owner/repo/issues/262" -> "owner/repo#262"
     """
@@ -565,10 +614,10 @@ def normalize_issue_ref(issue_ref: str, data: dict, task: dict = None) -> str:
     # Handle bare number or #number
     bare_match = re.match(r'^#?(\d+)$', issue_ref)
     if bare_match:
-        # Try task's role repo first, then global config
+        # Try task's repo first, then global config
         repo = None
         if task:
-            repo = get_role_repo(task, data)
+            repo = get_task_repo(task)
         if not repo:
             repo = data.get("config", {}).get("github_repo")
         if not repo:
@@ -594,11 +643,19 @@ def gh_issue_args(issue_ref: str) -> list[str]:
 
 # ── GitHub Project Integration ───────────────────────────
 
-def get_role_repo(task: dict, data: dict) -> str | None:
-    """Get the GitHub repo for a task's role. Returns None if not configured."""
-    role_id = task.get("role_id", "other")
-    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
-    return role.get("github_repo") if role else None
+def get_task_repo(task: dict) -> str | None:
+    """Get the GitHub repo for a task. Returns None if not set."""
+    return task.get("github_repo") or None
+
+
+def get_task_activity(task: dict) -> str | None:
+    """Get the GitHub Project activity for a task. Returns None if not set."""
+    return task.get("activity") or None
+
+
+def get_task_type(task: dict) -> str | None:
+    """Get the GitHub Project type for a task. Returns None if not set."""
+    return task.get("type") or None
 
 
 def create_github_issue(task: dict, repo: str) -> str:
@@ -684,6 +741,7 @@ def get_project_info(data: dict) -> dict:
     status_field = fields.get("Status", {})
     hours_field = fields.get("Hours", {})
     activity_field = fields.get("Activity", {})
+    type_field = fields.get("Type", {})
     sprint_field = fields.get("Sprint", {})
 
     if not status_field.get("id"):
@@ -699,17 +757,28 @@ def get_project_info(data: dict) -> dict:
     for opt in activity_field.get("options", []):
         activity_options[opt.get("name")] = opt.get("id")
 
-    return {
+    # Build type options map
+    type_options = {}
+    for opt in type_field.get("options", []):
+        type_options[opt.get("name")] = opt.get("id")
+
+    info = {
         "owner": owner,
         "project_num": project_num,
         "project_id": project_id,
         "status_field": status_field,
         "hours_field": hours_field,
         "activity_field": activity_field,
+        "type_field": type_field,
         "sprint_field": sprint_field,
         "status_options": status_options,
         "activity_options": activity_options,
+        "type_options": type_options,
     }
+    # Refresh the in-memory options cache; persists on the caller's next
+    # save(data) (every flow that fetches project info saves shortly after).
+    save_project_options_cache(data, info)
+    return info
 
 
 def get_all_sprints(data: dict) -> list[dict]:
@@ -857,6 +926,30 @@ def get_cached_sprints(data: dict) -> list[dict]:
         except (KeyError, ValueError):
             continue
     return out
+
+
+def save_project_options_cache(data: dict, project_info: dict) -> None:
+    """Persist the project's Activity/Type option names to config.
+
+    Stores data['config']['project_options_cache'] = {"activity": [...],
+    "type": [...]} preserving GitHub's option order, so the TUI Selects and
+    CLI validation work without a network call. The caller is responsible
+    for invoking save(data) after this (same contract as save_sprints_cache).
+    """
+    cfg = data.setdefault("config", {})
+    cfg["project_options_cache"] = {
+        "activity": list(project_info.get("activity_options", {}).keys()),
+        "type": list(project_info.get("type_options", {}).keys()),
+    }
+
+
+def get_cached_project_options(data: dict) -> dict:
+    """Read the persisted Activity/Type option lists from config.
+
+    Returns {} when the cache is missing; otherwise a dict like
+    {"activity": [...], "type": [...]}.
+    """
+    return data.get("config", {}).get("project_options_cache", {})
 
 
 def get_sprint_date_range_for_task(task: dict | None, data: dict):
@@ -1212,7 +1305,7 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
         if t.get("cross_sprint_parent") == task["id"]
     }
 
-    repo = get_role_repo(task, data)
+    repo = get_task_repo(task)
     config = data.get("config", {})
     has_project = bool(config.get("github_project_number"))
 
@@ -1256,6 +1349,10 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
             "sprint_id": sprint_info["sprint_id"],
             "cross_sprint_parent": task["id"],
         }
+        # Shadow tasks inherit the parent's GitHub fields
+        for key in _ROLE_GITHUB_FIELDS:
+            if task.get(key):
+                shadow_task[key] = task[key]
 
         created_info = {
             "sprint": sprint_label,
@@ -1263,7 +1360,7 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
             "issue_ref": None,
         }
 
-        # Create GH issue if role has a repo
+        # Create GH issue if the task has a repo
         if repo:
             try:
                 progress(f"  {sprint_label}: Creating issue...")
@@ -1290,9 +1387,13 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
                             project_info=pi, item_id=item_id
                         )
 
-                    activity = get_role_activity(task, data)
+                    activity = get_task_activity(task)
                     if activity:
                         update_project_activity(issue_ref, activity, data, project_info=pi, item_id=item_id)
+
+                    type_val = get_task_type(task)
+                    if type_val:
+                        update_project_type(issue_ref, type_val, data, project_info=pi, item_id=item_id)
 
                 # Add comment linking to main task
                 main_issue = task.get("github_issue", "")
@@ -1438,20 +1539,6 @@ def sync_project_status(issue_ref: str, status: str, data: dict,
         return False
 
 
-def get_role_activity(task: dict, data: dict) -> str | None:
-    """Get the GitHub Project activity for a task's role. Returns None if not configured."""
-    role_id = task.get("role_id", "other")
-    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
-    return role.get("activity") if role else None
-
-
-def get_role_type(task: dict, data: dict) -> str | None:
-    """Get the GitHub Project type for a task's role. Returns None if not configured."""
-    role_id = task.get("role_id", "other")
-    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
-    return role.get("type") if role else None
-
-
 def update_project_activity(issue_ref: str, activity: str, data: dict,
                             project_info: dict = None, item_id: str = None) -> bool:
     """Update Activity field for an issue in the project.
@@ -1481,6 +1568,43 @@ def update_project_activity(issue_ref: str, activity: str, data: dict,
             "--project-id", project_info["project_id"],
             "--id", item_id,
             "--field-id", activity_field["id"],
+            "--single-select-option-id", option_id
+        ], capture_output=True, text=True)
+
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def update_project_type(issue_ref: str, type_val: str, data: dict,
+                        project_info: dict = None, item_id: str = None) -> bool:
+    """Update Type field for an issue in the project.
+
+    Returns True on success, False if project not configured or field/option missing.
+    """
+    config = data.get("config", {})
+    if not config.get("github_project_number"):
+        return False
+
+    try:
+        if not project_info:
+            project_info = get_project_info(data)
+        if not item_id:
+            item_id = add_issue_to_project(issue_ref, data)
+
+        type_field = project_info.get("type_field", {})
+        if not type_field.get("id"):
+            return False  # No Type field
+
+        option_id = project_info["type_options"].get(type_val)
+        if not option_id:
+            return False  # Type option not found
+
+        result = subprocess.run([
+            "gh", "project", "item-edit",
+            "--project-id", project_info["project_id"],
+            "--id", item_id,
+            "--field-id", type_field["id"],
             "--single-select-option-id", option_id
         ], capture_output=True, text=True)
 
@@ -1596,12 +1720,12 @@ def get_project_hours(issue_ref: str, data: dict) -> float | None:
 
 
 def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
-    """Add issue to project and set up all fields (Status, Activity, Sprint, Hours).
+    """Add issue to project and set up all fields (Status, Activity, Type, Sprint, Hours).
 
     Args:
         issue_ref: GitHub issue reference (owner/repo#number)
-        task: Task dict with role_id, status, logs
-        data: Full data dict with config and roles
+        task: Task dict with status, logs, and optional activity/type
+        data: Full data dict with config
 
     Returns dict with success status and any errors.
     """
@@ -1623,11 +1747,17 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
         if not sync_project_status(issue_ref, status, data, project_info=pi, item_id=item_id):
             result["errors"].append("Failed to set status")
 
-        # Set activity based on role
-        activity = get_role_activity(task, data)
+        # Set activity from the task
+        activity = get_task_activity(task)
         if activity:
             if not update_project_activity(issue_ref, activity, data, project_info=pi, item_id=item_id):
                 result["errors"].append(f"Failed to set activity: {activity}")
+
+        # Set type from the task
+        type_val = get_task_type(task)
+        if type_val:
+            if not update_project_type(issue_ref, type_val, data, project_info=pi, item_id=item_id):
+                result["errors"].append(f"Failed to set type: {type_val}")
 
         # Set sprint: use task's stored sprint, fall back to current sprint
         sprint_id = task.get("sprint_id")
@@ -1660,10 +1790,10 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
 
 
 def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=None) -> bool:
-    """Sync task to GitHub project - updates Hours, Status, Activity, and Sprint.
+    """Sync task to GitHub project - updates Hours, Status, Activity, Type, and Sprint.
 
     Calculates total logged time, rounds to nearest 0.25 hours, and updates project.
-    Also syncs Status, Activity, and Sprint fields.
+    Also syncs Status, Activity, Type, and Sprint fields.
     Marks logs as uploaded after successful sync.
 
     Returns True on success.
@@ -1682,10 +1812,16 @@ def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=Non
     if not sync_project_status(issue_ref, status, data):
         success = False
 
-    # Sync activity based on role
-    activity = get_role_activity(task, data)
+    # Sync activity from the task
+    activity = get_task_activity(task)
     if activity:
         if not update_project_activity(issue_ref, activity, data):
+            success = False
+
+    # Sync type from the task
+    type_val = get_task_type(task)
+    if type_val:
+        if not update_project_type(issue_ref, type_val, data):
             success = False
 
     # Sync sprint: use task's stored sprint
@@ -1798,11 +1934,11 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
         "error": None
     }
 
-    # 1. Check if role has a GitHub repo
-    repo = get_role_repo(task, data)
+    # 1. Check if the task has a GitHub repo
+    repo = get_task_repo(task)
 
     if not repo:
-        # No GitHub integration for this role - just close
+        # No GitHub integration for this task - just close
         task["status"] = "done"
         save_callback(data)
         result["success"] = True
@@ -1816,7 +1952,7 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
                 f"Task '{task['title']}' has no GitHub issue. Create one in {repo}?"
             )
             if not create:
-                result["error"] = "Task must have GitHub issue to close (role requires it)"
+                result["error"] = "Task must have GitHub issue to close (task has a repo configured)"
                 return result
 
         try:
@@ -1857,8 +1993,8 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             add_to_project_and_update(task["github_issue"], hours, data)
             result["project_updated"] = True
 
-            # Set activity if role has one configured
-            activity = get_role_activity(task, data)
+            # Set activity if the task has one
+            activity = get_task_activity(task)
             if activity:
                 update_project_activity(task["github_issue"], activity, data)
 
@@ -1869,8 +2005,8 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
                 if field_id:
                     update_project_sprint(task["github_issue"], sprint_id, field_id, data)
 
-            # Set type if role has one configured
-            type_val = get_role_type(task, data)
+            # Set type if the task has one
+            type_val = get_task_type(task)
             if type_val:
                 update_project_type(task["github_issue"], type_val, data)
         except Exception as e:
@@ -2120,12 +2256,17 @@ def find_recurrent_tasks_to_recreate(data: dict, all_previous: bool = False) -> 
             new_title = strip_sprint_suffix(src["title"]) + cur_suffix
         else:
             new_title = src["title"]
-        plans.append({
+        plan = {
             "source": src,
             "new_title": new_title,
             "role_id": src.get("role_id", "other"),
             "description": src.get("description", ""),
-        })
+        }
+        # New copies inherit the source task's GitHub fields
+        for key in _ROLE_GITHUB_FIELDS:
+            if src.get(key):
+                plan[key] = src[key]
+        plans.append(plan)
     plans.sort(key=lambda p: p["new_title"].lower())
     return plans
 
@@ -2136,9 +2277,10 @@ def create_current_sprint_recurrent_tasks(data: dict, save_callback, all_previou
     For each plan from ``find_recurrent_tasks_to_recreate`` a new task is created
     with ``status == "recurrent"`` in the current sprint, copying the source's
     title (re-suffixed with the current sprint when it had a ' - Sprint N'
-    suffix), description and role, but with a fresh id, empty logs, and its own
-    GitHub issue. The issue is created when the role has a configured
-    ``github_repo``; otherwise the GitHub steps are skipped (noted per result).
+    suffix), description, role and GitHub fields (github_repo/activity/type),
+    but with a fresh id, empty logs, and its own GitHub issue. The issue is
+    created when the source task has a ``github_repo``; otherwise the GitHub
+    steps are skipped (noted per result).
 
     Returns a summary dict mirroring ``close_previous_sprint_recurrent_tasks``::
 
@@ -2177,13 +2319,16 @@ def create_current_sprint_recurrent_tasks(data: dict, save_callback, all_previou
             "sprint": current["title"],
             "sprint_id": current["id"],
         }
+        for key in _ROLE_GITHUB_FIELDS:
+            if plan.get(key):
+                task[key] = plan[key]
         data["tasks"].insert(0, task)
         save_callback(data)
         outcome["created"] = True
 
-        repo = get_role_repo(task, data)
+        repo = get_task_repo(task)
         if not repo:
-            # Role has no GitHub integration (e.g. "other") - task only, no issue.
+            # Task has no repo - no GitHub integration, task only.
             outcome["skipped_github"] = True
             results.append(outcome)
             continue
@@ -2215,7 +2360,7 @@ def create_current_sprint_recurrent_tasks(data: dict, save_callback, all_previou
 
 def cmd_add(args):
     if not args:
-        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC] [--sprint SPRINT] [--create-issue]")
+        print("Usage: wt add <title> [--role ROLE] [--status STATUS] [--desc DESC] [--sprint SPRINT] [--repo OWNER/REPO] [--activity ACT] [--type TYPE] [--create-issue]")
         sys.exit(1)
 
     data = load()
@@ -2227,6 +2372,9 @@ def cmd_add(args):
     status = "todo"
     desc = ""
     sprint_override = None
+    github_repo = None
+    activity = None
+    type_val = None
     create_issue = False
     i = 0
     while i < len(args):
@@ -2238,6 +2386,12 @@ def cmd_add(args):
             desc = args[i+1]; i += 2
         elif args[i] == "--sprint" and i + 1 < len(args):
             sprint_override = args[i+1]; i += 2
+        elif args[i] == "--repo" and i + 1 < len(args):
+            github_repo = args[i+1]; i += 2
+        elif args[i] == "--activity" and i + 1 < len(args):
+            activity = args[i+1]; i += 2
+        elif args[i] == "--type" and i + 1 < len(args):
+            type_val = args[i+1]; i += 2
         elif args[i] == "--create-issue":
             create_issue = True; i += 1
         else:
@@ -2246,28 +2400,34 @@ def cmd_add(args):
     if not title:
         print(c("Title is required.", "red")); sys.exit(1)
 
-    # Validate --create-issue preconditions BEFORE touching the data file
-    if create_issue:
-        role_repo = next(
-            (r.get("github_repo") for r in data["roles"] if r["id"] == role_id),
-            None,
-        )
-        if not role_repo:
-            print(c(
-                f"--create-issue requires role '{role_id}' to have a github_repo set.",
-                "red",
-            ))
-            print(c(
-                f"  Configure with: wt roles set-repo {role_id} owner/repo",
-                "dim",
-            ))
-            sys.exit(1)
+    # Validate flags BEFORE touching the data file
+    if github_repo and ("/" not in github_repo or github_repo.count("/") != 1):
+        print(c("Error: --repo must be in owner/repo format", "red"))
+        sys.exit(1)
+    cached_options = get_cached_project_options(data)
+    if activity and cached_options.get("activity") and activity not in cached_options["activity"]:
+        print(c(f"Unknown activity: {activity}", "red"))
+        print(c("  Available: " + ", ".join(cached_options["activity"]), "dim"))
+        sys.exit(1)
+    if type_val and cached_options.get("type") and type_val not in cached_options["type"]:
+        print(c(f"Unknown type: {type_val}", "red"))
+        print(c("  Available: " + ", ".join(cached_options["type"]), "dim"))
+        sys.exit(1)
+    if create_issue and not github_repo:
+        print(c("--create-issue requires --repo owner/repo.", "red"))
+        sys.exit(1)
 
     task = {
         "id": uid(), "title": title, "description": desc,
         "role_id": role_id, "status": status,
         "logs": [], "created_at": time.time()
     }
+    if github_repo:
+        task["github_repo"] = github_repo
+    if activity:
+        task["activity"] = activity
+    if type_val:
+        task["type"] = type_val
 
     # Auto-assign sprint (or use override)
     if sprint_override and sprint_override.lower() == "none":
@@ -2307,10 +2467,10 @@ def cmd_add(args):
 
     # Optional: create the linked GitHub issue and set up the project entry
     if create_issue:
-        repo = get_role_repo(task, data)
+        repo = get_task_repo(task)
         # repo is guaranteed by the pre-flight check above, but be defensive
         if not repo:
-            print(c("  [skip github] role has no github_repo", "dim"))
+            print(c("  [skip github] task has no github_repo", "dim"))
             return
         try:
             issue_ref = create_github_issue(task, repo)
@@ -2321,11 +2481,11 @@ def cmd_add(args):
         save(data)
         print(c(f"  ✓ Created issue: {issue_ref}", "green"))
 
-        # Add to GitHub project (Status, Activity, Sprint, Hours) if configured
+        # Add to GitHub project (Status, Activity, Type, Sprint, Hours) if configured
         if data.get("config", {}).get("github_project_number"):
             res = setup_issue_in_project(issue_ref, task, data)
             if res.get("success"):
-                print(c("  ✓ Added to project (Status/Activity/Sprint/Hours)", "green"))
+                print(c("  ✓ Added to project (Status/Activity/Type/Sprint/Hours)", "green"))
             else:
                 for err in res.get("errors") or ["unknown error"]:
                     print(c(f"  ! project setup: {err}", "yellow"))
@@ -2847,7 +3007,7 @@ def cmd_done(args):
     if result["success"]:
         print(c(f"✓ Closed: {task['title']}", "green"))
         if result["skipped_github"]:
-            print(c(f"  (No GitHub integration for this role)", "dim"))
+            print(c(f"  (No GitHub integration — task has no repo)", "dim"))
         else:
             if result.get("split_performed"):
                 sr = result.get("split_result") or {}
@@ -2957,8 +3117,8 @@ def cmd_new_recurrent(args):
         print(c(f"Would create {len(plans)} recurrent task(s) in {current['title']} (from {scope}):", "yellow"))
         roles = get_roles(data)
         for p in plans:
-            repo = get_role_repo(p["source"], data)
-            issue_note = "+ issue" if repo else "no issue (role has no repo)"
+            repo = get_task_repo(p["source"])
+            issue_note = "+ issue" if repo else "no issue (no repo)"
             print(f"  • {p['new_title']}  [{roles.get(p['role_id'], p['role_id'])}]  ({issue_note})")
         return
 
@@ -2972,7 +3132,7 @@ def cmd_new_recurrent(args):
             if r.get("project_updated"):
                 bits.append("project updated")
             if r.get("skipped_github"):
-                bits.append("no issue (role has no repo)")
+                bits.append("no issue (no repo)")
             extra = f" ({', '.join(bits)})" if bits else ""
             print(c(f"✓ {r['title']}  [{r.get('role', '?')}]{extra}", "green"))
             if r.get("error"):
@@ -3080,7 +3240,7 @@ def cmd_notes(args):
 
 
 def cmd_roles(args):
-    """Manage roles: list, add, update, delete, set-repo"""
+    """Manage roles: list, add, update, delete"""
     data = load()
 
     if not args:
@@ -3088,13 +3248,8 @@ def cmd_roles(args):
         print(c("\n  Roles:\n", "bold"))
         for r in data.get("roles", []):
             task_count = len([t for t in data["tasks"] if t.get("role_id") == r["id"]])
-            repo = r.get("github_repo", "")
-            activity = r.get("activity", "")
-            repo_str = f"→ {repo}" if repo else "(no repo)"
-            activity_str = f"[{activity}]" if activity else ""
-            print(f"  {r['id']:<15} {r['label']:<25} {repo_str:<40} {activity_str}")
-            if task_count:
-                print(f"  {'':<15} {'':<25} ({task_count} tasks)")
+            count_str = f"({task_count} tasks)" if task_count else ""
+            print(f"  {r['id']:<15} {r['label']:<35} {count_str}")
         print()
         return
 
@@ -3146,91 +3301,10 @@ def cmd_roles(args):
         save(data)
         print(c(f"✓ Deleted role: {role_id}", "yellow"))
 
-    elif subcmd == "set-repo":
-        if len(args) < 2:
-            print("Usage: wt roles set-repo <id> [repo]")
-            print("  Set a GitHub repo for a role (owner/repo format)")
-            print("  Omit repo to clear the setting")
-            sys.exit(1)
-        role_id = args[1].lower()
-
-        role = next((r for r in data["roles"] if r["id"] == role_id), None)
-        if not role:
-            print(c(f"Role '{role_id}' not found.", "red")); sys.exit(1)
-
-        if len(args) < 3:
-            # Clear the repo
-            if "github_repo" in role:
-                del role["github_repo"]
-                save(data)
-                print(c(f"✓ Cleared GitHub repo for role: {role_id}", "yellow"))
-            else:
-                print(c(f"Role '{role_id}' has no GitHub repo set.", "dim"))
-        else:
-            repo = args[2]
-            # Validate repo format (owner/repo)
-            if "/" not in repo or repo.count("/") != 1:
-                print(c("Error: Repo must be in owner/repo format", "red"))
-                sys.exit(1)
-            role["github_repo"] = repo
-            save(data)
-            print(c(f"✓ Set GitHub repo for {role_id}: {repo}", "green"))
-
-    elif subcmd == "set-activity":
-        if len(args) < 2:
-            print("Usage: wt roles set-activity <id> [activity]")
-            print("  Set a GitHub Project activity for a role")
-            print("  Omit activity to clear the setting")
-            sys.exit(1)
-        role_id = args[1].lower()
-
-        role = next((r for r in data["roles"] if r["id"] == role_id), None)
-        if not role:
-            print(c(f"Role '{role_id}' not found.", "red")); sys.exit(1)
-
-        if len(args) < 3:
-            # Clear the activity
-            if "activity" in role:
-                del role["activity"]
-                save(data)
-                print(c(f"✓ Cleared activity for role: {role_id}", "yellow"))
-            else:
-                print(c(f"Role '{role_id}' has no activity set.", "dim"))
-        else:
-            activity = " ".join(args[2:])  # Allow multi-word activities
-            role["activity"] = activity
-            save(data)
-            print(c(f"✓ Set activity for {role_id}: {activity}", "green"))
-
-    elif subcmd == "set-type":
-        if len(args) < 2:
-            print("Usage: wt roles set-type <id> [type]")
-            print("  Set a GitHub Project type for a role")
-            print("  Omit type to clear the setting")
-            sys.exit(1)
-        role_id = args[1].lower()
-
-        role = next((r for r in data["roles"] if r["id"] == role_id), None)
-        if not role:
-            print(c(f"Role '{role_id}' not found.", "red")); sys.exit(1)
-
-        if len(args) < 3:
-            # Clear the type
-            if "type" in role:
-                del role["type"]
-                save(data)
-                print(c(f"✓ Cleared type for role: {role_id}", "yellow"))
-            else:
-                print(c(f"Role '{role_id}' has no type set.", "dim"))
-        else:
-            type_val = " ".join(args[2:])  # Allow multi-word types
-            role["type"] = type_val
-            save(data)
-            print(c(f"✓ Set type for {role_id}: {type_val}", "green"))
-
     else:
         print(c(f"Unknown roles subcommand: {subcmd}", "red"))
-        print("Usage: wt roles [add|update|delete|set-repo|set-activity|set-type] ...")
+        print("Usage: wt roles [add|update|delete] ...")
+        print(c("  (Per-task GitHub settings moved to: wt set-repo/set-activity/set-type <task> ...)", "dim"))
         sys.exit(1)
 
 
@@ -3270,10 +3344,10 @@ def cmd_link(args):
         sys.exit(1)
 
     data = load()
-    # Resolve task first so we can use its role repo for bare issue numbers
+    # Resolve task first so we can use its repo for bare issue numbers
     query = " ".join(args[:-1])
     task = resolve_task(data, query)
-    # Issue ref is the last argument - use task's role repo if available
+    # Issue ref is the last argument - use task's repo if available
     issue_ref = normalize_issue_ref(args[-1], data, task)
 
     # Validate the issue exists
@@ -3299,6 +3373,9 @@ def cmd_link(args):
 
     # Store the issue reference (normalized form)
     task["github_issue"] = issue_ref
+    # Pin the task's repo from the issue ref (so the close workflow engages)
+    if not task.get("github_repo") and "#" in issue_ref:
+        task["github_repo"] = issue_ref.split("#", 1)[0]
     save(data)
     print(c(f"Linked '{task['title']}' to GitHub issue #{issue_info['number']}: {issue_info['title']}", "green"))
 
@@ -3486,6 +3563,9 @@ def create_task_from_issue(
         "created_at": time.time(),
         "github_issue": issue_ref,
     }
+    # The issue ref pins the task's repo
+    if "#" in issue_ref:
+        task["github_repo"] = issue_ref.split("#", 1)[0]
     if folder_str:
         task["local_folder"] = folder_str
 
@@ -4979,6 +5059,85 @@ def cmd_set_sprint(args):
     print(c(f"✓ Set sprint for '{task['title']}' to {match['title']}", "green"))
 
 
+def _print_push_hint(task):
+    if task.get("github_issue"):
+        print(c(f"  Run: wt push {task['id']} to sync project fields", "dim"))
+
+
+def cmd_set_repo(args):
+    """Set or clear the GitHub repo for a task."""
+    if not args:
+        print("Usage: wt set-repo <task> [owner/repo]")
+        print("  Omit the repo to clear it")
+        sys.exit(1)
+
+    data = load()
+    if len(args) < 2:
+        task = resolve_task(data, " ".join(args))
+        if task.pop("github_repo", None) is not None:
+            save(data)
+            print(c(f"✓ Cleared GitHub repo for '{task['title']}'", "yellow"))
+        else:
+            print(c(f"'{task['title']}' has no GitHub repo set.", "dim"))
+        return
+
+    task = resolve_task(data, args[0])
+    repo = args[1]
+    if "/" not in repo or repo.count("/") != 1:
+        print(c("Error: Repo must be in owner/repo format", "red"))
+        sys.exit(1)
+    task["github_repo"] = repo
+    save(data)
+    print(c(f"✓ Set GitHub repo for '{task['title']}': {repo}", "green"))
+    _print_push_hint(task)
+
+
+def _cmd_set_project_option(args, key: str, label: str):
+    """Shared logic for set-activity / set-type: first arg task, rest value."""
+    if not args:
+        print(f"Usage: wt set-{key} <task> [{label.lower()}]")
+        print(f"  Omit the {label.lower()} to clear it")
+        sys.exit(1)
+
+    data = load()
+    if len(args) < 2:
+        task = resolve_task(data, args[0])
+        if task.pop(key, None) is not None:
+            save(data)
+            print(c(f"✓ Cleared {label.lower()} for '{task['title']}'", "yellow"))
+        else:
+            print(c(f"'{task['title']}' has no {label.lower()} set.", "dim"))
+        return
+
+    # First arg is the task query, the rest joins into a (possibly multi-word)
+    # value — same convention as set-sprint.
+    task = resolve_task(data, args[0])
+    value = " ".join(args[1:])
+
+    options = get_cached_project_options(data).get(key)
+    if options and value not in options:
+        print(c(f"Unknown {label.lower()}: {value}", "red"))
+        print(c("  Available options:", "dim"))
+        for o in options:
+            print(c(f"    {o}", "dim"))
+        sys.exit(1)
+
+    task[key] = value
+    save(data)
+    print(c(f"✓ Set {label.lower()} for '{task['title']}': {value}", "green"))
+    _print_push_hint(task)
+
+
+def cmd_set_activity(args):
+    """Set or clear the GitHub Project activity for a task."""
+    _cmd_set_project_option(args, "activity", "Activity")
+
+
+def cmd_set_type(args):
+    """Set or clear the GitHub Project type for a task."""
+    _cmd_set_project_option(args, "type", "Type")
+
+
 def cmd_split_sprint(args):
     """Split cross-sprint task: create shadow tasks for previous sprints."""
     if not args:
@@ -5085,6 +5244,9 @@ COMMANDS = {
     "sprint": cmd_sprint,
     "set-sprint": cmd_set_sprint,
     "split-sprint": cmd_split_sprint,
+    "set-repo": cmd_set_repo,
+    "set-activity": cmd_set_activity,
+    "set-type": cmd_set_type,
 }
 
 

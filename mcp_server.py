@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, split_cross_sprint_task, sprint_summary_for_task, delete_github_issue, setup_issue_in_project, mins_to_quarter_hours, task_logged_mins_for_sprint
 from wt import build_time_report, format_time_report, _parse_last_arg, get_cached_sprints, get_role_ids
 from wt import find_recurrent_tasks_to_close, close_previous_sprint_recurrent_tasks
+from wt import get_task_repo, get_cached_project_options, _migrate_role_github_fields
 from datetime import timedelta
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -65,6 +66,9 @@ def load() -> dict:
     data.setdefault("active_timer", None)
     if "roles" not in data:
         data["roles"] = DEFAULT_ROLES.copy()
+    # Move role github fields onto tasks (idempotent, same as wt.load()).
+    if _migrate_role_github_fields(data):
+        save(data)
     return data
 
 
@@ -80,13 +84,6 @@ def get_roles(data: dict) -> dict:
 def get_role_ids(data: dict) -> list:
     """Return list of role IDs"""
     return [r["id"] for r in data.get("roles", [])]
-
-
-def get_role_repo(task: dict, data: dict) -> str | None:
-    """Get the GitHub repo for a task's role. Returns None if not configured."""
-    role_id = task.get("role_id", "other")
-    role = next((r for r in data.get("roles", []) if r["id"] == role_id), None)
-    return role.get("github_repo") if role else None
 
 
 def fmt_mins(mins: float) -> str:
@@ -166,6 +163,9 @@ def add_task(
     description: str = "",
     github_issue: str = "",
     sprint: str = "",
+    github_repo: str = "",
+    activity: str = "",
+    type: str = "",
 ) -> str:
     """Add a new task to the workload tracker.
 
@@ -176,6 +176,10 @@ def add_task(
         description: Optional task description
         github_issue: Optional GitHub issue reference (e.g., owner/repo#123)
         sprint: Sprint title (e.g., "Sprint 43"). Auto-assigns current sprint if empty.
+        github_repo: Optional GitHub repo (owner/repo) for issue creation and the
+            close workflow. Tasks without a repo skip GitHub integration.
+        activity: Optional GitHub Project Activity field value for this task.
+        type: Optional GitHub Project Type field value for this task.
     """
     data = load()
     roles = get_roles(data)
@@ -184,6 +188,13 @@ def add_task(
         return f"Error: Invalid role '{role}'. Available: {', '.join(roles.keys())}"
     if status not in STATUS_LABELS:
         return f"Error: Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
+    if github_repo and ("/" not in github_repo or github_repo.count("/") != 1):
+        return "Error: github_repo must be in owner/repo format"
+    cached_options = get_cached_project_options(data)
+    if activity and cached_options.get("activity") and activity not in cached_options["activity"]:
+        return f"Error: Unknown activity '{activity}'. Available: {', '.join(cached_options['activity'])}"
+    if type and cached_options.get("type") and type not in cached_options["type"]:
+        return f"Error: Unknown type '{type}'. Available: {', '.join(cached_options['type'])}"
 
     task = {
         "id": uid(),
@@ -196,6 +207,12 @@ def add_task(
     }
     if github_issue:
         task["github_issue"] = github_issue
+    if github_repo:
+        task["github_repo"] = github_repo
+    if activity:
+        task["activity"] = activity
+    if type:
+        task["type"] = type
 
     # Sprint assignment
     if sprint and sprint.lower() != "none":
@@ -292,6 +309,9 @@ def get_task(task_query: str) -> str:
         f"Time logged: {fmt_mins(logged)}",
         f"Timer running: {'Yes' if running else 'No'}",
         f"GitHub Issue: {task.get('github_issue') or '(none)'}",
+        f"GitHub Repo: {task.get('github_repo') or '(none)'}",
+        f"Activity: {task.get('activity') or '(none)'}",
+        f"Type: {task.get('type') or '(none)'}",
         f"Description: {task.get('description') or '(none)'}",
     ]
 
@@ -846,7 +866,7 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
     """Set the status of a task.
 
     When setting status to 'done', this triggers the close workflow:
-    - If the role has a configured GitHub repo, the task must have a linked issue
+    - If the task has a GitHub repo set, it must have a linked issue
     - The issue is added to the configured GitHub project with logged hours
 
     Args:
@@ -887,14 +907,14 @@ def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:
 
     result_lines = []
 
-    # Check if role has a GitHub repo
-    repo = get_role_repo(task, data)
+    # Check if the task has a GitHub repo
+    repo = get_task_repo(task)
 
     if not repo:
         # No GitHub integration - just close
         task["status"] = "done"
         save(data)
-        return f"Closed '{task['title']}' (no GitHub integration for this role)"
+        return f"Closed '{task['title']}' (task has no repo — no GitHub integration)"
 
     # Check if task has GitHub issue
     if not task.get("github_issue"):
@@ -932,7 +952,7 @@ def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:
         else:
             return (
                 f"Error: Task '{task['title']}' has no GitHub issue linked.\n"
-                f"This role ({task.get('role_id')}) requires issues in {repo}.\n"
+                f"This task has a repo configured ({repo}), so closing requires an issue.\n"
                 f"Either:\n"
                 f"  - Link an existing issue: link_github_issue('{task['title']}', 'owner/repo#123')\n"
                 f"  - Create one: set_task_status('{task['title']}', 'done', create_issue=True)"
@@ -1210,6 +1230,9 @@ def link_github_issue(task_query: str, github_issue: str) -> str:
     issue_info = json_mod.loads(result.stdout)
 
     task["github_issue"] = github_issue
+    # Pin the task's repo from the issue ref (so the close workflow engages)
+    if not task.get("github_repo") and "#" in github_issue:
+        task["github_repo"] = github_issue.split("#", 1)[0]
     save(data)
 
     return f"Linked '{task['title']}' to GitHub issue #{issue_info['number']}: {issue_info['title']}"
@@ -1307,14 +1330,12 @@ def add_github_comment(task_query: str, comment: str) -> str:
 
 @mcp.tool()
 def list_roles() -> str:
-    """List all available roles with their GitHub repo configuration."""
+    """List all available roles."""
     data = load()
     lines = ["Available roles:\n"]
     for r in data.get("roles", []):
         task_count = len([t for t in data["tasks"] if t.get("role_id") == r["id"]])
-        repo = r.get("github_repo", "")
-        repo_str = f"→ {repo}" if repo else "(no repo)"
-        lines.append(f"  {r['id']:<15} {r['label']:<25} {repo_str:<35} ({task_count} tasks)")
+        lines.append(f"  {r['id']:<15} {r['label']:<35} ({task_count} tasks)")
     return "\n".join(lines)
 
 
@@ -1380,36 +1401,79 @@ def delete_role(role_id: str) -> str:
 
 
 @mcp.tool()
-def set_role_repo(role_id: str, github_repo: str | None = None) -> str:
-    """Set or clear the GitHub repo for a role.
+def set_task_repo(task_query: str, github_repo: str | None = None) -> str:
+    """Set or clear the GitHub repo for a task.
 
-    When a role has a configured repo, tasks with that role require a GitHub issue
-    when being closed. The issue is automatically created in the configured repo.
+    When a task has a repo, closing it requires a GitHub issue (auto-created in
+    that repo if missing). Tasks without a repo skip GitHub integration entirely.
 
     Args:
-        role_id: The role ID to update
-        github_repo: GitHub repo in owner/repo format, or None to clear
+        task_query: Task ID or partial title to search for
+        github_repo: GitHub repo in owner/repo format, or None/empty to clear
     """
     data = load()
-    role = next((r for r in data["roles"] if r["id"] == role_id), None)
-
-    if not role:
-        return f"Error: Role '{role_id}' not found."
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
 
     if github_repo:
-        # Validate format
         if "/" not in github_repo or github_repo.count("/") != 1:
             return "Error: Repo must be in owner/repo format (e.g., 'grafana/field-eng')"
-        role["github_repo"] = github_repo
+        task["github_repo"] = github_repo
         save(data)
-        return f"Set GitHub repo for '{role_id}': {github_repo}"
-    else:
-        if "github_repo" in role:
-            del role["github_repo"]
-            save(data)
-            return f"Cleared GitHub repo for role: {role_id}"
-        else:
-            return f"Role '{role_id}' has no GitHub repo set."
+        return f"Set GitHub repo for '{task['title']}': {github_repo}"
+    if task.pop("github_repo", None) is not None:
+        save(data)
+        return f"Cleared GitHub repo for '{task['title']}'"
+    return f"'{task['title']}' has no GitHub repo set."
+
+
+def _set_task_project_option(task_query: str, key: str, label: str, value: str | None) -> str:
+    """Shared logic for set_task_activity / set_task_type."""
+    data = load()
+    task = resolve_task(data, task_query)
+    if not task:
+        return f"No task found matching '{task_query}'"
+
+    if value:
+        options = get_cached_project_options(data).get(key)
+        if options and value not in options:
+            return f"Error: Unknown {label.lower()} '{value}'. Available: {', '.join(options)}"
+        task[key] = value
+        save(data)
+        return f"Set {label.lower()} for '{task['title']}': {value}"
+    if task.pop(key, None) is not None:
+        save(data)
+        return f"Cleared {label.lower()} for '{task['title']}'"
+    return f"'{task['title']}' has no {label.lower()} set."
+
+
+@mcp.tool()
+def set_task_activity(task_query: str, activity: str | None = None) -> str:
+    """Set or clear the GitHub Project Activity field value for a task.
+
+    Validated against the cached project option list when available
+    (config.project_options_cache).
+
+    Args:
+        task_query: Task ID or partial title to search for
+        activity: Activity option name, or None/empty to clear
+    """
+    return _set_task_project_option(task_query, "activity", "Activity", activity)
+
+
+@mcp.tool()
+def set_task_type(task_query: str, type: str | None = None) -> str:
+    """Set or clear the GitHub Project Type field value for a task.
+
+    Validated against the cached project option list when available
+    (config.project_options_cache).
+
+    Args:
+        task_query: Task ID or partial title to search for
+        type: Type option name, or None/empty to clear
+    """
+    return _set_task_project_option(task_query, "type", "Type", type)
 
 
 @mcp.tool()
@@ -1463,6 +1527,9 @@ def create_task_from_issue(issue_ref: str, role: str = "other") -> str:
         "created_at": time.time(),
         "github_issue": issue_ref,
     }
+    # The issue ref pins the task's repo
+    if "#" in issue_ref:
+        task["github_repo"] = issue_ref.split("#", 1)[0]
     data["tasks"].insert(0, task)
     save(data)
 

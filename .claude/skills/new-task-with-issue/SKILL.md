@@ -8,8 +8,8 @@ description: Create a new workload-tracker task and its linked GitHub issue. Use
 This skill creates a task in the workload tracker and a linked GitHub issue
 in one step, using the `wt add --create-issue` CLI subcommand. **Always use
 `wt`; never call `gh` directly** — the CLI also adds the issue to the
-configured GitHub Project and sets the Status, Activity, Sprint, and Hours
-fields, which a raw `gh issue create` does not.
+configured GitHub Project and sets the Status, Activity, Type, Sprint, and
+Hours fields, which a raw `gh issue create` does not.
 
 ## When to use this skill
 
@@ -43,16 +43,21 @@ Before invoking the CLI, make sure you have:
    - `none` → no sprint assignment
 5. **Description** (optional). Goes into the issue body as well, since the
    issue body is read from the task's local notes.
+6. **Repo** (required for `--create-issue`). The `owner/repo` where the issue
+   should live — stored on the task as `github_repo`. Ask the user if it's
+   not obvious from context.
+7. **Activity / Type** (optional). GitHub Project field values, stored on the
+   task. Valid options can be read offline from
+   `data["config"]["project_options_cache"]` (`activity` / `type` lists).
 
 ## Preconditions to verify
 
 The CLI fails fast if these are not met — verify them up-front so you can
 guide the user before running anything:
 
-- **The chosen role must have a `github_repo`** in its config. Check with
-  `wt roles` (or read `data["roles"][i]["github_repo"]`). If the role has no
-  repo, ask the user whether to set one with
-  `wt roles set-repo <role> owner/repo` first, or pick a different role.
+- **`--create-issue` requires `--repo owner/repo`.** The repo lives on the
+  task (roles carry no GitHub configuration). `--activity`/`--type` values
+  are validated against `config.project_options_cache` when populated.
 - The user must be logged into `gh` (`gh auth status`). The CLI uses `gh`
   internally; if auth is missing, the issue creation will fail with a clear
   error.
@@ -66,6 +71,8 @@ python3 wt.py add "Task title here" \
     --role <role> \
     --status <status> \
     --sprint "<sprint>" \
+    --repo <owner/repo> \
+    --activity "<activity>" \
     --create-issue
 ```
 
@@ -73,6 +80,7 @@ Notes:
 - Always quote the title.
 - Omit `--status` to default to `todo`.
 - Omit `--sprint` to auto-assign to the current sprint.
+- `--repo` is required with `--create-issue`; `--activity`/`--type` are optional.
 - `--create-issue` is the only flag that triggers GitHub work.
 
 On success the CLI prints:
@@ -80,21 +88,22 @@ On success the CLI prints:
 ✓ Added: <title>  [Role]  [Status]  [Sprint NN]
   id: <task-id>
   ✓ Created issue: owner/repo#NNNN
-  ✓ Added to project (Status/Activity/Sprint/Hours)
+  ✓ Added to project (Status/Activity/Type/Sprint/Hours)
 ```
 
 ## What the flag does under the hood
 
 `wt add --create-issue` (in `wt.py:cmd_add`) does, in order:
 
-1. Validates that the role has a `github_repo` (errors out otherwise).
-2. Creates the task in `~/.workload_tracker.json` with the usual sprint
-   auto-assignment.
+1. Validates `--repo owner/repo` was given (errors out otherwise) and that
+   `--activity`/`--type` match the cached project options when populated.
+2. Creates the task in `~/.workload_tracker.json` (with `github_repo`,
+   `activity`, `type` stored on it) and the usual sprint auto-assignment.
 3. Calls `create_github_issue(task, repo)` which uses `gh issue create`
    internally and assigns it to `@me`. Body comes from local notes if any.
 4. Calls `setup_issue_in_project(issue_ref, task, data)` to add the issue
-   to the configured GitHub Project and set its Status, Activity, Sprint,
-   and Hours fields.
+   to the configured GitHub Project and set its Status, Activity, Type,
+   Sprint, and Hours fields (Activity/Type read from the task).
 5. Writes the resulting `github_issue` reference back to the task.
 
 This is the **same path** the TUI uses when a user enables GH integration on
@@ -115,13 +124,15 @@ task creation, so behaviour stays consistent.
 
 ### Standard new task with issue in the current sprint
 ```bash
-python3 wt.py add "Refactor login flow" --role demokit --create-issue
+python3 wt.py add "Refactor login flow" --role demokit \
+    --repo grafana/field-eng-demo-kit --activity "Demo Kit Maintenance" --create-issue
 ```
 
 ### Recurrent task pinned to a specific past sprint (the Ana 1:1 pattern)
 ```bash
 python3 wt.py add "Ana 1:1 calls - casanabria - Sprint 95" \
-    --role other --status recurrent --sprint "Sprint 95" --create-issue
+    --role other --status recurrent --sprint "Sprint 95" \
+    --repo grafana/field-eng --create-issue
 ```
 
 ### Task in progress with a description
@@ -129,7 +140,7 @@ python3 wt.py add "Ana 1:1 calls - casanabria - Sprint 95" \
 python3 wt.py add "Investigate dashboard timeout" \
     --role strategic --status inprogress \
     --desc "Customer reports 30s+ load times on demo dashboard" \
-    --create-issue
+    --repo grafana/field-eng --create-issue
 ```
 
 ### Bulk: create one per sprint (loop in a shell, not a single command)
@@ -138,7 +149,8 @@ data file is read-modify-written by each invocation:
 ```bash
 for sprint in "Sprint 95" "Sprint 96" "Sprint 97"; do
     python3 wt.py add "Ana 1:1 calls - casanabria - $sprint" \
-        --role other --status recurrent --sprint "$sprint" --create-issue
+        --role other --status recurrent --sprint "$sprint" \
+        --repo grafana/field-eng --create-issue
 done
 ```
 
@@ -146,7 +158,8 @@ done
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `--create-issue requires role 'X' to have a github_repo set.` | Role missing repo | `wt roles set-repo <role> owner/repo`, then retry |
+| `--create-issue requires --repo owner/repo.` | Repo flag missing | Add `--repo owner/repo`, then retry |
+| `Unknown activity: X` / `Unknown type: X` | Value not in `config.project_options_cache` | Read valid options from the cache (or open the TUI once to refresh it) |
 | `Failed to create issue: ...` | `gh` auth / network / repo permission | Run `gh auth status`; check the user has issue-create perms on the repo |
 | `! project setup: <error>` | Project lookup failed but task and issue exist | Don't re-run — re-running creates a duplicate issue. Use `wt link`/`wt unlink` and the TUI's "sync project" path to recover |
 | `Sprint 'X' not found.` | Sprint title typo or non-existent | Look up exact titles with `python3 -c "import wt; [print(s['title']) for s in wt.get_all_sprints(wt.load())]"` |
