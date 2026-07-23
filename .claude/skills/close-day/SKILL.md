@@ -77,7 +77,9 @@ print([d.isoformat() for d in pending])
 
 - Weekends are never *required* — but if a weekend day in the gap has logs,
   mention it to Carlos and offer to include it.
-- Process pending days **oldest first**, one full pass (Steps 1–4) per day.
+- Process pending days **oldest first**, one full pass (Steps 1–5) per day.
+  The GitHub sync check (Step 4) only needs to run once per *task*, on its
+  final pass — the Hours field is a per-sprint running total, not per-day.
 - If today is the only pending day, this is the normal single-day flow.
 - If an **active timer** is running while closing *today*, it must be stopped
   first — running time isn't in `logs[]` yet, so the summary would undercount.
@@ -172,7 +174,35 @@ wt.save(data)
 Run these sequentially (the JSON file is read-modify-written), then re-print
 the Step 1 summary so Carlos sees the corrected day total.
 
-## Step 4 — Mark the day closed
+## Step 4 — GitHub issue sync check
+
+For every task that got time today (the Step 1 list) and has a linked
+`github_issue`, verify the GH Project's Hours field matches our data. The
+value GitHub should show is the **sprint-filtered** local total rounded to
+quarter hours — exactly what `sync_project_hours()` writes:
+
+```python
+import wt
+data = wt.load()
+sprints = wt.get_cached_sprints(data)
+for t in todays_tasks:                       # tasks with logs today, from Step 1
+    issue = t.get("github_issue")
+    expected = wt.mins_to_quarter_hours(wt.task_logged_mins_for_sprint(t, sprints))
+    gh = wt.get_project_hours(issue, data) if issue else None   # network call per issue
+    print(t["title"], t.get("github_repo"), t.get("activity"), expected, gh)
+```
+
+- **In sync**: `gh == expected` — nothing to do.
+- **Mismatch**: confirm with Carlos, then `wt.sync_project_hours(issue, t, data)`
+  (re-syncs Status/Activity/Type/Sprint/Hours in one shot; run sequentially,
+  it makes several network calls per issue). It marks logs uploaded in the
+  local data — `wt.save(data)` after, minding the TUI clobber gotcha.
+- **No linked issue**: nothing to verify; flag it if the task *does* have a
+  `github_repo` (an issue is expected eventually via the close workflow).
+- `gh is None` with an issue linked usually means the issue isn't in the
+  configured project — surface it rather than silently passing.
+
+## Step 5 — Mark the day closed
 
 Only after Carlos confirms the day looks right (for *today*, that means he's
 actually signing off):
@@ -192,9 +222,17 @@ wt.save(data)
 
 Idempotent — re-closing an already-closed day just refreshes its stored total.
 
-## Step 5 — Sign-off recap
+## Step 6 — Sign-off recap
 
-After the last pending day is closed, give Carlos a one-screen recap: total
-time per closed day, meetings logged during this session, and anything left
-deliberately open (skipped meetings, a zero-log day he chose to close anyway).
+After the last pending day is closed, give Carlos a one-screen recap:
+
+1. **Per-task table** for the closed day(s), one row per task with time today:
+   Task | Repo | Activity | Today | Sprint (local) | GitHub — where *Sprint
+   (local)* is `task_logged_mins_for_sprint()` and *GitHub* is the project
+   Hours field from Step 4 (with a ✓/✗ sync indicator). Use `—` for tasks
+   without a repo/issue.
+2. Total time per closed day and meetings logged during this session.
+3. Anything left deliberately open (skipped meetings, sync mismatches Carlos
+   chose not to fix, a zero-log day he closed anyway).
+
 Remind him to press `r` in the TUI if it's open, so it picks up the new logs.
