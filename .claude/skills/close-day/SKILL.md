@@ -35,9 +35,23 @@ wiped by the stop's async hours sync). When the TUI is open (bridge answers on
 
 ## State: `config.closed_days`
 
-A sorted, deduped list of ISO dates (`"2026-07-22"`) in
-`data["config"]["closed_days"]`. A date in the list = that day was closed via
-this workflow. The list lives in the shared data file, so it syncs across Macs.
+A dict in `data["config"]["closed_days"]` mapping ISO date → **total minutes
+logged that day** (the Step 1 grand total: non-shadow tasks only), kept sorted
+by key:
+
+```json
+{"2026-07-22": 412.24, "2026-07-23": 390.0}
+```
+
+A key present = that day was closed via this workflow. The per-day total is
+stored so longer-term analysis can read one number per day instead of
+re-scanning every task's logs. It's a **snapshot at close time** — later log
+edits aren't reflected; recompute from logs (Step 1 snippet) when exactness
+matters. The dict lives in the shared data file, so it syncs across Macs.
+
+**Legacy format**: the first version stored a plain list of ISO dates. If a
+list is found, migrate in place first: recompute each listed day's total with
+the Step 1 snippet and rewrite the key as a dict.
 
 **First run** (key missing): don't invent a backlog. Ask Carlos which date to
 start from (default: today), then treat only weekdays from that date onward as
@@ -49,7 +63,10 @@ requiring closure.
 import wt
 from datetime import date, timedelta
 data = wt.load()
-closed = set(data.get("config", {}).get("closed_days", []))
+closed = data.get("config", {}).get("closed_days", {})
+if isinstance(closed, list):          # legacy list format — migrate first (see State)
+    closed = {d: None for d in closed}
+closed = set(closed)                  # ISO date strings (dict keys)
 today = date.today()
 # Weekdays from the day after the newest closed day through today, not yet closed.
 start = date.fromisoformat(max(closed)) + timedelta(days=1) if closed else today
@@ -160,16 +177,20 @@ the Step 1 summary so Carlos sees the corrected day total.
 Only after Carlos confirms the day looks right (for *today*, that means he's
 actually signing off):
 
+Record the day with its Step 1 grand total (in minutes):
+
 ```python
 import wt
 data = wt.load()
-closed = set(data.setdefault("config", {}).get("closed_days", []))
-closed.add(day.isoformat())
-data["config"]["closed_days"] = sorted(closed)
+cd = data.setdefault("config", {}).get("closed_days", {})
+if isinstance(cd, list):              # legacy list format
+    cd = {d: None for d in cd}        # backfill totals via the Step 1 snippet
+cd[day.isoformat()] = round(total, 2) # `total` from the (post-Step-3) Step 1 summary
+data["config"]["closed_days"] = dict(sorted(cd.items()))
 wt.save(data)
 ```
 
-Idempotent — re-closing an already-closed day is a no-op.
+Idempotent — re-closing an already-closed day just refreshes its stored total.
 
 ## Step 5 — Sign-off recap
 
