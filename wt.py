@@ -1658,19 +1658,594 @@ def _match_sprint(sprints: list[dict], query: str) -> dict | None:
     return None
 
 
+def _find_binding(bindings: list[dict], issue: str = None, sprint_id: str = None) -> dict | None:
+    """Locate a binding by issue ref first, then by sprint_id. None if absent.
+
+    Issue-ref lookup wins because a reconcile can re-point a binding's sprint,
+    but an issue ref, once minted, never moves to another binding.
+    """
+    if issue:
+        for b in bindings:
+            if b.get("issue") == issue:
+                return b
+    if sprint_id:
+        for b in bindings:
+            if b.get("sprint_id") == sprint_id:
+                return b
+    return None
+
+
+def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
+                    create_issues: bool = True, close_past: bool = True,
+                    sync_hours: bool = True) -> dict:
+    """Pure planner behind :func:`reconcile_task_sprints` (plan §2.3).
+
+    Reads ``task``/``data``/``sprints`` and returns the ordered list of
+    operations that would bring the task's ``sprint_issues`` bindings in line
+    with what its logs say. **Mutates nothing and makes no GitHub call**, which
+    is what makes ``dry_run=True`` structurally airtight: the caller either
+    executes this plan or returns it untouched.
+
+    Returned dict:
+      ``error``              — fatal planning problem (no sprints), else None
+      ``current_sprint`` / ``current_sprint_id``
+      ``target``             — [{sprint_id, sprint, minutes, hours}], oldest first
+      ``ops``                — ordered ops, each a self-describing dict with an
+                               ``op`` of create/repoint/hours/close
+      ``skipped``            — no-ops worth reporting, each with a ``reason``
+      ``unassigned_minutes`` — minutes whose log timestamps fall in no sprint
+      ``seed_legacy``        — the task's legacy ``github_issue`` is not yet
+                               represented by a binding and must be seeded
+    """
+    plan = {
+        "error": None,
+        "current_sprint": None,
+        "current_sprint_id": None,
+        "target": [],
+        "ops": [],
+        "skipped": [],
+        "unassigned_minutes": 0.0,
+        "seed_legacy": False,
+    }
+
+    sprints = sprints or []
+    if not sprints:
+        plan["error"] = "No sprints found"
+        return plan
+
+    by_id = {s["id"]: s for s in sprints if s.get("id")}
+    today = datetime.now().date()
+    repo = get_task_repo(task)
+    has_project = bool(data.get("config", {}).get("github_project_number"))
+
+    def sort_key(sprint_id):
+        s = by_id.get(sprint_id)
+        return _sprint_start_sort_key(s.get("start_date") if s else None)
+
+    def ended(sprint_id):
+        s = by_id.get(sprint_id)
+        return bool(s and s.get("end_date") and s["end_date"] <= today)
+
+    # 1. Bucket logs by sprint; sprints with a zero total are not targets. Logs
+    #    that land outside every sprint are surfaced, never silently attributed.
+    plan["unassigned_minutes"] = sum(
+        l.get("minutes", 0) for l in bucket_logs_by_sprint(task, sprints).get(None, [])
+    )
+    targets = {e["sprint_id"]: e["total_mins"] for e in task_sprints_with_time(task, sprints)}
+
+    # 2. …plus the current sprint while the task is still open. This is what
+    #    makes the marker-log ritual of plan §1.3 unnecessary: an open task
+    #    always has a binding for new work to land on, even at 0 minutes.
+    current = find_sprint_for_date(sprints, today)
+    if current:
+        plan["current_sprint"] = current["title"]
+        plan["current_sprint_id"] = current["id"]
+        if task.get("status") != "done":
+            targets.setdefault(current["id"], 0.0)
+
+    target_ids = sorted((sid for sid in targets if sid in by_id), key=sort_key)
+    plan["target"] = [
+        {
+            "sprint_id": sid,
+            "sprint": by_id[sid]["title"],
+            "minutes": targets[sid],
+            "hours": mins_to_quarter_hours(targets[sid]) if targets[sid] > 0 else 0.0,
+        }
+        for sid in target_ids
+    ]
+
+    # Working copy of the existing bindings — planning never touches the real ones.
+    persisted = task.get("sprint_issues")
+    if isinstance(persisted, list):
+        work = [
+            {"sprint_id": b.get("sprint_id"), "issue": b.get("issue"),
+             "state": b.get("state"), "hours_synced": b.get("hours_synced")}
+            for b in persisted
+        ]
+        legacy_issue = task.get("github_issue")
+        if legacy_issue and not any(w["issue"] == legacy_issue for w in work):
+            # e.g. close_task() just minted the task's first issue and set only
+            # the legacy field. Adopt it rather than minting a second one.
+            seed = _legacy_binding_for_task(task)
+            work.append({"sprint_id": seed["sprint_id"], "issue": seed["issue"],
+                         "state": seed["state"], "hours_synced": None})
+            plan["seed_legacy"] = True
+    else:
+        work = []
+        seed = _legacy_binding_for_task(task)
+        if seed:
+            work.append({"sprint_id": seed["sprint_id"], "issue": seed["issue"],
+                         "state": seed["state"], "hours_synced": None})
+            plan["seed_legacy"] = True
+
+    bound = {w["sprint_id"] for w in work if w["sprint_id"] in by_id}
+
+    # Option A (plan §2.4): the task's *original* issue is the long-lived
+    # "current" one and moves forward across sprint boundaries; brand-new issues
+    # are minted for the sprints left behind. The carry-forward binding is the
+    # one holding that issue: the binding for the task's own sprint_id, else an
+    # unanchored binding (sprint unknown — a pre-sprint-tracking task).
+    own = task.get("sprint_id")
+    carry = None
+    if own:
+        carry = next((w for w in work if w["sprint_id"] == own and w["issue"]), None)
+    if carry is None:
+        carry = next((w for w in work if w["issue"] and w["sprint_id"] not in by_id), None)
+    if carry is None:
+        # `wt set-sprint` moves sprint_id without touching bindings, so the two
+        # can disagree. Fall back to the newest still-open issue — same rule as
+        # task_current_issue(). Without this we would mint a *second* issue for
+        # a sprint the task's live issue should simply have moved to.
+        still_open = sorted(
+            (w for w in work
+             if w["issue"] and w["state"] != "closed" and w["sprint_id"] in by_id),
+            key=lambda w: by_id[w["sprint_id"]]["start_date"],
+        )
+        carry = still_open[-1] if still_open else None
+    main_issue = carry["issue"] if carry else task.get("github_issue")
+
+    latest = target_ids[-1] if target_ids else None
+    if latest and latest not in bound and carry is not None:
+        carry_start = (by_id[carry["sprint_id"]]["start_date"]
+                       if carry["sprint_id"] in by_id else None)
+        # Never move an issue backwards in time.
+        if carry_start is None or carry_start < by_id[latest]["start_date"]:
+            plan["ops"].append({
+                "op": "repoint",
+                "sprint_id": latest,
+                "sprint": by_id[latest]["title"],
+                "from_sprint_id": carry["sprint_id"],
+                "from_sprint": (by_id[carry["sprint_id"]]["title"]
+                                if carry["sprint_id"] in by_id else None),
+                "issue": carry["issue"],
+                "minutes": targets[latest],
+                "hours": mins_to_quarter_hours(targets[latest]) if targets[latest] > 0 else 0.0,
+                "reason": "carry the task's current issue forward (Option A)",
+            })
+            bound.discard(carry["sprint_id"])
+            bound.add(latest)
+            carry["sprint_id"] = latest
+
+    # 3. Target sprints with no binding get one (plus a GH issue when possible).
+    has_issue_anywhere = any(w["issue"] for w in work)
+    missing = [sid for sid in target_ids if sid not in bound]
+    created_plan = []
+    for sid in missing:
+        sprint_title = by_id[sid]["title"]
+        minutes = targets[sid]
+        hours = mins_to_quarter_hours(minutes) if minutes > 0 else 0.0
+        will_close = bool(close_past and ended(sid))
+        # A past-sprint issue keeps today's " (Sprint N)" title suffix. Only a
+        # task that has no issue at all gets a plain-titled one, and only for
+        # its most recent sprint — matching create_github_issue()'s use in
+        # close_task()/wt add.
+        plain = (not has_issue_anywhere) and sid == latest
+        op = {
+            "op": "create",
+            "sprint_id": sid,
+            "sprint": sprint_title,
+            "minutes": minutes,
+            "hours": hours,
+            "issue": None,
+            "create_issue": bool(repo and create_issues),
+            "issue_title": task.get("title") if plain else f"{task.get('title')} ({sprint_title})",
+            "repo": repo,
+            "will_close": will_close,
+            "main_issue": main_issue,
+            "reason": ("sprint has logged time" if minutes > 0
+                       else "open task needs a binding for the current sprint"),
+        }
+        if not repo:
+            op["skipped_github"] = "task has no github_repo"
+        elif not create_issues:
+            op["skipped_github"] = "create_issues=False"
+        plan["ops"].append(op)
+        created_plan.append(op)
+
+    # Post-plan binding set: existing (possibly re-pointed) plus the new ones.
+    final = [
+        {"sprint_id": w["sprint_id"], "issue": w["issue"], "state": w["state"],
+         "hours_synced": w["hours_synced"], "new": False}
+        for w in work
+    ]
+    for op in created_plan:
+        # A created binding gets its hours pushed as part of creation, so it
+        # never needs a separate hours op.
+        final.append({"sprint_id": op["sprint_id"], "issue": None, "state": "open",
+                      "hours_synced": op["hours"], "new": True})
+
+    for sid in target_ids:
+        if sid in bound and sid != latest:
+            entry = next((f for f in final if f["sprint_id"] == sid), None)
+            plan["skipped"].append({
+                "sprint": by_id[sid]["title"], "sprint_id": sid,
+                "minutes": targets[sid], "issue": entry and entry.get("issue"),
+                "reason": "already bound",
+            })
+
+    # 4. Hours: push only when the value differs from what we last told GitHub.
+    for f in final:
+        sid = f["sprint_id"]
+        label = by_id[sid]["title"] if sid in by_id else (sid or "unknown sprint")
+        if sid not in by_id:
+            plan["skipped"].append({
+                "sprint": None, "sprint_id": sid, "issue": f["issue"],
+                "reason": "binding's sprint is not in the sprint list",
+            })
+            continue
+        if f["new"]:
+            continue
+        minutes = task_mins_for_sprint(task, sid, sprints)
+        hours = mins_to_quarter_hours(minutes) if minutes > 0 else 0.0
+        common = {"sprint": label, "sprint_id": sid, "issue": f["issue"],
+                  "minutes": minutes, "hours": hours,
+                  "from_hours": f["hours_synced"]}
+        if not f["issue"]:
+            plan["skipped"].append({**common, "reason": "binding has no issue"})
+        elif not sync_hours:
+            plan["skipped"].append({**common, "reason": "sync_hours=False"})
+        elif not has_project:
+            plan["skipped"].append({**common, "reason": "no github project configured"})
+        elif hours <= 0:
+            # Matches today's `if sprint_mins > 0` guard everywhere else: we
+            # never push a 0 to the project's Hours field.
+            plan["skipped"].append({**common, "reason": "no logged minutes"})
+        elif hours == f["hours_synced"]:
+            plan["skipped"].append({**common, "reason": "hours already synced"})
+        else:
+            plan["ops"].append({
+                "op": "hours", **common,
+                "reason": ("hours_synced unknown" if f["hours_synced"] is None
+                           else f"hours changed {f['hours_synced']} -> {hours}"),
+            })
+
+    # 5. Bindings whose sprint has ended are final: Status=Done + close.
+    for f in final:
+        sid = f["sprint_id"]
+        if sid not in by_id or not ended(sid):
+            continue
+        if f["state"] == "closed":
+            continue
+        if not close_past:
+            plan["skipped"].append({
+                "sprint": by_id[sid]["title"], "sprint_id": sid, "issue": f["issue"],
+                "reason": "close_past=False",
+            })
+            continue
+        plan["ops"].append({
+            "op": "close",
+            "sprint_id": sid,
+            "sprint": by_id[sid]["title"],
+            "issue": f["issue"],
+            "reason": "sprint has ended",
+        })
+
+    # Local-only: keep the legacy sprint/sprint_id pointing at whichever sprint
+    # the task's carried-forward "current" issue ends up bound to. Phase 3
+    # retires these fields; until then wt sprint, the TUI board and
+    # task_logged_mins_for_sprint() all read them. Listed as an op so an empty
+    # plan really means "nothing to do".
+    anchor = carry["sprint_id"] if (carry and carry["sprint_id"] in by_id) else latest
+    if anchor and task.get("sprint_id") != anchor:
+        own_start = by_id[own]["start_date"] if own in by_id else None
+        if own_start is not None and own_start > by_id[anchor]["start_date"]:
+            # Never walk the pointer backwards in time.
+            plan["skipped"].append({
+                "sprint": by_id[anchor]["title"], "sprint_id": anchor,
+                "reason": "would move the task's sprint pointer backwards",
+            })
+        else:
+            plan["ops"].append({
+                "op": "relabel",
+                "sprint_id": anchor,
+                "sprint": by_id[anchor]["title"],
+                "from_sprint_id": own,
+                "from_sprint": task.get("sprint"),
+                "reason": "legacy sprint/sprint_id follows the current issue's binding",
+            })
+
+    return plan
+
+
+def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
+                           create_issues: bool = True, close_past: bool = True,
+                           sync_hours: bool = True, dry_run: bool = False,
+                           save_callback=None, progress_callback=None) -> dict:
+    """Bring a task's per-sprint issue bindings in line with its logs.
+
+    Implements plan §2.3 as a diff between the target state derived from
+    ``logs`` + ``sprints`` and the task's existing ``sprint_issues``:
+
+      1. Bucket logs by sprint; sprints with 0 minutes are not targets.
+      2. Target set = {sprints with time} ∪ {current sprint, if the task is
+         open}. The second term replaces the marker-log ritual (plan §1.3).
+      3. Target sprints with no binding get one, plus a GitHub issue when the
+         task has a ``github_repo`` and *create_issues* is set.
+      4. Every binding's hours are recomputed from the logs and pushed only
+         when they differ from the cached ``hours_synced``.
+      5. Bindings whose sprint has ended get Status=Done + a closed issue.
+      6. Bindings are never deleted and ``logs`` is never touched.
+
+    Which issue is "current" follows Option A of plan §2.4: the task's original
+    issue is carried forward to its most recent sprint and newly-minted issues
+    are for the sprints left behind (titled ``Task (Sprint N)``), which is
+    exactly what ``split_cross_sprint_task`` did on GitHub.
+
+    Idempotent: a second run plans nothing and calls nothing.
+
+    ``dry_run=True`` performs **zero** writes — no GitHub call, no mutation of
+    *task*/*data*, no ``save_callback`` — and returns the same result shape
+    describing what would happen. The plan is computed by the pure
+    :func:`_reconcile_plan` and only then executed, so this is structural
+    rather than a per-call-site check.
+
+    Args:
+        sprints: sprint list (``get_all_sprints`` or ``get_cached_sprints``).
+        create_issues: mint GitHub issues for new bindings.
+        close_past: close issues whose sprint has ended.
+        sync_hours: push recomputed hours to the project.
+        dry_run: plan only.
+        save_callback: called after each created binding and once at the end.
+        progress_callback: ``f(msg)`` progress updates.
+
+    Returns:
+        {success, error, dry_run, task, task_id, current_sprint, target,
+         planned, created, repointed, hours_updated, closed, relabeled,
+         skipped, errors, unassigned_minutes, bindings}
+
+        ``success`` is False if any per-sprint operation errored; the remaining
+        sprints are still processed and their results persisted.
+    """
+    def progress(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    plan = _reconcile_plan(task, data, sprints, create_issues=create_issues,
+                           close_past=close_past, sync_hours=sync_hours)
+
+    result = {
+        "success": plan["error"] is None,
+        "error": plan["error"],
+        "dry_run": bool(dry_run),
+        "task": task.get("title"),
+        "task_id": task.get("id"),
+        "current_sprint": plan["current_sprint"],
+        "target": plan["target"],
+        "planned": plan["ops"],
+        "created": [],
+        "repointed": [],
+        "hours_updated": [],
+        "closed": [],
+        "relabeled": None,
+        "skipped": list(plan["skipped"]),
+        "errors": [],
+        "unassigned_minutes": plan["unassigned_minutes"],
+        "bindings": [],
+    }
+
+    if plan["error"] or dry_run or not plan["ops"]:
+        result["bindings"] = [dict(b) for b in task_sprint_bindings(task, sprints)]
+        return result
+
+    # ---- execute -------------------------------------------------------------
+    by_id = {s["id"]: s for s in (sprints or []) if s.get("id")}
+    has_project = bool(data.get("config", {}).get("github_project_number"))
+    needs_project = any(
+        op["op"] in ("hours", "repoint", "close") or op.get("create_issue")
+        for op in plan["ops"]
+    )
+    pi = None
+    if has_project and needs_project:
+        progress("Fetching project info...")
+        try:
+            pi = get_project_info(data)
+        except Exception:
+            pi = None
+
+    bindings = task.get("sprint_issues")
+    if not isinstance(bindings, list):
+        bindings = []
+        task["sprint_issues"] = bindings
+    if plan["seed_legacy"]:
+        seed = _legacy_binding_for_task(task)
+        if seed:
+            _merge_binding(bindings, seed)
+
+    activity = get_task_activity(task)
+    type_val = get_task_type(task)
+    did_work = False
+    failed_sprints = set()
+
+    for op in plan["ops"]:
+        kind = op["op"]
+        sprint = by_id.get(op["sprint_id"])
+        label = op.get("sprint") or op["sprint_id"]
+        if op["sprint_id"] in failed_sprints:
+            # An earlier op for this sprint failed (e.g. issue creation), so the
+            # follow-ups have nothing to act on. One error per sprint, not three.
+            result["skipped"].append({
+                **op, "reason": "aborted: an earlier operation for this sprint failed",
+            })
+            continue
+        try:
+            if kind == "create":
+                binding = {
+                    "sprint_id": op["sprint_id"],
+                    "sprint": op["sprint"],
+                    "issue": None,
+                    "state": "open",
+                    "hours_synced": None,
+                    "synced_at": None,
+                    "created_at": time.time(),
+                }
+                if op["create_issue"]:
+                    progress(f"  {label}: Creating issue...")
+                    issue_ref = create_github_issue(
+                        {"id": uid(), "title": op["issue_title"]}, op["repo"]
+                    )
+                    binding["issue"] = issue_ref
+                    if pi:
+                        progress(f"  {label}: Adding to project...")
+                        item_id = add_issue_to_project(issue_ref, data)
+                        progress(f"  {label}: Setting fields...")
+                        if not op["will_close"]:
+                            # A close op below sets Status=Done; don't push twice.
+                            sync_project_status(issue_ref, task.get("status", "todo"),
+                                                data, project_info=pi, item_id=item_id)
+                        if op["hours"] > 0 and sync_hours:
+                            if update_project_hours(issue_ref, op["hours"], data,
+                                                    project_info=pi, item_id=item_id):
+                                binding["hours_synced"] = op["hours"]
+                                binding["synced_at"] = time.time()
+                        if sprint and sprint.get("field_id"):
+                            update_project_sprint(issue_ref, op["sprint_id"],
+                                                  sprint["field_id"], data,
+                                                  project_info=pi, item_id=item_id)
+                        if activity:
+                            update_project_activity(issue_ref, activity, data,
+                                                    project_info=pi, item_id=item_id)
+                        if type_val:
+                            update_project_type(issue_ref, type_val, data,
+                                                project_info=pi, item_id=item_id)
+                    if op.get("main_issue"):
+                        progress(f"  {label}: Adding comment...")
+                        add_issue_comment(
+                            binding["issue"],
+                            f"Sprint split from {op['main_issue']}. "
+                            "See that issue for full details and notes.",
+                        )
+                _merge_binding(bindings, binding)
+                if binding["issue"] and not task.get("github_issue"):
+                    task["github_issue"] = binding["issue"]
+                did_work = True
+                result["created"].append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "issue": binding["issue"], "minutes": op["minutes"],
+                    "hours": op["hours"],
+                    "skipped_github": op.get("skipped_github"),
+                })
+                if save_callback:
+                    save_callback(data)
+
+            elif kind == "repoint":
+                binding = _find_binding(bindings, issue=op["issue"],
+                                        sprint_id=op["from_sprint_id"])
+                if binding is None:
+                    raise Exception("binding to carry forward has disappeared")
+                binding["sprint_id"] = op["sprint_id"]
+                binding["sprint"] = op["sprint"]
+                if binding.get("issue") and pi and sprint and sprint.get("field_id"):
+                    progress(f"  {label}: Moving issue {binding['issue']} forward...")
+                    item_id = add_issue_to_project(binding["issue"], data)
+                    update_project_sprint(binding["issue"], op["sprint_id"],
+                                          sprint["field_id"], data,
+                                          project_info=pi, item_id=item_id)
+                did_work = True
+                result["repointed"].append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "from_sprint": op.get("from_sprint"), "issue": op["issue"],
+                })
+
+            elif kind == "hours":
+                binding = _find_binding(bindings, issue=op["issue"],
+                                        sprint_id=op["sprint_id"])
+                if binding is None:
+                    raise Exception("binding to sync hours for has disappeared")
+                progress(f"  {label}: Setting hours to {op['hours']}...")
+                item_id = add_issue_to_project(op["issue"], data)
+                if not update_project_hours(op["issue"], op["hours"], data,
+                                            project_info=pi, item_id=item_id):
+                    raise Exception(f"failed to set hours to {op['hours']}")
+                binding["hours_synced"] = op["hours"]
+                binding["synced_at"] = time.time()
+                did_work = True
+                result["hours_updated"].append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "issue": op["issue"], "minutes": op["minutes"],
+                    "hours": op["hours"], "from_hours": op.get("from_hours"),
+                })
+
+            elif kind == "close":
+                binding = _find_binding(bindings, issue=op["issue"],
+                                        sprint_id=op["sprint_id"])
+                if binding is None:
+                    raise Exception("binding to close has disappeared")
+                issue_ref = binding.get("issue")
+                if issue_ref:
+                    if pi:
+                        progress(f"  {label}: Setting Status=Done...")
+                        item_id = add_issue_to_project(issue_ref, data)
+                        sync_project_status(issue_ref, "done", data,
+                                            project_info=pi, item_id=item_id)
+                    progress(f"  {label}: Closing issue...")
+                    if not close_github_issue(issue_ref):
+                        raise Exception(f"failed to close issue {issue_ref}")
+                binding["state"] = "closed"
+                did_work = True
+                result["closed"].append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "issue": issue_ref,
+                })
+
+            elif kind == "relabel":
+                task["sprint_id"] = op["sprint_id"]
+                task["sprint"] = op["sprint"]
+                did_work = True
+                result["relabeled"] = {
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "from_sprint": op.get("from_sprint"),
+                }
+        except Exception as e:
+            result["errors"].append({**op, "error": str(e)})
+            result["success"] = False
+            failed_sprints.add(op["sprint_id"])
+
+    if did_work:
+        _dedupe_bindings(task)
+        _sort_task_bindings(task, sprints)
+        mark_logs_uploaded(task)
+        if save_callback:
+            save_callback(data)
+
+    result["bindings"] = [dict(b) for b in task_sprint_bindings(task, sprints)]
+    return result
+
+
 def split_cross_sprint_task(task: dict, data: dict, save_callback,
                             all_sprints: list[dict] = None,
                             progress_callback=None) -> dict:
-    """Split a task that has logs spanning multiple sprints.
+    """**Deprecated** — thin wrapper over :func:`reconcile_task_sprints`.
 
-    Creates shadow tasks for previous sprints with their own GH issues.
-    The original task is updated to the most recent sprint.
+    Kept so ``tracker.py``, ``mcp_server.py`` and ``cmd_split_sprint`` keep
+    working unchanged through Phase 2; Phase 3 migrates them to call reconcile
+    directly. The historical gate ("only has time in one sprint" → error) and
+    the return-dict keys ``success`` / ``sprint_tasks_created`` / ``main_sprint``
+    / ``error`` are preserved.
 
-    Args:
-        progress_callback: Optional function(msg) called with progress updates.
-
-    Returns dict with:
-        success, sprint_tasks_created, main_sprint, error
+    What changed underneath: previous sprints are recorded as ``sprint_issues``
+    bindings on the task instead of duplicate "shadow" task objects. The GitHub
+    side is unchanged — one issue per sprint, past ones titled
+    ``Task (Sprint N)``, closed, carrying that sprint's hours.
     """
     def progress(msg):
         if progress_callback:
@@ -1695,147 +2270,42 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
         result["error"] = "Task only has time in one sprint"
         return result
 
-    # Most recent sprint (last in sorted list) stays on original task
-    main_sprint_info = summary[-1]
-    previous_sprints = summary[:-1]
+    rec = reconcile_task_sprints(task, data, all_sprints,
+                                 save_callback=save_callback,
+                                 progress_callback=progress_callback)
 
-    # Idempotency: the main task keeps all its logs (source of truth), so a
-    # re-split would otherwise re-detect the same previous sprints and create
-    # duplicate shadow tasks/issues. Skip any previous sprint already billed to
-    # its own issue — as a shadow task, or as a per-sprint binding once the
-    # shadow-to-bindings migration has removed those shadow objects.
-    existing_shadow_sprint_ids = existing_split_sprint_ids(task, data)
+    result["success"] = bool(rec.get("success"))
+    result["error"] = rec.get("error")
+    result["main_sprint"] = task.get("sprint") or (
+        rec["target"][-1]["sprint"] if rec.get("target") else None
+    )
 
-    repo = get_task_repo(task)
-    config = data.get("config", {})
-    has_project = bool(config.get("github_project_number"))
-
-    # Pre-fetch project info once (avoids repeated API calls)
-    pi = None
-    if has_project:
-        progress("Fetching project info...")
-        try:
-            pi = get_project_info(data)
-        except Exception:
-            pass
-
-    for sprint_info in previous_sprints:
-        sprint_label = sprint_info["sprint_title"]
-
-        # Skip sprints that were already split off into a shadow task.
-        if sprint_info["sprint_id"] in existing_shadow_sprint_ids:
+    for entry in rec.get("created", []):
+        result["sprint_tasks_created"].append({
+            "sprint": entry["sprint"],
+            "total_mins": entry["minutes"],
+            "issue_ref": entry.get("issue"),
+        })
+    for entry in rec.get("skipped", []):
+        if entry.get("reason") == "already bound":
             result["sprint_tasks_created"].append({
-                "sprint": sprint_label,
-                "total_mins": sprint_info["total_mins"],
+                "sprint": entry["sprint"],
+                "total_mins": entry.get("minutes", 0),
                 "issue_ref": None,
                 "skipped": "shadow already exists",
             })
-            continue
+    for entry in rec.get("errors", []):
+        result["sprint_tasks_created"].append({
+            "sprint": entry.get("sprint"),
+            "total_mins": entry.get("minutes", 0),
+            "issue_ref": entry.get("issue"),
+            "error": entry["error"],
+        })
+    if not result["success"] and not result["error"]:
+        result["error"] = "; ".join(
+            f"{e.get('sprint')}: {e['error']}" for e in rec.get("errors", [])
+        ) or "reconcile failed"
 
-        shadow_title = f"{task['title']} ({sprint_label})"
-        shadow_task = {
-            "id": uid(),
-            "title": shadow_title,
-            "description": f"Sprint split from: {task['title']}",
-            "role_id": task.get("role_id", "other"),
-            "status": "done",
-            "logs": [{
-                "id": uid(),
-                "minutes": sprint_info["total_mins"],
-                "note": f"Sprint split: {fmt_mins(sprint_info['total_mins'])} from {task['title']}",
-                "at": time.time(),
-            }],
-            "created_at": time.time(),
-            "sprint": sprint_label,
-            "sprint_id": sprint_info["sprint_id"],
-            "cross_sprint_parent": task["id"],
-        }
-        # Shadow tasks inherit the parent's GitHub fields
-        for key in _ROLE_GITHUB_FIELDS:
-            if task.get(key):
-                shadow_task[key] = task[key]
-
-        created_info = {
-            "sprint": sprint_label,
-            "total_mins": sprint_info["total_mins"],
-            "issue_ref": None,
-        }
-
-        # Create GH issue if the task has a repo
-        if repo:
-            try:
-                progress(f"  {sprint_label}: Creating issue...")
-                issue_ref = create_github_issue(
-                    {**shadow_task, "title": shadow_title}, repo
-                )
-                shadow_task["github_issue"] = issue_ref
-                created_info["issue_ref"] = issue_ref
-
-                if pi:
-                    progress(f"  {sprint_label}: Adding to project...")
-                    item_id = add_issue_to_project(issue_ref, data)
-
-                    progress(f"  {sprint_label}: Setting fields...")
-                    sync_project_status(issue_ref, "done", data, project_info=pi, item_id=item_id)
-
-                    hours = mins_to_quarter_hours(sprint_info["total_mins"])
-                    update_project_hours(issue_ref, hours, data, project_info=pi, item_id=item_id)
-
-                    if sprint_info.get("field_id"):
-                        update_project_sprint(
-                            issue_ref, sprint_info["sprint_id"],
-                            sprint_info["field_id"], data,
-                            project_info=pi, item_id=item_id
-                        )
-
-                    activity = get_task_activity(task)
-                    if activity:
-                        update_project_activity(issue_ref, activity, data, project_info=pi, item_id=item_id)
-
-                    type_val = get_task_type(task)
-                    if type_val:
-                        update_project_type(issue_ref, type_val, data, project_info=pi, item_id=item_id)
-
-                # Add comment linking to main task
-                main_issue = task.get("github_issue", "")
-                if main_issue:
-                    progress(f"  {sprint_label}: Adding comment...")
-                    comment = f"Sprint split from {main_issue}. See that issue for full details and notes."
-                    add_issue_comment(issue_ref, comment)
-
-                progress(f"  {sprint_label}: Closing issue...")
-                close_github_issue(issue_ref)
-                mark_logs_uploaded(shadow_task)
-
-            except Exception as e:
-                created_info["error"] = str(e)
-
-        data["tasks"].append(shadow_task)
-        result["sprint_tasks_created"].append(created_info)
-
-    # Update main task sprint to most recent
-    task["sprint"] = main_sprint_info["sprint_title"]
-    task["sprint_id"] = main_sprint_info["sprint_id"]
-    result["main_sprint"] = main_sprint_info["sprint_title"]
-
-    # Update main task's GH issue hours to only the most recent sprint's hours
-    if task.get("github_issue") and pi:
-        progress(f"  Main task: Updating hours and sprint...")
-        main_item_id = add_issue_to_project(task["github_issue"], data)
-        main_hours = mins_to_quarter_hours(main_sprint_info["total_mins"])
-        update_project_hours(task["github_issue"], main_hours, data, project_info=pi, item_id=main_item_id)
-        if main_sprint_info.get("field_id"):
-            update_project_sprint(
-                task["github_issue"], main_sprint_info["sprint_id"],
-                main_sprint_info["field_id"], data,
-                project_info=pi, item_id=main_item_id
-            )
-
-    # Mark all original task logs as uploaded
-    mark_logs_uploaded(task)
-    save_callback(data)
-
-    result["success"] = True
     return result
 
 
@@ -2394,6 +2864,14 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             add_to_project_and_update(task["github_issue"], hours, data)
             result["project_updated"] = True
 
+            # Record what GitHub was told on the matching binding, so a later
+            # reconcile doesn't re-push an identical value.
+            binding = _find_binding(task.get("sprint_issues") or [],
+                                    issue=task["github_issue"])
+            if binding is not None:
+                binding["hours_synced"] = hours
+                binding["synced_at"] = time.time()
+
             # Set activity if the task has one
             activity = get_task_activity(task)
             if activity:
@@ -2426,6 +2904,12 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     # 5. Close the GitHub issue
     if close_github_issue(task["github_issue"]):
         result["issue_closed"] = True
+        # Keep the binding's cached state honest, or a reconcile run after this
+        # sprint ends would try to close an already-closed issue.
+        binding = _find_binding(task.get("sprint_issues") or [],
+                                issue=task["github_issue"])
+        if binding is not None:
+            binding["state"] = "closed"
 
     # 6. Mark as done
     task["status"] = "done"
