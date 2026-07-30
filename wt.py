@@ -96,7 +96,20 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
-DATA_FILE = Path.home() / ".workload_tracker.json"
+def _resolve_data_file() -> Path:
+    """Where the tracker's JSON lives.
+
+    Defaults to ``~/.workload_tracker.json``. ``WT_DATA_FILE`` overrides it so
+    migrations and refactors can be exercised against a throwaway copy instead
+    of the live, iCloud-synced source of truth. Production runs never set it.
+    """
+    override = os.environ.get("WT_DATA_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".workload_tracker.json"
+
+
+DATA_FILE = _resolve_data_file()
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
 
 DEFAULT_ROLES = [
