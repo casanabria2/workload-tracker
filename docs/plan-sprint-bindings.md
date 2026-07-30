@@ -323,8 +323,14 @@ reconcile is no longer something the user has to be told to run.
   only the current binding.
 - Rework `wt sprint`, `wt report`, `wt done` output, `wt split-sprint` →
   `wt sync-sprints`, `wt set-sprint` semantics, `TaskModal`'s sprint Select
-  (the `InvalidSelectValueError` workaround for out-of-window `sprint_id`
-  becomes unnecessary — it edits `start_sprint` now).
+  (retargeted onto `start_sprint`).
+  - **Correction, found during implementation:** this section originally claimed
+    the `InvalidSelectValueError` workaround becomes unnecessary. It does not —
+    it becomes *more* necessary. `start_sprint_id` is frozen at the **earliest**
+    log, so it falls outside the Select's "current + previous 4" window far more
+    often than the old mutable `sprint_id` did (e.g. a task started in Sprint 95
+    with current = Sprint 105). Removing the workaround crashes the edit modal.
+    It was kept and retargeted.
 - MCP: `sprint_split` → `sync_task_sprints`; `get_task` returns bindings.
 
 ### Phase 4 — Retire the rituals
@@ -382,6 +388,41 @@ Manual smoke pass per phase: `wt list`, `wt sprint`, `wt report --sprint
 task with an old start sprint.
 
 ---
+
+## 6b. Known follow-ups (found while implementing phases 1–4, not fixed)
+
+Deliberately left out of scope so the phases stayed reviewable. None affects the
+"GitHub state is unchanged" property.
+
+1. **Three loaders, three migrations.** `wt.load()`, `mcp_server.load()` and
+   `tracker.load_data()` are independent; each needed
+   `_migrate_shadows_to_bindings` wired in separately. A shared loader would stop
+   the next migration from having to be remembered three times.
+2. **`get_sprint_date_range_for_task()` still keys on legacy `task["sprint_id"]`**,
+   so the TUI calendar modal's default date range for a carried-over task points
+   at the pre-rollover sprint. Should consult `current_binding()`.
+3. **`cmd_add` / `create_task_from_issue` set only `sprint`/`sprint_id`**, never
+   `start_sprint*`, so `wt sprint`'s "started Sprint N" is blank for
+   CLI-created tasks until their first reconcile. The TUI sets both.
+4. **Closing an open carry-over task can report 0h.** Reconcile targets the
+   current sprint for an open task, then `close_task` reports that binding — so
+   a task with no minutes yet in the current sprint closes its carried-forward
+   issue at 0.0h. This matches the old marker-log outcome, but reporting the
+   latest sprint *with time* may be the better rule. **Policy decision, not a
+   bug** — needs Carlos.
+5. **A stray 8-second timer log mints a whole past-sprint issue** billed at
+   0.25h, because `mins_to_quarter_hours` rounds up per sprint (preserved
+   deliberately, §5). A minimum-minutes threshold in `_reconcile_plan` would
+   avoid it.
+6. **`setup_issue_in_project()` sets the project Sprint field from the legacy
+   `task["sprint_id"]`** while taking Hours from the current binding. The
+   reconcile's `relabel` op keeps them agreeing today, but `wt set-sprint` no
+   longer touches `sprint_id`, so they could in principle diverge.
+7. **`close_task`'s "no issue" refusal is detected by string match** in
+   `mcp_server`; a structured `error_code` would be sturdier.
+8. **Legacy `sprint`/`sprint_id`/`github_issue` keys are still written** as a
+   mirror. Retiring them needs all three loaders updated at once plus both Macs
+   on the new code — a coordinated phase of its own.
 
 ## 7. Open questions for Carlos
 
