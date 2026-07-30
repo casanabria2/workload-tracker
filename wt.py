@@ -155,6 +155,9 @@ def load() -> dict:
     # Move github_repo/activity/type from roles onto tasks (one-time copy,
     # roles stripped on every load). Idempotent on subsequent runs.
     mutated = _migrate_role_github_fields(data) or mutated
+    # Convert cross-sprint shadow tasks into per-sprint issue bindings (one-time),
+    # and strip re-introduced shadows on every load. Idempotent.
+    mutated = _migrate_shadows_to_bindings(data) or mutated
     if mutated:
         save(data)
     return data
@@ -354,6 +357,192 @@ def _migrate_role_github_fields(data: dict) -> bool:
     return mutated
 
 
+def _merge_binding(bindings: list[dict], new: dict) -> bool:
+    """Append *new* to *bindings* unless its sprint_id is already bound.
+
+    One binding per sprint (plan §6 invariant 4). On collision the entry that
+    carries an ``issue`` wins; otherwise the incumbent is kept. Returns True if
+    *bindings* was modified.
+    """
+    sprint_id = new.get("sprint_id")
+    existing = None
+    if sprint_id:
+        existing = next((b for b in bindings if b.get("sprint_id") == sprint_id), None)
+    if existing is None:
+        bindings.append(new)
+        return True
+    if new.get("issue") and not existing.get("issue"):
+        bindings[bindings.index(existing)] = new
+        return True
+    return False
+
+
+def _dedupe_bindings(task: dict) -> bool:
+    """Collapse duplicate sprint_ids in a task's bindings. True if changed."""
+    bindings = task.get("sprint_issues")
+    if not isinstance(bindings, list) or len(bindings) < 2:
+        return False
+    kept: list[dict] = []
+    for b in bindings:
+        _merge_binding(kept, b)
+    if len(kept) == len(bindings):
+        return False
+    task["sprint_issues"] = kept
+    return True
+
+
+def _sort_task_bindings(task: dict, sprints: list[dict]) -> bool:
+    """Store a task's bindings in chronological (sprint start_date) order.
+
+    Keeping the persisted list sorted means "the last binding" is always the
+    most recent sprint, so ``task_current_issue(task)`` picks the right issue
+    even when it is called without *data* (no sprint cache to sort by). Bindings
+    whose sprint can't be resolved keep sorting first, so they never become the
+    accidental "current" one. Returns True if the order changed.
+    """
+    bindings = task.get("sprint_issues")
+    if not isinstance(bindings, list) or len(bindings) < 2:
+        return False
+    start_by_id = {s["id"]: s.get("start_date") for s in (sprints or [])}
+    ordered = sorted(
+        bindings,
+        key=lambda b: _sprint_start_sort_key(start_by_id.get(b.get("sprint_id"))),
+    )
+    if ordered == bindings:
+        return False
+    task["sprint_issues"] = ordered
+    return True
+
+
+def _ensure_bindings(task: dict) -> list[dict]:
+    """Return the task's ``sprint_issues`` list, seeding it from legacy fields."""
+    bindings = task.get("sprint_issues")
+    if not isinstance(bindings, list):
+        legacy = _legacy_binding_for_task(task)
+        bindings = [legacy] if legacy else []
+        task["sprint_issues"] = bindings
+    return bindings
+
+
+def _shadow_binding(shadow: dict) -> dict:
+    """Build the parent binding that replaces a shadow task object.
+
+    The shadow's hours are preserved as ``hours_synced`` (what GitHub was told)
+    and its newest log timestamp as ``synced_at``. Its synthetic "Sprint split"
+    marker log is deliberately dropped: the parent already holds the real logs,
+    so merging would double-count (plan §4 Phase 1, step 4).
+    """
+    logs = shadow.get("logs", []) or []
+    marker_mins = sum(l.get("minutes", 0) for l in logs)
+    stamps = [l.get("at") for l in logs if l.get("at")]
+    return {
+        "sprint_id": shadow.get("sprint_id"),
+        "sprint": shadow.get("sprint"),
+        "issue": shadow.get("github_issue"),
+        "state": "closed",
+        "hours_synced": mins_to_quarter_hours(marker_mins) if marker_mins else None,
+        "synced_at": max(stamps) if stamps else None,
+        "created_at": shadow.get("created_at"),
+    }
+
+
+def _migrate_shadows_to_bindings(data: dict) -> bool:
+    """Replace cross-sprint shadow tasks with per-sprint issue bindings.
+
+    See docs/plan-sprint-bindings.md §2.1/§4. Two parts:
+
+      * One-time conversion (guarded by ``config["sprint_bindings_migrated"]``):
+        give every task a ``sprint_issues`` list seeded from its legacy
+        ``sprint_id``/``github_issue``, and freeze ``start_sprint_id`` /
+        ``start_sprint`` from its earliest log (offline, via the sprints cache;
+        left unset when the sprint can't be resolved).
+      * Shadow sweep (**every load**): any task carrying ``cross_sprint_parent``
+        is converted into a binding on its parent and deleted, mirroring how
+        ``_migrate_role_github_fields`` keeps stripping legacy role keys — an
+        older wt.py on another Mac can re-introduce shadows via iCloud.
+
+    Legacy ``sprint``/``sprint_id``/``github_issue`` keys are kept (Phase 1 is
+    additive plus shadow removal; Phase 3 stops reading them). ``logs`` and the
+    per-task ``github_repo``/``activity``/``type`` are never touched.
+
+    Orphan shadows (parent id not in the data) are left alone and reported via
+    ``logging.warning`` rather than silently deleted.
+
+    Returns True if any mutation occurred. Idempotent on repeat runs.
+    """
+    mutated = False
+    config = data.setdefault("config", {})
+    tasks = data.get("tasks", [])
+    first_run = not config.get("sprint_bindings_migrated")
+
+    # 1. Seed each real task's bindings from its legacy fields (one-time).
+    if first_run:
+        for task in tasks:
+            if task.get("cross_sprint_parent"):
+                continue  # shadows are removed below, not migrated
+            if task.get("sprint_issues") is None:
+                _ensure_bindings(task)
+                mutated = True
+
+    # 2/4. Convert shadows into parent bindings and drop the shadow objects.
+    by_id = {t["id"]: t for t in tasks if t.get("id")}
+    survivors = []
+    orphans = []
+    for task in tasks:
+        parent_id = task.get("cross_sprint_parent")
+        if not parent_id:
+            survivors.append(task)
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            # 5. Orphan: keep it, report it. Never destroy data we can't re-home.
+            orphans.append(task)
+            survivors.append(task)
+            continue
+        if _merge_binding(_ensure_bindings(parent), _shadow_binding(task)):
+            mutated = True
+        mutated = True  # the shadow object itself goes away
+    if len(survivors) != len(tasks):
+        data["tasks"] = survivors
+        tasks = survivors
+
+    if orphans:
+        logging.warning(
+            "sprint bindings migration: %d shadow task(s) kept — parent missing: %s",
+            len(orphans),
+            ", ".join(f"{t.get('title', '?')} (parent {t.get('cross_sprint_parent')})"
+                      for t in orphans),
+        )
+
+    # Sprint dates come from the persisted cache — this migration never touches
+    # the network (load() must stay offline).
+    sprints = get_cached_sprints(data)
+
+    # 3. Freeze the start sprint from the earliest log (one-time, offline).
+    if first_run:
+        if sprints:
+            for task in tasks:
+                if task.get("cross_sprint_parent") or task.get("start_sprint_id"):
+                    continue
+                start = task_start_sprint(task, sprints)
+                if start:
+                    task["start_sprint_id"] = start["id"]
+                    task["start_sprint"] = start["title"]
+                    mutated = True
+        config["sprint_bindings_migrated"] = True
+        mutated = True
+
+    # 9. One binding per sprint, always — and keep the list chronological so
+    #    bindings[-1] is the most recent sprint.
+    for task in tasks:
+        if _dedupe_bindings(task):
+            mutated = True
+        if _sort_task_bindings(task, sprints):
+            mutated = True
+
+    return mutated
+
+
 def resolve_task_by_id(data: dict, task_id: str) -> dict | None:
     """Find a task by its exact ID."""
     return next((t for t in data.get("tasks", []) if t["id"] == task_id), None)
@@ -479,6 +668,30 @@ def task_logged_mins_for_sprint(task: dict, sprints: list) -> float:
         if sprint["start_date"] <= log_date < sprint["end_date"]:
             total += log.get("minutes", 0)
     return total
+
+
+def existing_split_sprint_ids(task: dict, data: dict) -> set:
+    """Sprints of *task* that a previous split already billed to their own issue.
+
+    Union of two representations of the same fact, so the split stays idempotent
+    across the Phase-1 migration:
+      * legacy shadow task objects (``cross_sprint_parent == task["id"]``), and
+      * the task's own ``sprint_issues`` bindings other than the one for its
+        current ``sprint_id`` (which is the main issue, not a split-off one).
+
+    Before migration this returns exactly the old shadow-id set.
+    """
+    ids = {
+        t.get("sprint_id")
+        for t in data.get("tasks", [])
+        if t.get("cross_sprint_parent") == task.get("id")
+    }
+    own = task.get("sprint_id")
+    for binding in task_sprint_bindings(task):
+        sprint_id = binding.get("sprint_id")
+        if sprint_id and sprint_id != own:
+            ids.add(sprint_id)
+    return ids
 
 
 def task_uploaded_mins(task: dict) -> float:
@@ -1024,13 +1237,27 @@ def bucket_logs_by_sprint(task: dict, sprints: list[dict]) -> dict:
     return buckets
 
 
-def sprint_summary_for_task(task: dict, sprints: list[dict]) -> list[dict]:
-    """Get per-sprint breakdown of logged time for a task.
+def _sprint_start_sort_key(start_date):
+    """Sort key for a sprint's start_date that tolerates None/unknown sprints.
 
-    Returns list of dicts sorted by sprint start date:
-        [{sprint_id, sprint_title, field_id, start_date, logs, total_mins}, ...]
-    Only includes sprints that have logged time (excludes None bucket).
+    Unresolvable sprints sort first (they can never be "the most recent").
     """
+    from datetime import date
+    return start_date if start_date is not None else date.min
+
+
+def _sprint_time_entries(task: dict, sprints: list[dict], include_zero: bool = False) -> list[dict]:
+    """Per-sprint breakdown of a task's logged time, sorted by sprint start date.
+
+    Shared implementation behind ``sprint_summary_for_task`` (legacy, keeps
+    zero-minute sprints) and ``task_sprints_with_time`` (drops them).
+
+    ``start_date`` in each entry is the sprint's ``start_date`` **date object**,
+    which both ``get_all_sprints()`` and ``get_cached_sprints()`` provide — the
+    old code read the camelCase ``startDate`` that only the former produces, so
+    passing cached sprints sorted every entry by ``""`` (see plan §1.7).
+    """
+    sprints = sprints or []
     buckets = bucket_logs_by_sprint(task, sprints)
     sprint_map = {s["id"]: s for s in sprints}
     result = []
@@ -1038,16 +1265,180 @@ def sprint_summary_for_task(task: dict, sprints: list[dict]) -> list[dict]:
         if sprint_id is None:
             continue
         s = sprint_map.get(sprint_id, {})
+        total_mins = sum(l.get("minutes", 0) for l in logs)
+        if not include_zero and total_mins <= 0:
+            continue
         result.append({
             "sprint_id": sprint_id,
             "sprint_title": s.get("title", "Unknown"),
             "field_id": s.get("field_id"),
-            "start_date": s.get("startDate", ""),
+            "start_date": s.get("start_date"),
             "logs": logs,
-            "total_mins": sum(l.get("minutes", 0) for l in logs),
+            "total_mins": total_mins,
         })
-    result.sort(key=lambda x: x["start_date"])
+    result.sort(key=lambda x: _sprint_start_sort_key(x["start_date"]))
     return result
+
+
+def sprint_summary_for_task(task: dict, sprints: list[dict]) -> list[dict]:
+    """Get per-sprint breakdown of logged time for a task.
+
+    Returns list of dicts sorted by sprint start date:
+        [{sprint_id, sprint_title, field_id, start_date, logs, total_mins}, ...]
+    Only includes sprints that have logged time (excludes None bucket).
+
+    Legacy shim: delegates to ``_sprint_time_entries`` with ``include_zero=True``
+    so its current callers (the split machinery, which relies on zero-minute
+    "sprint rollover marker" logs creating a bucket) keep their behaviour while
+    picking up the start_date sort fix. New code should use
+    ``task_sprints_with_time``.
+    """
+    return _sprint_time_entries(task, sprints, include_zero=True)
+
+
+def task_sprints_with_time(task: dict, sprints: list[dict]) -> list[dict]:
+    """Sprints in which this task has logged time, oldest first.
+
+    Replacement for ``sprint_summary_for_task``: same entry shape
+    ``{sprint_id, sprint_title, field_id, start_date, logs, total_mins}`` but
+    sorted by the real ``start_date`` date object and excluding sprints whose
+    total is zero (e.g. the marker-log hack of plan §1.3).
+    """
+    return _sprint_time_entries(task, sprints, include_zero=False)
+
+
+# --- Per-sprint issue bindings (plan §2.1/§2.2) --------------------------------
+#
+# A task carries ``sprint_issues``: one binding per sprint the work was billed
+# to, replacing the "shadow task" duplicates. Every accessor below falls back to
+# the legacy ``sprint``/``sprint_id``/``github_issue`` fields, so they are safe
+# to call on un-migrated data.
+
+
+def _legacy_binding_for_task(task: dict) -> dict | None:
+    """Synthesize a binding from a task's legacy sprint/issue fields.
+
+    Returns None when the task has neither a ``sprint_id`` nor a
+    ``github_issue`` (nothing to bind).
+    """
+    sprint_id = task.get("sprint_id")
+    issue = task.get("github_issue")
+    if not sprint_id and not issue:
+        return None
+    return {
+        "sprint_id": sprint_id,
+        "sprint": task.get("sprint"),
+        "issue": issue,
+        "state": "closed" if task.get("status") == "done" else "open",
+        "hours_synced": None,
+        "synced_at": None,
+        "created_at": task.get("created_at"),
+    }
+
+
+def task_sprint_bindings(task: dict, sprints: list[dict] = None) -> list[dict]:
+    """Return the task's per-sprint issue bindings. Never None.
+
+    Sorted by the binding's sprint ``start_date`` when *sprints* is supplied,
+    otherwise left in insertion order. When the task has no ``sprint_issues``
+    key at all (un-migrated data) a single binding is synthesized from the
+    legacy fields — synthesized, not persisted. An explicitly empty list is
+    respected as "this task has no bindings".
+    """
+    bindings = task.get("sprint_issues")
+    if bindings is None:
+        legacy = _legacy_binding_for_task(task)
+        bindings = [legacy] if legacy else []
+    elif not isinstance(bindings, list):
+        return []
+    if not sprints or not bindings:
+        return list(bindings)
+    start_by_id = {s["id"]: s.get("start_date") for s in sprints}
+    return sorted(
+        bindings,
+        key=lambda b: _sprint_start_sort_key(start_by_id.get(b.get("sprint_id"))),
+    )
+
+
+def task_binding_for_sprint(task: dict, sprint_id: str) -> dict | None:
+    """The task's binding for *sprint_id*, or None."""
+    if not sprint_id:
+        return None
+    for b in task_sprint_bindings(task):
+        if b.get("sprint_id") == sprint_id:
+            return b
+    return None
+
+
+def task_current_issue(task: dict, data: dict = None) -> str | None:
+    """The issue ref that "is" this task's current GitHub issue.
+
+    Resolution order:
+      1. The binding for the current sprint — resolved **offline** from
+         ``get_cached_sprints(data)`` + today's date when *data* is given.
+      2. The binding with the latest sprint ``start_date`` (needs the cache).
+      3. The last binding in insertion order.
+      4. The legacy ``task["github_issue"]``.
+
+    Never makes a network call, so it is safe on every hot path.
+    """
+    bindings = task_sprint_bindings(task)
+    candidates = []
+    if bindings:
+        sprints = get_cached_sprints(data) if data is not None else []
+        if sprints:
+            current = find_sprint_for_date(sprints, datetime.now().date())
+            if current:
+                b = next((x for x in bindings if x.get("sprint_id") == current["id"]), None)
+                if b is not None:
+                    candidates.append(b)
+            candidates.append(task_sprint_bindings(task, sprints)[-1])
+        candidates.append(bindings[-1])
+    for b in candidates:
+        if b.get("issue"):
+            return b["issue"]
+    return task.get("github_issue")
+
+
+def task_start_sprint(task: dict, sprints: list[dict]) -> dict | None:
+    """The sprint this task started in.
+
+    Uses the frozen ``start_sprint_id`` when set, otherwise derives it from the
+    task's earliest log (``log_effective_date``). Derive-only: this never writes
+    the field — freezing happens in ``_migrate_shadows_to_bindings``.
+    """
+    sprints = sprints or []
+    frozen = task.get("start_sprint_id")
+    if frozen:
+        return next((s for s in sprints if s["id"] == frozen), None)
+    stamps = [ts for ts in (log_effective_date(l) for l in task.get("logs", [])) if ts]
+    if not stamps:
+        return None
+    return find_sprint_for_date(sprints, datetime.fromtimestamp(min(stamps)).date())
+
+
+def task_mins_for_sprint(task: dict, sprint_id: str, sprints: list[dict]) -> float:
+    """Minutes logged by *task* inside *sprint_id*'s half-open date range.
+
+    Unlike the legacy ``task_logged_mins_for_sprint`` there is **no** "sprint
+    unknown → return the task total" fallback (which silently over-reports):
+    an unresolvable sprint, or a task whose logs carry no usable timestamp,
+    contributes 0.0 to that sprint.
+    """
+    if not sprint_id or not sprints:
+        return 0.0
+    sprint = next((s for s in sprints if s.get("id") == sprint_id), None)
+    if not sprint or not sprint.get("start_date") or not sprint.get("end_date"):
+        return 0.0
+    total = 0.0
+    for log in task.get("logs", []):
+        ts = log_effective_date(log)
+        if not ts:
+            continue
+        log_date = datetime.fromtimestamp(ts).date()
+        if sprint["start_date"] <= log_date < sprint["end_date"]:
+            total += log.get("minutes", 0)
+    return total
 
 
 def logs_in_date_range(
@@ -1310,13 +1701,10 @@ def split_cross_sprint_task(task: dict, data: dict, save_callback,
 
     # Idempotency: the main task keeps all its logs (source of truth), so a
     # re-split would otherwise re-detect the same previous sprints and create
-    # duplicate shadow tasks/issues. Skip any previous sprint that already has
-    # a shadow task for this parent.
-    existing_shadow_sprint_ids = {
-        t.get("sprint_id")
-        for t in data.get("tasks", [])
-        if t.get("cross_sprint_parent") == task["id"]
-    }
+    # duplicate shadow tasks/issues. Skip any previous sprint already billed to
+    # its own issue — as a shadow task, or as a per-sprint binding once the
+    # shadow-to-bindings migration has removed those shadow objects.
+    existing_shadow_sprint_ids = existing_split_sprint_ids(task, data)
 
     repo = get_task_repo(task)
     config = data.get("config", {})
@@ -5169,12 +5557,9 @@ def cmd_split_sprint(args):
         print(c(f"Task '{task['title']}' only has time in {sprint_name}. No split needed.", "dim"))
         return
 
-    # Sprints already split off into shadow tasks won't be recreated.
-    existing_shadow_sprint_ids = {
-        t.get("sprint_id")
-        for t in data.get("tasks", [])
-        if t.get("cross_sprint_parent") == task["id"]
-    }
+    # Sprints already billed to their own issue (shadow task or binding) won't
+    # be recreated — same set the split itself uses.
+    existing_shadow_sprint_ids = existing_split_sprint_ids(task, data)
 
     # Show breakdown
     print(c(f"\n  Sprint breakdown for: {task['title']}\n", "bold"))
