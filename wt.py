@@ -920,12 +920,49 @@ PROJECT_STATUS_MAP = {
 }
 
 
-def get_project_info(data: dict) -> dict:
+# Project field metadata (project id + field/option ids) costs two GraphQL-backed
+# `gh project` calls to fetch and changes only when the GitHub Project itself is
+# edited. It used to be re-fetched per call site — `wt sync-sprints --all` over 67
+# tasks burned ~134 of them and exhausted the 5000-point GraphQL budget mid-run,
+# which surfaced as `gh`'s unhelpful "unknown owner type". Memoised per
+# (owner, project number) with a short TTL: a burst run pays for it once, while a
+# long-lived process (the TUI) still picks up new Activity/Type options within a
+# few minutes rather than needing a restart.
+PROJECT_INFO_TTL_SECONDS = 300
+_PROJECT_INFO_CACHE: dict = {}
+
+
+def clear_project_info_cache() -> None:
+    """Drop the memoised project metadata. For tests and explicit refreshes."""
+    _PROJECT_INFO_CACHE.clear()
+
+
+def get_project_info(data: dict, refresh: bool = False) -> dict:
     """Get project ID and field information.
 
     Returns dict with project_id, status_field, hours_field, status_options, etc.
     Raises Exception if project not configured or fields missing.
+
+    Memoised for ``PROJECT_INFO_TTL_SECONDS``; pass ``refresh=True`` to force a
+    re-fetch. Failures are never cached, so a transient error doesn't stick.
     """
+    config = data.get("config", {})
+    key = (config.get("github_project_owner", "grafana"),
+           config.get("github_project_number"))
+    if not refresh:
+        hit = _PROJECT_INFO_CACHE.get(key)
+        if hit and (time.time() - hit[0]) < PROJECT_INFO_TTL_SECONDS:
+            # Keep the local Activity/Type options cache warm on hits too, so
+            # behaviour matches an uncached fetch exactly.
+            save_project_options_cache(data, hit[1])
+            return hit[1]
+    info = _fetch_project_info(data)
+    _PROJECT_INFO_CACHE[key] = (time.time(), info)
+    return info
+
+
+def _fetch_project_info(data: dict) -> dict:
+    """Uncached fetch behind :func:`get_project_info` — two `gh project` calls."""
     config = data.get("config", {})
     owner = config.get("github_project_owner", "grafana")
     project_num = config.get("github_project_number")

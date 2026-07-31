@@ -446,6 +446,24 @@ Deliberately left out of scope so the phases stayed reviewable. None affects the
    exactly the 41 no-ops plus the 2 upward corrections. Covered by
    `tools/test_reconcile.py` group 12.
 
+4c. ~~**`get_project_info()` re-fetched per task.**~~ **FIXED 2026-07-31.**
+   Project metadata (project id + field/option ids) costs two GraphQL-backed `gh
+   project` calls and changes only when the Project itself is edited, but it was
+   re-fetched at every call site — including inside each `update_project_*`
+   helper when `project_info` wasn't passed down. A `sync-sprints --all` over ~75
+   tasks made **118** metadata calls and exhausted the 5000-point GraphQL budget
+   mid-run, failing 17 tasks with `gh`'s misleading `unknown owner type`.
+
+   Now memoised per (owner, project number) with a 300s TTL, so a burst run pays
+   once (118 → **2**) while a long-lived TUI still picks up new Activity/Type
+   options within minutes. Failures are never cached; `refresh=True` /
+   `clear_project_info_cache()` force a re-fetch. Covered by
+   `tools/test_reconcile.py` group 13.
+
+   Note the partial failure was clean: per-sprint error isolation meant every
+   successful write persisted and nothing was left half-applied, so the retry
+   only had to do the remainder.
+
 5. **A stray 8-second timer log mints a whole past-sprint issue** billed at
    0.25h, because `mins_to_quarter_hours` rounds up per sprint (preserved
    deliberately, §5). A minimum-minutes threshold in `_reconcile_plan` would
