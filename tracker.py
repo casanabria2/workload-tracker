@@ -79,7 +79,8 @@ from wt import (
     # task_reportable_mins() (the current binding's sprint, never the task
     # total, which would double-count a carry-over); and the cross-sprint split
     # is now the idempotent reconcile_task_sprints().
-    _migrate_shadows_to_bindings, task_current_issue, set_task_current_issue,
+    _migrate_shadows_to_bindings, _migrate_recurrent_series_to_bindings,
+    task_current_issue, set_task_current_issue,
     clear_task_current_issue, task_binding_for_sprint, task_start_sprint,
     task_reportable_mins, task_sprints_with_time, reconcile_task_sprints,
     close_task as wt_close_task, current_binding,
@@ -157,6 +158,7 @@ def load_data() -> dict:
     # guarantee, and without it a synced-in shadow would show up as a duplicate
     # task and double-count in the overview totals.
     mutated = _migrate_shadows_to_bindings(data) or mutated
+    mutated = _migrate_recurrent_series_to_bindings(data) or mutated
     if mutated:
         DATA_FILE.write_text(json.dumps(data, indent=2))
     return data

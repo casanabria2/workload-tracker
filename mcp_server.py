@@ -34,7 +34,7 @@ from wt import get_task_repo, get_cached_project_options, _migrate_role_github_f
 # ``task_current_issue`` and every write through ``set_task_current_issue`` /
 # ``clear_task_current_issue``; hours come from ``task_reportable_mins``; the
 # cross-sprint split is now ``reconcile_task_sprints``.
-from wt import _migrate_shadows_to_bindings
+from wt import _migrate_shadows_to_bindings, _migrate_recurrent_series_to_bindings
 from wt import (task_current_issue, set_task_current_issue, clear_task_current_issue,
                 current_binding, task_issue_refs, task_sprint_bindings,
                 task_start_sprint, task_reportable_mins, task_sprints_with_time,
@@ -90,6 +90,7 @@ def load() -> dict:
     # would write a shadow-bearing file back over a migrated one. Note the
     # deliberate non-short-circuit: both migrations always run.
     mutated = _migrate_shadows_to_bindings(data) or mutated
+    mutated = _migrate_recurrent_series_to_bindings(data) or mutated
     if mutated:
         save(data)
     return data
@@ -1047,6 +1048,15 @@ def close_previous_recurrent_tasks(all_previous: bool = False, dry_run: bool = F
         dry_run: If True, only list the tasks that would be closed without making
             any changes.
     """
+    return (
+        "close_previous_recurrent_tasks has been retired.\n\n"
+        "Recurring work is now one perpetual task with a GitHub issue per\n"
+        "sprint, so there are no per-sprint copies to close. The merged task\n"
+        "matches this tool's old selection rule, so running it would end the\n"
+        "recurrence outright.\n\n"
+        "Use sync_task_sprints(all_tasks=True, create_issues=True) instead: it\n"
+        "closes the sprint that just ended and opens the new one."
+    )
     data = load()
     current = get_current_sprint(data)
     if not current:
@@ -1915,13 +1925,12 @@ def sync_task_sprints(
             return f"No task found matching '{task_query}'"
         candidates = [task]
 
-    # Requirement (b): skip recurrent tasks and say so.
-    targets, skipped_tasks = [], []
-    for t in candidates:
-        if t.get("status") == "recurrent":
-            skipped_tasks.append(t)
-            continue
-        targets.append(t)
+    # Phase 5 removed the recurrent exclusion: a recurring series is no longer a
+    # cloned task per sprint but one perpetual task with a binding per sprint, so
+    # reconcile is exactly what it needs — it closes the sprint that just ended and
+    # mints the new one, which is what close_previous_recurrent_tasks and
+    # wt new-recurrent used to do by hand.
+    targets, skipped_tasks = list(candidates), []
 
     header = []
     if from_cache:

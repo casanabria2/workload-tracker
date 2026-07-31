@@ -148,6 +148,30 @@ class Stubs:
 
 # ------------------------------------------------------------------- fixtures --
 
+def expected_task_count(wt, fixture):
+    """Tasks a fully-migrated *fixture* should end up with.
+
+    Derived, not hardcoded: the shadow migration drops every task carrying
+    cross_sprint_parent, and the Phase 5 merge collapses each known recurrent
+    series to a single task. Hardcoding a number here just means the harness
+    breaks every time a migration legitimately changes the shape.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    raw = _json.loads(_Path(fixture).read_text())
+    tasks = raw.get("tasks", [])
+    shadows = sum(1 for t in tasks if t.get("cross_sprint_parent"))
+    series = {}
+    for t in tasks:
+        if t.get("cross_sprint_parent"):
+            continue
+        canon = wt.recurrent_series_for_title(t.get("title", ""))
+        if canon:
+            series[canon] = series.get(canon, 0) + 1
+    merged_away = sum(n - 1 for n in series.values() if n > 1)
+    return len(tasks) - shadows - merged_away
+
+
 def load_copy(wt, src, dst):
     """Copy *src* to *dst*, point wt at it and wt.load() it.
 
@@ -581,7 +605,9 @@ def test_close_task(wt, migrated, scratch):
     check(task["status"] == "done", "task marked done")
     check(all("cross_sprint_parent" not in t for t in data["tasks"]),
           "no shadow task objects created")
-    check(len(data["tasks"]) == 80, "no tasks added", str(len(data["tasks"])))
+    want = expected_task_count(wt, migrated)
+    check(len(data["tasks"]) == want, "no unexpected tasks added or removed",
+          f'{len(data["tasks"])} vs expected {want}')
     bound = {b["sprint"]: b for b in task["sprint_issues"]}
     # close_task passes closing=True, so no empty binding is reserved for the
     # current sprint (Sprint 105 has no logs). The task's long-lived issue lands
@@ -658,9 +684,11 @@ def test_set_sprint_drift(wt, migrated, scratch):
 def test_pre_migration(wt, fixture, scratch):
     section("9. reconcile on a pre-migration fixture (load() migrates first)")
     data = load_copy(wt, fixture, scratch / "pre.json")
-    check(len(data["tasks"]) == 80 and not any(t.get("cross_sprint_parent")
-                                              for t in data["tasks"]),
-          "load() migrated 92 -> 80 tasks, 0 shadows",
+    want = expected_task_count(wt, fixture)
+    check(len(data["tasks"]) == want and not any(t.get("cross_sprint_parent")
+                                                for t in data["tasks"]),
+          f"load() migrated the fixture to {want} tasks with 0 shadows",
+          f'{len(data["tasks"])} tasks'
           f"{len(data['tasks'])} tasks")
     sprints = wt.get_cached_sprints(data)
     task = find(data, "IRON Infusion")
@@ -850,6 +878,112 @@ def test_project_info_cache(wt, migrated, scratch):
         wt.clear_project_info_cache()
 
 
+def test_phase5_merge(wt, fixture, scratch):
+    section("14. Phase 5: recurrent clones merge into one task per series")
+    import json as _json
+    raw = _json.loads(Path(fixture).read_text())
+
+    pre_series = {}
+    for t in raw["tasks"]:
+        if t.get("cross_sprint_parent"):
+            continue
+        canon = wt.recurrent_series_for_title(t.get("title", ""))
+        if canon:
+            pre_series.setdefault(canon, []).append(t)
+    pre_issues = {b["issue"] for t in raw["tasks"]
+                  for b in (t.get("sprint_issues") or []) if b.get("issue")}
+    pre_mins = round(sum(l.get("minutes", 0) for t in raw["tasks"]
+                         if not t.get("cross_sprint_parent")
+                         for l in t.get("logs", [])), 6)
+    pre_log_ids = {l.get("id") for t in raw["tasks"]
+                   if not t.get("cross_sprint_parent") for l in t.get("logs", [])}
+    print(f"    {len(pre_series)} series, "
+          f"{sum(len(v) for v in pre_series.values())} clones pre-merge")
+
+    data = load_copy(wt, fixture, scratch / "phase5.json")
+
+    merged = [t for t in data["tasks"] if wt.recurrent_series_for_title(t["title"])]
+    check(len(merged) == len(pre_series),
+          f"one task per series survives ({len(pre_series)})", str(len(merged)))
+    check(all(" - Sprint " not in t["title"] for t in merged),
+          "no survivor keeps a '- Sprint N' suffix",
+          str([t["title"] for t in merged if " - Sprint " in t["title"]]))
+
+    # Nothing may be lost: not a log, not an issue reference.
+    post_mins = round(sum(l.get("minutes", 0) for t in data["tasks"]
+                          for l in t.get("logs", [])), 6)
+    post_log_ids = {l.get("id") for t in data["tasks"] for l in t.get("logs", [])}
+    post_issues = set()
+    for t in data["tasks"]:
+        for b in t.get("sprint_issues") or []:
+            if b.get("issue"):
+                post_issues.add(b["issue"])
+            post_issues.update(b.get("superseded_issues") or [])
+    check(post_mins == pre_mins, "total minutes unchanged", f"{pre_mins} -> {post_mins}")
+    check(post_log_ids == pre_log_ids, "every log id survives",
+          f"lost={sorted(pre_log_ids - post_log_ids)[:3]}")
+    check(pre_issues <= post_issues,
+          "every issue reference survives (as a binding or superseded)",
+          f"lost={sorted(pre_issues - post_issues)[:3]}")
+
+    # A clone whose title named one sprint but whose logs fell in another produced
+    # two issues for a single sprint. One must be kept as the primary and the other
+    # recorded — never silently dropped, or the project double-counts that sprint.
+    supers = [(t["title"], b["sprint"], b["issue"], b["superseded_issues"])
+              for t in data["tasks"] for b in (t.get("sprint_issues") or [])
+              if b.get("superseded_issues")]
+    for title, sprint, primary, extra in supers:
+        print(f"    superseded on {title[:34]!r} {sprint}: {primary} over {extra}")
+    # Whether a real collision exists depends on the fixture's vintage (it needs a
+    # clone whose title named one sprint while its logs fell in another), so the
+    # behaviour is asserted directly rather than relying on the data.
+    synthetic = [{"sprint_id": "s1", "issue": "o/r#1", "hours_synced": 2.0}]
+    changed = wt._merge_binding(
+        synthetic, {"sprint_id": "s1", "issue": "o/r#2", "hours_synced": 3.75})
+    check(changed and len(synthetic) == 1,
+          "two issues for one sprint collapse to a single binding", str(synthetic))
+    check(synthetic[0]["issue"] == "o/r#2",
+          "the better-evidenced issue (more hours) becomes primary", str(synthetic[0]))
+    check(synthetic[0].get("superseded_issues") == ["o/r#1"],
+          "and the loser is recorded, never dropped", str(synthetic[0]))
+    keep_low = [{"sprint_id": "s1", "issue": "o/r#9", "hours_synced": 9.0}]
+    wt._merge_binding(keep_low, {"sprint_id": "s1", "issue": "o/r#8", "hours_synced": 1.0})
+    check(keep_low[0]["issue"] == "o/r#9"
+          and keep_low[0].get("superseded_issues") == ["o/r#8"],
+          "the incumbent wins when it has more hours", str(keep_low[0]))
+
+    sprints = wt.get_cached_sprints(data)
+    for t in merged:
+        ids = [b.get("sprint_id") for b in t.get("sprint_issues") or []]
+        check(len(ids) == len(set(ids)), f"one binding per sprint on {t['title'][:32]!r}")
+        # The legacy pointer must name the *latest* bound sprint. Pointing it at
+        # the survivor's original (earliest) sprint made the carry-forward rule
+        # re-point the oldest sprint's issue to the current sprint.
+        if ids:
+            check(t.get("sprint_id") == ids[-1],
+                  f"legacy sprint pointer is the latest binding on {t['title'][:28]!r}",
+                  f"{t.get('sprint')} vs {ids[-1]}")
+
+    # Reconcile must plan a superseded-issue cleanup so nothing double-counts.
+    if supers:
+        owner = next(t for t in data["tasks"]
+                     if any(b.get("superseded_issues") for b in t.get("sprint_issues") or []))
+        with Stubs(wt, mode="strict", sprints=sprints):
+            r = wt.reconcile_task_sprints(owner, data, sprints, dry_run=True,
+                                          create_issues=True)
+        ops = [o for o in r["planned"] if o["op"] == "supersede"]
+        check(ops, "reconcile plans a supersede (zero + close) for the duplicate",
+              str([o["op"] for o in r["planned"]]))
+        check(all(o["hours"] == 0.0 for o in ops),
+              "and zeroes it rather than leaving stale hours", str(ops))
+
+    # Idempotent: a second load changes nothing.
+    before = Path(scratch / "phase5.json").read_text()
+    wt.load()
+    check(Path(scratch / "phase5.json").read_text() == before,
+          "a second load() is a no-op")
+
+
 def main():
     if len(sys.argv) != 5:
         print(__doc__.strip(), file=sys.stderr)
@@ -878,6 +1012,7 @@ def main():
     test_pre_migration(wt, fixture, scratch)
     test_hours_withheld_guard(wt, migrated, scratch)
     test_project_info_cache(wt, migrated, scratch)
+    test_phase5_merge(wt, fixture, scratch)
     test_idempotency(wt, migrated, scratch, baseline)
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

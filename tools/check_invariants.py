@@ -168,10 +168,12 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
     base_shadows = base.get("shadows", {})
 
     # 5. Totals, relative to the baseline (never hardcoded).
-    rep.check(len(tasks) == base["non_shadow_count"], "5/task-count",
-              f"task count is {len(tasks)}, baseline non-shadow count is "
-              f"{base['non_shadow_count']}")
-
+    #
+    # Task *count* is deliberately not asserted: migrations legitimately remove
+    # tasks (shadows became bindings; recurrent per-sprint clones merged into one
+    # task per series). What must never change is the tracked time itself, so the
+    # strict assertions are on totals and on the global set of log ids — logs may
+    # move between tasks, but none may appear, vanish or duplicate.
     total_mins = round(sum(_mins(t) for t in tasks), 6)
     rep.check(total_mins == base["total_minutes_excluding_shadows"], "5/total-minutes",
               f"total minutes {total_mins} != baseline "
@@ -182,7 +184,25 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
               f"total log count {total_logs} != baseline "
               f"{base['total_log_count_excluding_shadows']}")
 
-    # Every non-shadow baseline task must survive with identical logs.
+    live_log_ids = sorted(l.get("id", "") for t in tasks for l in t.get("logs", []))
+    base_log_ids = sorted(
+        lid for tid, snap in base_tasks.items() if tid not in base_shadows
+        for lid in snap["log_ids"]
+    )
+    rep.check(live_log_ids == base_log_ids, "5/log-ids-conserved",
+              f"the global set of log ids changed "
+              f"({len(live_log_ids)} live vs {len(base_log_ids)} baseline)")
+    if live_log_ids != base_log_ids:
+        lost = sorted(set(base_log_ids) - set(live_log_ids))[:5]
+        gained = sorted(set(live_log_ids) - set(base_log_ids))[:5]
+        if lost:
+            rep.fail("5/logs-lost", f"log ids no longer present: {lost}")
+        if gained:
+            rep.fail("5/logs-invented", f"log ids not in the baseline: {gained}")
+
+    # Shadows must be gone; other baseline tasks either survive or were absorbed
+    # by a merge, in which case their logs must have landed on the survivor.
+    live_ids = set(live_log_ids)
     for tid, snap in base_tasks.items():
         if tid in base_shadows:
             rep.check(tid not in by_id, "5/shadow-removed",
@@ -190,19 +210,23 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
             continue
         task = by_id.get(tid)
         if task is None:
-            rep.fail("5/task-missing", f"task {snap['title']!r} ({tid}) disappeared")
+            missing = [lid for lid in snap["log_ids"] if lid not in live_ids]
+            if missing:
+                rep.fail("5/absorbed-logs-lost",
+                         f"task {snap['title']!r} ({tid}) is gone and took "
+                         f"{len(missing)} log(s) with it")
+            else:
+                rep.warn("5/task-absorbed",
+                         f"task {snap['title']!r} ({tid}) was absorbed by a merge; "
+                         f"its {snap['log_count']} log(s) survive elsewhere")
             continue
-        rep.check(round(_mins(task), 6) == snap["minutes"], "5/task-minutes",
-                  f"task {snap['title']!r} ({tid}) minutes {round(_mins(task), 6)} != "
-                  f"baseline {snap['minutes']}")
-        rep.check(len(task.get("logs", [])) == snap["log_count"], "5/task-log-count",
-                  f"task {snap['title']!r} ({tid}) log count "
-                  f"{len(task.get('logs', []))} != baseline {snap['log_count']}")
-        log_ids = sorted(l.get("id", "") for l in task.get("logs", []))
-        rep.check(log_ids == snap["log_ids"], "5/task-log-ids",
-                  f"task {snap['title']!r} ({tid}) log ids changed")
+        if round(_mins(task), 6) != snap["minutes"]:
+            rep.warn("5/task-minutes-moved",
+                     f"task {snap['title']!r} ({tid}) minutes "
+                     f"{round(_mins(task), 6)} != baseline {snap['minutes']} "
+                     f"(logs moved or absorbed)")
 
-    # Unexpected new tasks (the migration must not invent any).
+    # Unexpected new tasks (a migration must not invent any).
     for tid, task in by_id.items():
         if tid not in base_tasks:
             rep.fail("5/task-added",
