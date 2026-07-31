@@ -80,6 +80,11 @@ Read the dry-run output carefully before approving:
   those tasks individually instead of running `--all --create-issues`.
 - **`recurrent` tasks are always skipped** and listed as such — steps 1 and 2
   own them.
+- **`HOLD` lines mean hours were withheld.** If a task has time in a sprint
+  that has no issue, reconcile refuses to narrow its *other* issues, because
+  that would delete the unreported time from the project. Adding
+  `--create-issues` gives that time an issue and clears the hold. Never work
+  around a HOLD by editing Hours by hand.
 - Rounding is up-per-sprint (`mins_to_quarter_hours`), unchanged, so a stray
   1-minute log in a sprint bills 0.25h. If a `create` line shows a suspiciously
   tiny sprint, check whether that log is misfiled before approving.

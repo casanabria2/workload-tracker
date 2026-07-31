@@ -671,6 +671,74 @@ def test_pre_migration(wt, fixture, scratch):
           str(res["planned"]))
 
 
+def test_hours_withheld_guard(wt, migrated, scratch):
+    section("12. hours are withheld when some of a task's time has no issue")
+    data = load_copy(wt, migrated, scratch / "hold.json")
+    sprints = wt.get_cached_sprints(data)
+
+    # Assist on Banco Galicia: 12h30m in Sprint 95 + 6h30m in Sprint 96, one
+    # issue. Narrowing that issue to Sprint 96 alone while Sprint 95 has nowhere
+    # to go would delete 12h30m from the project's reporting.
+    task = find(data, "Assist on Banco Galicia")
+    per = {e["sprint_title"]: e["total_mins"] for e in wt.task_sprints_with_time(task, sprints)}
+    print(f"    logs by sprint: { {k: round(v) for k, v in per.items()} }")
+    check(len(per) > 1, "the fixture task really does span sprints", str(per))
+
+    with Stubs(wt, mode="strict", sprints=sprints):
+        held = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                         create_issues=False)
+        freed = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                          create_issues=True)
+
+    held_hours = [o for o in held["planned"] if o["op"] == "hours"]
+    withheld = [s for s in held["skipped"] if s.get("withheld_hours")]
+    check(held_hours == [], "create_issues=False plans no hours write",
+          str(held_hours))
+    check(len(withheld) == 1, "and reports exactly one withheld hours write",
+          str(withheld))
+    check([e["sprint"] for e in held["unbillable"]] == ["Sprint 95"],
+          "naming the sprint whose time has no issue",
+          str(held["unbillable"]))
+    # The withheld value must be the *narrowing* one — that's the whole hazard.
+    check(withheld and withheld[0]["hours"] < wt.mins_to_quarter_hours(sum(per.values())),
+          "the withheld value is lower than the task's full logged total",
+          str(withheld[0]["hours"] if withheld else None))
+    lines = wt._reconcile_plan_lines(held)
+    check(any(l.startswith("HOLD") for l in lines), "plan output shows a HOLD line",
+          "\n".join(lines))
+    check(any("Add --create-issues" in l for l in lines),
+          "and explains how to clear it", "\n".join(lines))
+
+    # With create_issues=True the deferred sprint gets its own issue in the same
+    # plan, so nothing is lost and the guard must step aside.
+    freed_hours = [o for o in freed["planned"] if o["op"] == "hours"]
+    check(freed["unbillable"] == [], "create_issues=True clears unbillable",
+          str(freed["unbillable"]))
+    check(len(freed_hours) == 1, "and lets the hours write through",
+          str(freed_hours))
+    check(not any(s.get("withheld_hours") for s in freed["skipped"]),
+          "with nothing withheld", str(freed["skipped"]))
+
+    # A single-sprint task has nothing unbillable, so it is unaffected.
+    solo = find(data, "Broken New Relic Dashboard")
+    with Stubs(wt, mode="strict", sprints=sprints):
+        r = wt.reconcile_task_sprints(solo, data, sprints, dry_run=True,
+                                      create_issues=False)
+    check(r["unbillable"] == [],
+          "a single-sprint task is not affected by the guard", str(r["unbillable"]))
+    check(any(o["op"] == "hours" for o in r["planned"]),
+          "and still syncs its hours", str(r["planned"]))
+
+    # close_task always mints, so the guard must never withhold on a close.
+    closing = find(data, "Assist on Banco Galicia")
+    with Stubs(wt, mode="strict", sprints=sprints):
+        rc = wt.reconcile_task_sprints(closing, data, sprints, dry_run=True,
+                                       closing=True)
+    check(rc["unbillable"] == [],
+          "a close (closing=True, create_issues default) withholds nothing",
+          str(rc["unbillable"]))
+
+
 def main():
     if len(sys.argv) != 5:
         print(__doc__.strip(), file=sys.stderr)
@@ -697,6 +765,7 @@ def main():
     test_close_task(wt, migrated, scratch)
     test_set_sprint_drift(wt, migrated, scratch)
     test_pre_migration(wt, fixture, scratch)
+    test_hours_withheld_guard(wt, migrated, scratch)
     test_idempotency(wt, migrated, scratch, baseline)
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

@@ -882,19 +882,31 @@ def test_close_task_github_diff(migrated, scratch):
           "the only removed writes are current-sprint Sprint fields, absorbed "
           "past-sprint issue mints, and the 0.0h report",
           "\n      ".join(unexplained))
-    check(any("NEW#" in l for l in removed),
-          "at least one past-sprint issue is no longer minted "
-          "(absorbed by the carried-forward issue)", str(len(removed)))
-    # The point of the change: the main issue stops being told 0.0h.
+    # The two assertions below describe the `closing=True` change specifically.
+    # They only hold while HEAD predates it — once it is merged, HEAD *is* the
+    # new behaviour and the diff is empty of its signature. Assert them when the
+    # comparison spans that change, and say so plainly when it doesn't, rather
+    # than failing on a moving baseline.
     zero_before = [l for l in run.stdout.splitlines()
                    if l.strip().startswith("-")
                    and "add_to_project_and_update" in l and ", 0.0," in l]
     nonzero_after = [l for l in run.stdout.splitlines()
                      if l.strip().startswith("+")
                      and "add_to_project_and_update" in l and ", 0.0," not in l]
-    check(zero_before and nonzero_after,
-          "a close that used to report 0.0h now reports its real sprint hours",
-          f"before={len(zero_before)} after={len(nonzero_after)}")
+    spans_closing_change = bool(zero_before or any("NEW#" in l for l in removed))
+    if spans_closing_change:
+        check(any("NEW#" in l for l in removed),
+              "at least one past-sprint issue is no longer minted "
+              "(absorbed by the carried-forward issue)", str(len(removed)))
+        check(zero_before and nonzero_after,
+              "a close that used to report 0.0h now reports its real sprint hours",
+              f"before={len(zero_before)} after={len(nonzero_after)}")
+    else:
+        print("    (HEAD already contains closing=True — its signature is not in "
+              "this diff, so those two assertions are vacuous here)")
+        check(diff == 0,
+              "with closing=True already in HEAD, close_task's GitHub writes are "
+              "unchanged by this branch", f"diff={diff}")
 
 
 def test_reconcile_harness_still_passes(fixture, migrated, baseline, scratch):

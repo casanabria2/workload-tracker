@@ -422,6 +422,30 @@ Deliberately left out of scope so the phases stayed reviewable. None affects the
    newest sprint, and (c) `add_to_project_and_update` reporting 0.25h where it
    used to report 0.0h. `tools/test_phase3.py` asserts exactly that allow-list,
    so any *other* removed write fails the build.
+4b. ~~**Narrowing an issue's Hours can delete reported time.**~~ **FIXED
+   2026-07-31.** Reconcile makes each issue carry *its own* sprint's hours, which
+   is only conservative when every other sprint's hours land on an issue of their
+   own. With `create_issues=False` (the `--all` default) a deferred sprint has
+   nowhere to go, so narrowing the *other* issues silently dropped the
+   difference.
+
+   Found by the first live `--all --dry-run`: reading the current Hours off all
+   49 target issues gave 41 no-op writes, 2 corrections upward, and **6 narrowing
+   writes totalling ~26h**. `Assist on Banco Galicia` alone (Sprint 95 12h30m +
+   Sprint 96 6h30m on one issue at 19.0h) would have been set to 6.5h with Sprint
+   95's 12.5h reported nowhere.
+
+   `_reconcile_plan` now computes `plan["unbillable"]` — sprints with logged time
+   that end up with no issue, whether deferred by `create_issues=False` or bound
+   to an issue-less binding. While it is non-empty, **every** hours write for
+   that task is withheld and surfaced as a `HOLD` line plus a `WHY` explaining
+   how to clear it. The test is structural, so it costs no network call. Sprints
+   getting a freshly-minted issue in the same plan count as billable, so
+   `--create-issues` clears the guard instead of tripping it, and `close_task`
+   (which always mints) is never affected. Verified live: 49 hours writes → 43,
+   exactly the 41 no-ops plus the 2 upward corrections. Covered by
+   `tools/test_reconcile.py` group 12.
+
 5. **A stray 8-second timer log mints a whole past-sprint issue** billed at
    0.25h, because `mins_to_quarter_hours` rounds up per sprint (preserved
    deliberately, §5). A minimum-minutes threshold in `_reconcile_plan` would

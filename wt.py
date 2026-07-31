@@ -1825,6 +1825,7 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
         "ops": [],
         "skipped": [],
         "unassigned_minutes": 0.0,
+        "unbillable": [],
         "seed_legacy": False,
     }
 
@@ -2022,6 +2023,38 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
                 "reason": "already bound",
             })
 
+    # 4a. Safety guard: never narrow an issue's Hours while some of this task's
+    # logged time has nowhere to be reported.
+    #
+    # Reconcile's job is to make each issue carry *its own* sprint's hours. That
+    # is only conservative when every other sprint's hours land on an issue of
+    # their own. If a sprint with time ends up with no issue — because
+    # create_issues=False deferred it, or because its binding was never linked —
+    # then narrowing the *other* issues silently deletes the difference from the
+    # project's reporting. Observed on real data: `Assist on Banco Galicia`
+    # (Sprint 95 12.5h + Sprint 96 6.5h) would have gone from 19.0h on one issue
+    # to 6.5h, with Sprint 95's 12.5h reported nowhere.
+    #
+    # The test is structural, so it needs no network call: if any sprint of this
+    # task has minutes but no issue to put them on, withhold *all* of the task's
+    # hours writes and say why. Passing --create-issues binds those sprints and
+    # the guard clears itself.
+    # Sprints getting a freshly-minted issue *in this same plan* are billable:
+    # the create op carries their hours, so nothing is lost.
+    will_mint = {op["sprint_id"] for op in plan["ops"]
+                 if op["op"] == "create" and op.get("create_issue")}
+    unbillable = []
+    for sid, mins in targets.items():
+        if mins <= 0 or sid not in by_id or sid in will_mint:
+            continue
+        entry = next((f for f in final if f["sprint_id"] == sid), None)
+        if entry is None or not entry.get("issue"):
+            unbillable.append({"sprint": by_id[sid]["title"], "sprint_id": sid,
+                               "minutes": mins,
+                               "hours": mins_to_quarter_hours(mins)})
+    unbillable.sort(key=lambda e: sort_key(e["sprint_id"]))
+    plan["unbillable"] = unbillable
+
     # 4. Hours: push only when the value differs from what we last told GitHub.
     for f in final:
         sid = f["sprint_id"]
@@ -2041,6 +2074,15 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
                   "from_hours": f["hours_synced"]}
         if not f["issue"]:
             plan["skipped"].append({**common, "reason": "binding has no issue"})
+        elif unbillable:
+            where = ", ".join(f"{e['sprint']} {fmt_mins(e['minutes'])}"
+                              for e in unbillable)
+            plan["skipped"].append({
+                **common, "withheld_hours": True,
+                "reason": ("hours withheld — unreported time in " + where +
+                           "; re-run with --create-issues so it lands on its "
+                           "own issue"),
+            })
         elif not sync_hours:
             plan["skipped"].append({**common, "reason": "sync_hours=False"})
         elif not has_project:
@@ -2191,6 +2233,7 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
         "skipped": list(plan["skipped"]),
         "errors": [],
         "unassigned_minutes": plan["unassigned_minutes"],
+        "unbillable": plan["unbillable"],
         "bindings": [],
     }
 
@@ -6393,6 +6436,18 @@ def _reconcile_plan_lines(res: dict) -> list[str]:
             # reconcile only mints issues for *unbound* sprints.
             lines.append(f"note    {sk.get('sprint'):<12} {fmt_mins(sk['minutes'])} bound but "
                          f"never linked to an issue — use 'wt link' or 'wt done'")
+        elif sk.get("withheld_hours"):
+            was = sk.get("from_hours")
+            was_s = "unknown" if was is None else f"{was}h"
+            lines.append(f"HOLD    {sk.get('sprint'):<12} {sk['issue']}: would set "
+                         f"{was_s} → {sk['hours']}h, withheld")
+    if res.get("unbillable"):
+        where = ", ".join(f"{e['sprint']} {fmt_mins(e['minutes'])}"
+                          for e in res["unbillable"])
+        lines.append(f"WHY     {'':<12} hours withheld because this task's time in "
+                     f"{where} has no issue to report on.")
+        lines.append(f"        {'':<12} Narrowing the other issues would delete that "
+                     f"time from the project. Add --create-issues.")
     if res.get("unassigned_minutes"):
         lines.append(f"note    {'':<12} {fmt_mins(res['unassigned_minutes'])} of logs fall "
                      f"outside every sprint (not reported to GitHub)")
