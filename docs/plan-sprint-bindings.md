@@ -404,12 +404,24 @@ Deliberately left out of scope so the phases stayed reviewable. None affects the
 3. **`cmd_add` / `create_task_from_issue` set only `sprint`/`sprint_id`**, never
    `start_sprint*`, so `wt sprint`'s "started Sprint N" is blank for
    CLI-created tasks until their first reconcile. The TUI sets both.
-4. **Closing an open carry-over task can report 0h.** Reconcile targets the
-   current sprint for an open task, then `close_task` reports that binding — so
-   a task with no minutes yet in the current sprint closes its carried-forward
-   issue at 0.0h. This matches the old marker-log outcome, but reporting the
-   latest sprint *with time* may be the better rule. **Policy decision, not a
-   bug** — needs Carlos.
+4. ~~**Closing an open carry-over task can report 0h.**~~ **RESOLVED
+   2026-07-31 — now reports the latest sprint with time.** `close_task` passes
+   `closing=True` to the reconcile, which suppresses the "reserve the current
+   sprint for an open task" target. A task being closed has no future work to
+   land, so `latest` becomes the newest sprint that actually has minutes, and the
+   task's long-lived issue is carried there and reports *that* sprint's hours.
+   Open-task reconcile is unchanged — it still reserves the current sprint, which
+   is what makes the marker-log ritual unnecessary (§1.3).
+
+   **This is the first change that is not GitHub-neutral**, so Option A's "a
+   correct migration produces a zero GH diff" property (§2.4, §5) applies to
+   phases 0–4 only, not to this. Measured against the merged Phase 3 across the
+   12 previously-split tasks: 10 byte-identical, 2 differing, and in both the
+   only changes are (a) the Sprint field no longer parked on the current sprint,
+   (b) one fewer issue minted because the carried-forward issue absorbed the
+   newest sprint, and (c) `add_to_project_and_update` reporting 0.25h where it
+   used to report 0.0h. `tools/test_phase3.py` asserts exactly that allow-list,
+   so any *other* removed write fails the build.
 5. **A stray 8-second timer log mints a whole past-sprint issue** billed at
    0.25h, because `mins_to_quarter_hours` rounds up per sprint (preserved
    deliberately, §5). A minimum-minutes threshold in `_reconcile_plan` would

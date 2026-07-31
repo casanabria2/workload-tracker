@@ -412,7 +412,9 @@ Linking an issue (`wt link`, MCP `link_github_issue`, `wt add-issue`, `create_ta
      reporting hours, so each prior sprint's hours land on that sprint's own
      issue and only the current sprint's hours go on the current binding (see
      "Reconcile workflow" below). It runs unconditionally — reconcile is
-     idempotent, so there's no "does this span sprints?" gate any more.
+     idempotent, so there's no "does this span sprints?" gate any more — and
+     with `closing=True`, so hours are reported against the latest sprint that
+     actually has time rather than an empty current sprint.
      `recurrent` tasks are skipped. A failed reconcile aborts the close (the task
      is **not** marked done) so hours can't be mis-reported.
    - Issue is added to the configured GitHub project (if configured)
@@ -636,6 +638,10 @@ a pure diff between derived target state and existing bindings —
 2. Target set = {sprints with time} ∪ {current sprint, if the task is open}.
    That second term is why the old **0-minute "rollover marker" log hack is
    unnecessary** — an open task always has a landing place for new work.
+   **`closing=True` drops it**: a task being closed has no future work, so
+   reserving an empty current-sprint binding would park its long-lived issue on
+   a sprint it was never worked in and report 0h there. `close_task()` always
+   passes it, which is why a close reports the **latest sprint with time**.
 3. Create a binding (and issue, if the task has a `github_repo`) for each
    missing target sprint. New issues are for *past* sprints and keep the
    ` (Sprint N)` title suffix.

@@ -583,30 +583,39 @@ def test_close_task(wt, migrated, scratch):
           "no shadow task objects created")
     check(len(data["tasks"]) == 80, "no tasks added", str(len(data["tasks"])))
     bound = {b["sprint"]: b for b in task["sprint_issues"]}
-    check(set(bound) == {"Sprint 97", "Sprint 98", "Sprint 104", "Sprint 105"},
-          "a binding per sprint with time, plus the current sprint", str(sorted(bound)))
-    check(bound["Sprint 105"]["issue"] == issue,
-          "the original issue is the current-sprint one (Option A)",
-          str(bound["Sprint 105"]))
-    check(st.count("create_github_issue") == 2,
-          "two past-sprint issues minted (Sprint 98 and Sprint 104)",
+    # close_task passes closing=True, so no empty binding is reserved for the
+    # current sprint (Sprint 105 has no logs). The task's long-lived issue lands
+    # on the newest sprint that actually has time instead of reporting 0h against
+    # a sprint it was never worked in.
+    check(set(bound) == {"Sprint 97", "Sprint 98", "Sprint 104"},
+          "a binding per sprint with time, and no empty current-sprint binding",
+          str(sorted(bound)))
+    last = "Sprint 104"  # newest sprint with logged time
+    check(bound[last]["issue"] == issue,
+          "the original issue lands on the newest sprint with time (Option A)",
+          str(bound[last]))
+    check(st.count("create_github_issue") == 1,
+          "only Sprint 98 is minted (Sprint 104 took the carried-forward issue)",
           str(st.count("create_github_issue")))
-    check(all(b["state"] == "closed" for k, b in bound.items() if k != "Sprint 105"),
-          "past bindings closed", str(bound))
+    check(all(b["state"] == "closed" for b in bound.values()),
+          "every binding closed (all their sprints have ended)", str(bound))
     # Hours reported on the main issue must be the sprint-filtered value.
     hour_calls = [c for c in st.calls if c[0] == "update_project_hours"]
     print(f"    update_project_hours calls: "
           f"{[(c[1][0], c[1][1]) for c in hour_calls]}")
     main_hours = [c[1][1] for c in hour_calls if c[1][0] == issue]
     expected = wt.mins_to_quarter_hours(
-        wt.task_mins_for_sprint(task, bound["Sprint 105"]["sprint_id"], sprints))
+        wt.task_mins_for_sprint(task, bound[last]["sprint_id"], sprints))
     check(all(h == expected for h in main_hours),
-          f"main issue only ever told its current-sprint hours ({expected})",
+          f"main issue only ever told its own sprint's hours ({expected})",
           str(main_hours))
-    check(bound["Sprint 105"]["state"] == "closed"
-          and bound["Sprint 105"]["hours_synced"] == expected,
+    check(expected > 0,
+          "and that value is non-zero — the whole point of closing=True",
+          str(expected))
+    check(bound[last]["state"] == "closed"
+          and bound[last]["hours_synced"] == expected,
           "the current binding's cached state/hours match what close_task did",
-          str(bound["Sprint 105"]))
+          str(bound[last]))
     # A reconcile straight after must not try to re-close or re-push anything.
     with Stubs(wt, mode="strict", sprints=sprints) as st:
         after = wt.reconcile_task_sprints(task, data, sprints, save_callback=wt.save)
