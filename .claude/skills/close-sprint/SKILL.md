@@ -19,36 +19,21 @@ first** — do all the read-only analysis, present the full plan, then execute.
 
 ## Step 0 — Preconditions (Carlos does this manually)
 
-Carlos verifies all hours are logged on the previous sprint's **recurrent**
-tasks before asking to close the sprint. Don't re-audit those.
+Carlos verifies all hours are logged before asking to close the sprint. Don't
+re-audit those.
 
-**Do still check recurrent copies for misfiled logs.** Recurrent tasks are
-still one task object per sprint (unifying them into a single task with one
-binding per sprint is a later, separate phase), so a timer left running on the
-old `… - Sprint N` copy leaves next-sprint logs on the wrong object. For each
-`… - Sprint N` pair, bucket with `wt.bucket_logs_by_sprint()`, move any
-next-sprint logs to the next-sprint copy, then `wt.sync_project_hours()` on
-**both** issues.
+No misfiled-log repair is needed any more: every sprint of a recurring series
+shares one task, so `wt sync-sprints` attributes each log to its sprint from the
+timestamp and recomputes that sprint's hours from scratch.
 
-Non-recurrent tasks need no such repair: `wt sync-sprints` recomputes every
-sprint's hours from the logs, so moving a log and re-running fixes it.
+## Steps 1–2 — (retired)
 
-## Step 1 — Close previous-sprint recurrent tasks
-
-```bash
-wt close-recurrent --dry-run   # preview + confirm with Carlos
-wt close-recurrent             # closes GH issues, sets Status=Done, syncs hours
-```
-
-Only targets `status == "recurrent"` tasks with a linked issue in the sprint
-immediately before the current one. Recurrent copies without a linked issue are
-skipped silently — check the dry-run lists everything expected.
-
-## Step 2 — Recreate recurrent tasks for the current sprint
-
-Use the `new-sprint-recurrent` skill / `wt new-recurrent` (preview with
-`--dry-run` first). Often a no-op if the new sprint's copies were already
-created at sprint start — "No recurring tasks … to recreate" is fine.
+Recurring work is no longer cloned per sprint, so there is nothing to close and
+recreate. `wt close-recurrent` and `wt new-recurrent` **hard-refuse** — a
+recurring series is now one perpetual task with a GitHub issue per sprint, and
+Step 3 handles it along with everything else. Step 0's misfiled-log repair is
+also gone: all of a series' logs live on one task, so a timer that runs past a
+sprint boundary is attributed by timestamp automatically.
 
 ## Step 3 — Reconcile everything else
 

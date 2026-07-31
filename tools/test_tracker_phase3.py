@@ -649,8 +649,18 @@ def migration_check(tracker, wt, fixture, scratch):
         tracker.DATA_FILE = saved
     left = [t for t in loaded["tasks"] if t.get("cross_sprint_parent")]
     check(not left, "load_data() converted every shadow into bindings", str(len(left)))
-    check(len(loaded["tasks"]) == len(raw["tasks"]) - n_shadow,
-          f"task count dropped by {n_shadow}",
+    # load_data() runs both migrations, so the drop is the shadows *plus* the
+    # per-sprint recurrent clones the Phase 5 merge folds into one task per series.
+    series = {}
+    for t in raw["tasks"]:
+        if t.get("cross_sprint_parent"):
+            continue
+        canon = wt.recurrent_series_for_title(t.get("title", ""))
+        if canon:
+            series[canon] = series.get(canon, 0) + 1
+    n_merged = sum(n - 1 for n in series.values() if n > 1)
+    check(len(loaded["tasks"]) == len(raw["tasks"]) - n_shadow - n_merged,
+          f"task count dropped by {n_shadow} shadow(s) + {n_merged} merged clone(s)",
           f"{len(raw['tasks'])} -> {len(loaded['tasks'])}")
     on_disk = json.loads(dst.read_text())
     check(not [t for t in on_disk["tasks"] if t.get("cross_sprint_parent")],

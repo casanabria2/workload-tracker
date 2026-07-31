@@ -43,6 +43,7 @@ sys.path.insert(0, str(REPO / "tools"))
 from test_reconcile import Stubs, SubprocessGuard, sig  # noqa: E402
 
 FAILURES = []
+_WANT = [0]   # expected post-migration task count, filled in main()
 CHECKS = 0
 
 RECURRENT_TITLES = [
@@ -234,7 +235,7 @@ def test_load_migrates(wt, mcp_server, fixture, scratch):
     check(n_shadow == 12, "fixture starts with 12 shadows", str(n_shadow))
 
     data = mcp_server.load()
-    check(len(data["tasks"]) == 80, "mcp_server.load() returns 80 tasks",
+    check(len(data["tasks"]) == _WANT[0], f"mcp_server.load() returns {_WANT[0]} tasks",
           str(len(data["tasks"])))
     check(not any(t.get("cross_sprint_parent") for t in data["tasks"]),
           "no shadow survives mcp_server.load()")
@@ -244,7 +245,7 @@ def test_load_migrates(wt, mcp_server, fixture, scratch):
           "migration flag set")
     # It persisted, and a second load is a no-op.
     on_disk = json.loads(dst.read_text())
-    check(len(on_disk["tasks"]) == 80, "migration was saved to disk",
+    check(len(on_disk["tasks"]) == _WANT[0], "migration was saved to disk",
           str(len(on_disk["tasks"])))
     before = dst.read_text()
     mcp_server.load()
@@ -402,33 +403,43 @@ def test_requirement_a(wt, mcp_server, migrated, scratch):
     print(f"       opt-in would create {would} issue(s)")
 
 
-def test_requirement_b(wt, mcp_server, migrated, scratch):
-    section("7. requirement (b): recurrent tasks skipped and reported")
+def test_recurrent_reconciles(wt, mcp_server, migrated, scratch):
+    section("7. Phase 5: MCP reconciles merged recurrent series")
     point_at(wt, mcp_server, migrated, scratch / "rec.json")
     data = mcp_server.load()
     sprints = sprints_of(data, wt)
+    recurrent = [t for t in data["tasks"] if t.get("status") == "recurrent"]
+    print(f"    {len(recurrent)} perpetual recurrent task(s):")
+    for t in recurrent:
+        print(f"      - {t['title']}  bindings={len(t.get('sprint_issues') or [])}")
+
+    # Phase 3 asserted these were skipped, because each sprint was its own cloned
+    # task. Phase 5 merged them, so they must now be reconciled like anything else.
+    check(recurrent, "the merge left perpetual recurrent tasks")
+    check(all(" - Sprint " not in t["title"] for t in recurrent),
+          "none still carries a '- Sprint N' suffix",
+          str([t["title"] for t in recurrent if " - Sprint " in t["title"]]))
 
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
             out = mcp_server.sync_task_sprints(all_tasks=True, dry_run=True)
-    check("Skipped 5 recurrent task(s)" in out, "5 recurrent tasks reported as skipped",
-          [l for l in out.splitlines() if "Skipped" in l])
-    for title in RECURRENT_TITLES:
-        check(f"  - {title} " in out, f"named in output: {title}")
-    # And none of them appears in the plan body.
-    plan_body = out.split("Plan for", 1)[-1]
-    leaked = [t for t in RECURRENT_TITLES if f"\n  {t}" in plan_body]
-    check(not leaked, "no recurrent task appears in the plan body", str(leaked))
+    check("recurrent task(s)" not in out or "Skipped 0 recurrent" in out,
+          "no recurrent tasks are reported as skipped",
+          [l for l in out.splitlines() if "Skipped" in l][:2])
+    for t in recurrent:
+        check(t["title"] in out, f"appears in the plan: {t['title'][:34]}")
 
-    # Single-task form skips too.
+    # Single-task form: a perpetual series closes the ended sprint and mints the
+    # new one, never carrying an issue forward (that would strand hours).
+    target = recurrent[0]["title"]
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
-            one = mcp_server.sync_task_sprints("Time tracking - Sprint 104",
-                                               dry_run=True)
-    check("Skipped 1 recurrent task(s)" in one, "single recurrent task is skipped", one[:120])
-    check("Nothing to do (0 task(s)" in one, "and nothing is planned for it", one[:200])
+            one = mcp_server.sync_task_sprints(target, create_issues=True, dry_run=True)
+    check("Nothing to do" not in one, f"{target[:30]!r} has work planned", one[:160])
+    check("repoint" not in one.lower(), "no carry-forward for a perpetual series",
+          [l for l in one.splitlines() if "repoint" in l.lower()][:2])
 
 
 def test_sync_real_run(wt, mcp_server, migrated, scratch):
@@ -792,7 +803,8 @@ def test_read_only_tools(wt, mcp_server, migrated, scratch):
 
     # get_status total must equal the invariant total (no shadow double-count).
     total_line = status.splitlines()[0]
-    check("80 tasks" in total_line, "get_status counts 80 tasks", total_line)
+    check(f"{_WANT[0]} tasks" in total_line,
+          f"get_status counts {_WANT[0]} tasks", total_line)
     at = data.get("active_timer")
     mins = sum(mcp_server.task_logged_mins(t) + mcp_server.task_live_mins(t, at)
                for t in data["tasks"])
@@ -870,6 +882,9 @@ def main():
 
     os.environ["WT_DATA_FILE"] = str(scratch / "unused.json")
     import wt
+    from test_reconcile import expected_task_count
+    _WANT[0] = expected_task_count(wt, fixture)
+
     import mcp_server
 
     live = Path.home() / ".workload_tracker.json"
@@ -885,7 +900,7 @@ def main():
     test_get_task(wt, mcp_server, migrated, scratch)
     test_sync_dry_run(wt, mcp_server, migrated, scratch)
     test_requirement_a(wt, mcp_server, migrated, scratch)
-    test_requirement_b(wt, mcp_server, migrated, scratch)
+    test_recurrent_reconciles(wt, mcp_server, migrated, scratch)
     worked = test_sync_real_run(wt, mcp_server, migrated, scratch)
     test_set_sprint(wt, mcp_server, migrated, scratch)
     test_close_end_to_end(wt, mcp_server, migrated, scratch)

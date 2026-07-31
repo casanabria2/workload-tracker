@@ -310,68 +310,57 @@ def test_all_creates_nothing(wt, migrated, scratch):
 
 # ------------------------------------------------------- 4. requirement (b) --
 
-def test_recurrent_skipped(wt, migrated, scratch):
-    section("4. requirement (b): recurrent tasks are skipped and reported")
+def test_recurrent_reconciles(wt, migrated, scratch):
+    section("4. Phase 5: recurrent series reconcile like any other task")
     env = Env(wt, migrated, scratch / "rec.json")
     recurrent = [t for t in env.data["tasks"] if t.get("status") == "recurrent"]
-    print(f"    {len(recurrent)} recurrent task(s) in the data:")
+    print(f"    {len(recurrent)} recurrent task(s) after the merge:")
     for t in recurrent:
-        print(f"      • {t['title']}  [{t.get('sprint')}]")
+        n = len(t.get("sprint_issues") or [])
+        print(f"      • {t['title']}  bindings={n}  start={t.get('start_sprint')}")
 
-    # Which of them a blanket reconcile *would* mint issues for, unskipped.
-    would = []
+    # Phase 3 asserted the opposite: recurrent tasks were excluded because each
+    # sprint was a separate cloned task, so reconciling would mint a past-sprint
+    # issue per clone. Phase 5 merged the clones, so reconcile is now the right
+    # thing to run — and it must NOT be skipped.
+    check(recurrent, "the merge left at least one perpetual recurrent task")
+    check(all(" - Sprint " not in t["title"] for t in recurrent),
+          "no recurrent task still carries a '- Sprint N' suffix",
+          str([t["title"] for t in recurrent if " - Sprint " in t["title"]]))
+
     with CliStubs(wt, mode="strict", sprints=env.sprints):
-        for t in recurrent:
-            r = wt.reconcile_task_sprints(t, env.data, env.sprints, dry_run=True)
-            if any(o["op"] == "create" and o["create_issue"] for o in r["planned"]):
-                would.append(t["title"])
-    check(sorted(would) == sorted(RECURRENT_WOULD_MINT),
-          "the 4 recurrent copies an unskipped reconcile would mint issues for",
-          f"got {sorted(would)}")
-    for title in RECURRENT_WOULD_MINT:
-        print(f"      would mint: {title}")
+        out, _ = run_cmd(wt, wt.cmd_sync_sprints, ["--all", "--dry-run"])
+    check("recurrent — use wt close-recurrent" not in out,
+          "sync-sprints no longer reports recurrent tasks as skipped")
 
+    # A perpetual series must never carry an issue forward: each sprint keeps its
+    # own issue, so the sprint that just ended closes and the new one is minted.
+    # Carrying forward would strand the ended sprint's hours (plan §6b/Phase 5).
+    for t in recurrent:
+        with CliStubs(wt, mode="strict", sprints=env.sprints):
+            r = wt.reconcile_task_sprints(t, env.data, env.sprints, dry_run=True,
+                                          create_issues=True)
+        ops = [o["op"] for o in r["planned"]]
+        check("repoint" not in ops,
+              f"no carry-forward for perpetual {t['title'][:34]!r}", str(ops))
+        check("create" in ops,
+              f"mints the current sprint's issue for {t['title'][:34]!r}", str(ops))
+        check(any(o["op"] == "close" for o in r["planned"]),
+              f"closes the ended sprint for {t['title'][:34]!r}", str(ops))
+
+    # That pair of ops is exactly what close-recurrent + new-recurrent did.
     with CliStubs(wt, mode="record", sprints=env.sprints) as st:
-        out, _ = run_cmd(wt, wt.cmd_sync_sprints,
-                         ["--all", "--create-issues", "--yes"], Answers("y"))
-        created_titles = [a[0].get("title") for n, a, k in st.calls
-                          if n == "create_github_issue"]
-    plain = out
-    for title in RECURRENT_WOULD_MINT:
-        check(re.search(rf"•\s+{re.escape(title)}\b.*recurrent", plain) is not None,
-              f"reported as skipped: {title}",
-              [l for l in plain.splitlines() if title in l][:2])
-    leaked = [t for t in created_titles
-              if any(t and t.startswith(r) for r in RECURRENT_WOULD_MINT)]
-    check(not leaked,
-          "no issue minted for any task whose status is 'recurrent', even with "
-          "--create-issues", str(leaked))
-    # For the record: *closed* per-sprint copies of a recurring series (status
-    # 'done', so not skipped) do get past-sprint issues under --create-issues.
-    # That is the plan §1.6 "leaking logs" data, and it is opt-in behind an
-    # itemised plan + confirmation, so it is treated as ordinary cross-sprint work.
-    closed_copies = [t for t in created_titles
-                     if t and re.search(r" - Sprint \d+ \(Sprint \d+\)$", t)]
-    print(f"    NOTE: {len(closed_copies)} issue(s) for CLOSED prior-sprint copies "
-          f"of recurring series (status='done', not skipped): {closed_copies}")
-    check(all(t.get("status") == "recurrent"
-              for t in env.reload()["tasks"]
-              if t["title"] in RECURRENT_WOULD_MINT),
-          "the recurrent tasks were not otherwise mutated")
+        run_cmd(wt, wt.cmd_sync_sprints,
+                ["--all", "--create-issues", "--yes"], Answers("y"))
+        made = [a[0].get("title") for n, a, k in st.calls if n == "create_github_issue"]
+    for t in recurrent:
+        want = t["title"]
+        check(any(m == want or m.startswith(want) for m in made),
+              f"a current-sprint issue was minted for {want[:34]!r}",
+              str([m for m in made if want[:18] in (m or "")][:2]))
+    check(not any(re.search(r" - Sprint \d+ \(Sprint \d+\)$", m or "") for m in made),
+          "no double-suffixed clone-of-a-clone issue titles", str(made[:3]))
 
-    # Naming one explicitly is skipped too, with an explanation.
-    env2 = Env(wt, migrated, scratch / "rec2.json")
-    with CliStubs(wt, mode="strict", sprints=env2.sprints) as st2:
-        out2, code2 = run_cmd(wt, wt.cmd_sync_sprints,
-                              ["--dry-run", "Ana 1:1 calls - casanabria - Sprint 104"])
-        check(st2.calls == [], "explicit recurrent target makes no GitHub call")
-    check("recurrent" in out2 and "Nothing to do" in out2,
-          "an explicitly named recurrent task is skipped with a reason",
-          out2[:500])
-    print("\n".join("   " + l for l in out2.strip().splitlines()))
-
-
-# ------------------------------------------------------- 5. deprecated alias --
 
 def test_split_sprint_alias(wt, migrated, scratch):
     section("5. `wt split-sprint` still works and warns")
@@ -517,7 +506,8 @@ def test_done(wt, migrated, scratch):
     check(closes >= 1, "the task's own issue was closed", str(closes))
     check(all("cross_sprint_parent" not in x for x in env.reload()["tasks"]),
           "no shadow task object created")
-    check(len(env.reload()["tasks"]) == 80, "no task added or removed",
+    check(len(env.reload()["tasks"]) == len(env.data["tasks"]),
+          "no task added or removed",
           str(len(env.reload()["tasks"])))
 
     # close_task's documented return keys must survive.
@@ -842,9 +832,15 @@ def test_close_task_github_diff(migrated, scratch):
     same = len([l for l in run.stdout.splitlines() if l.startswith("  same ")])
     diff = len([l for l in run.stdout.splitlines() if l.startswith("  DIFF ")])
     err = len([l for l in run.stdout.splitlines() if l.startswith("  ERR ")])
+    gone = len([l for l in run.stdout.splitlines() if l.startswith("  gone ")])
     check(err == 0, "no task errored under either version", f"{err} error(s)")
-    check(same >= 10, "at least 10 of 12 tasks have a byte-identical write sequence",
-          f"same={same} diff={diff}")
+    # 'gone' = a title the Phase 5 merge absorbed, so it is no longer comparable.
+    compared = same + diff
+    check(compared >= 8, "enough tasks remain comparable to be meaningful",
+          f"same={same} diff={diff} gone={gone}")
+    check(same >= compared - 2,
+          "all but at most two comparable tasks are byte-identical",
+          f"same={same} of {compared} comparable (gone={gone})")
 
     # NOTE: this check used to assert "diffs are additions only", i.e. that the
     # refactor never changed a GitHub-visible value (Option A's premise). The
@@ -942,7 +938,7 @@ def main():
     test_cli_smoke(wt, migrated, scratch)
     test_sprint_offline(wt, migrated, scratch)
     test_all_creates_nothing(wt, migrated, scratch)
-    test_recurrent_skipped(wt, migrated, scratch)
+    test_recurrent_reconciles(wt, migrated, scratch)
     test_split_sprint_alias(wt, migrated, scratch)
     work = test_idempotent(wt, migrated, scratch)
     test_set_sprint(wt, migrated, scratch)

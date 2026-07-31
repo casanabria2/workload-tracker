@@ -157,6 +157,18 @@ def main():
         old_ops, old_sum, old_err = run_one(old_wt, migrated, scratch / "old.json", title)
         new_ops, new_sum, new_err = run_one(new_wt, migrated, scratch / "new.json", title)
         label = title[:58]
+        # The Phase 5 merge folds per-sprint recurrent clones into one task per
+        # series, so a title like "Time tracking - Sprint 103" resolves under the
+        # old wt.py but not the new one. That asymmetry is the migration working,
+        # not a comparison failure — classify it by cause rather than treating any
+        # resolution mismatch as an error.
+        absorbed = getattr(new_wt, "recurrent_series_for_title", lambda _t: None)(title)
+        if new_err and absorbed and not old_err:
+            print(f"  gone {label}  (merged into {absorbed!r} by Phase 5)")
+            continue
+        if old_err and new_err:
+            print(f"  gone {label}  (not present in this fixture under either version)")
+            continue
         if old_err or new_err:
             print(f"  ERR  {label}\n       old: {old_err}\n       new: {new_err}")
             diffs += 1

@@ -342,7 +342,7 @@ reconcile is no longer something the user has to be told to run.
 - Update `CLAUDE.md`: the whole "Cross-sprint split workflow" / "shadow tasks"
   sections.
 
-### Phase 5 — Collapse recurrent per-sprint copies (**separate decision**)
+### Phase 5 — Collapse recurrent per-sprint copies — **DONE 2026-07-31**
 
 Once 1–4 land, a recurrent task is just a task that never closes and grows one
 binding per sprint. That would let us retire `close-recurrent`, `new-recurrent`,
@@ -350,10 +350,34 @@ binding per sprint. That would let us retire `close-recurrent`, `new-recurrent`,
 calendar mappings from base-name to task-id keying (§1.6) — a big simplification
 that also structurally fixes the leaking-logs problem.
 
-But it's a large blast radius (two CLI commands, two MCP tools, two skills, the
-calendar mapping migration, and the TUI's second table), and it changes the
-shape of Carlos's per-sprint GitHub issues for recurring work. **Do not bundle
-it.** Decide after 1–4 are running clean for a sprint or two.
+**Shipped.** 32 clones across 5 series became 5 perpetual tasks (80 → 53 tasks),
+each keeping every log and gaining one binding per sprint. No GitHub write: every
+clone's issue survived as a binding.
+
+Three things the implementation surfaced that the plan hadn't anticipated:
+
+1. **Grouping can't be automatic.** `_same_recurrent_series` bridged
+   `Ad-hoc Slack Questions` ↔ `… - casanabria` but missed
+   `Ad-hoc Slack Question casanabria` (singular, no dash). Resolved with an
+   explicit `RECURRENT_SERIES_ALIASES` table rather than fuzzy matching.
+2. **Two issues for one sprint.** One clone's title said Sprint 100 while its
+   logs fell in Sprint 101, so the merged series had two issues (`#5615` 2.0h and
+   `#5719` 3.75h) for Sprint 101. `_merge_binding` used to silently drop the
+   loser, which would have left it open and still reporting — the project would
+   double-count. It now keeps the better-evidenced issue and records the other in
+   `superseded_issues`, and reconcile plans a `supersede` op to zero and close it.
+3. **A perpetual series must not carry an issue forward.** Option A's
+   carry-forward is for one continuing piece of work; applied to a recurrent
+   series it re-pointed the just-ended sprint's issue onto the new sprint and
+   stranded the hours it carried (Sprint 104's `#6207`, 2h 54m). Recurrent tasks
+   now get no carry-forward: each sprint keeps its own issue permanently, the
+   ended one closes, the new one is minted — which is exactly the shape
+   `close-recurrent` + `new-recurrent` produced by hand.
+
+`wt close-recurrent`, `wt new-recurrent` and `close_previous_recurrent_tasks`
+**hard-refuse** rather than no-op: their selection rule (`status == "recurrent"`
+plus a prior-sprint `sprint_id`) matches the merged task, so running one would
+set the whole series to done and close its live issue.
 
 ---
 

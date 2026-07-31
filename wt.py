@@ -168,6 +168,9 @@ def load() -> dict:
     # Convert cross-sprint shadow tasks into per-sprint issue bindings (one-time),
     # and strip re-introduced shadows on every load. Idempotent.
     mutated = _migrate_shadows_to_bindings(data) or mutated
+    # Collapse per-sprint recurrent clones into one task per series (one-time),
+    # and absorb any clone an older wt.py re-introduces. Idempotent.
+    mutated = _migrate_recurrent_series_to_bindings(data) or mutated
     if mutated:
         save(data)
     return data
@@ -371,8 +374,19 @@ def _merge_binding(bindings: list[dict], new: dict) -> bool:
     """Append *new* to *bindings* unless its sprint_id is already bound.
 
     One binding per sprint (plan §6 invariant 4). On collision the entry that
-    carries an ``issue`` wins; otherwise the incumbent is kept. Returns True if
-    *bindings* was modified.
+    carries an ``issue`` wins; when *both* carry a distinct issue the one with the
+    larger ``hours_synced`` wins and the loser is recorded in the winner's
+    ``superseded_issues`` — **never dropped**.
+
+    That case is real: merging the recurrent clones found two issues for one
+    sprint (``#5615`` at 2.0h and ``#5719`` at 3.75h, both Sprint 101 of the
+    Ad-hoc Slack series, because one clone's title said Sprint 100 while its logs
+    fell in 101). Silently discarding one would leave it open on the project,
+    still reporting its old hours, while the surviving binding reports the merged
+    total — i.e. double-counting. A superseded issue must be zeroed and closed;
+    reconcile plans that as a ``supersede`` op.
+
+    Returns True if *bindings* was modified.
     """
     sprint_id = new.get("sprint_id")
     existing = None
@@ -381,10 +395,39 @@ def _merge_binding(bindings: list[dict], new: dict) -> bool:
     if existing is None:
         bindings.append(new)
         return True
+
+    def _carry(winner: dict, loser: dict) -> None:
+        """Move the loser's issue (and anything it superseded) onto the winner."""
+        extra = list(winner.get("superseded_issues") or [])
+        for ref in list(loser.get("superseded_issues") or []) + [loser.get("issue")]:
+            if ref and ref != winner.get("issue") and ref not in extra:
+                extra.append(ref)
+        if extra:
+            winner["superseded_issues"] = extra
+
     if new.get("issue") and not existing.get("issue"):
+        _carry(new, existing)
         bindings[bindings.index(existing)] = new
         return True
-    return False
+    if not new.get("issue"):
+        # Incumbent keeps the sprint; still preserve anything new superseded.
+        before = list(existing.get("superseded_issues") or [])
+        _carry(existing, new)
+        return list(existing.get("superseded_issues") or []) != before
+    if new["issue"] == existing.get("issue"):
+        return False
+
+    # Both bound, to different issues: keep the better-evidenced one.
+    def rank(b):
+        h = b.get("hours_synced")
+        return (h if isinstance(h, (int, float)) else -1.0)
+
+    if rank(new) > rank(existing):
+        _carry(new, existing)
+        bindings[bindings.index(existing)] = new
+    else:
+        _carry(existing, new)
+    return True
 
 
 def _dedupe_bindings(task: dict) -> bool:
@@ -551,6 +594,198 @@ def _migrate_shadows_to_bindings(data: dict) -> bool:
             mutated = True
 
     return mutated
+
+
+
+# Recurring work used to be modelled as one cloned task per sprint, titled
+# "<base> - Sprint N". Phase 5 collapses each series into a single perpetual task
+# that grows one binding per sprint, exactly like any other cross-sprint task.
+#
+# Grouping cannot be fully automatic: the live data drifted three ways for one
+# series ("Ad-hoc Slack Questions", "Ad-hoc Slack Questions - casanabria",
+# "Ad-hoc Slack Question casanabria" — note the singular and the missing dash),
+# and `_same_recurrent_series` bridges only two of them. So the drift is resolved
+# by an explicit alias table: normalised stripped title -> canonical title.
+# Anything not listed here is left alone.
+RECURRENT_SERIES_ALIASES = {
+    "stand up calls - casanabria":        "Stand Up Calls - casanabria",
+    "ana 1:1 calls - casanabria":         "Ana 1:1 calls - casanabria",
+    "general demo kit maintenance":       "General Demo Kit maintenance",
+    "time tracking":                      "Time tracking",
+    # One logical series, three spellings.
+    "ad-hoc slack questions":             "Ad-hoc Slack Questions - casanabria",
+    "ad-hoc slack questions - casanabria": "Ad-hoc Slack Questions - casanabria",
+    "ad-hoc slack question casanabria":   "Ad-hoc Slack Questions - casanabria",
+}
+
+
+def recurrent_series_for_title(title: str) -> str | None:
+    """Canonical series title for *title*, or None if it isn't a known series.
+
+    Matches on the sprint-suffix-stripped title, case- and whitespace-insensitive,
+    so both "Ad-hoc Slack Questions - Sprint 103" and the already-merged
+    "Ad-hoc Slack Questions - casanabria" resolve to the same series.
+    """
+    base = " ".join(strip_sprint_suffix(title or "").split()).lower()
+    return RECURRENT_SERIES_ALIASES.get(base)
+
+
+def _migrate_recurrent_series_to_bindings(data: dict) -> bool:
+    """Collapse per-sprint recurrent clones into one task per series (Phase 5).
+
+    Recurring work was cloned per sprint with a ``- Sprint N`` title suffix, so a
+    single activity was scattered across up to ten task objects — each with its
+    own id, its own issue, and its own slice of the logs. That is the same
+    problem the shadow tasks had, solved a second way; with per-sprint bindings
+    the clones are redundant.
+
+    For each series in :data:`RECURRENT_SERIES_ALIASES`:
+
+      * the **earliest-created** member survives and is retitled to the canonical
+        name (the sprint suffix is what made the clones necessary);
+      * every member's ``logs`` move onto it, deduped by log id;
+      * every member's ``sprint_issues`` merge into it, one binding per sprint,
+        preferring the entry that actually has an issue;
+      * ``status`` becomes ``recurrent`` if any member was still recurrent;
+      * ``start_sprint*`` is re-frozen from the merged earliest log;
+      * ``calendar_event_mappings`` values and ``active_timer.task_id`` are
+        re-pointed at the survivor so neither dangles;
+      * absorbed members are deleted.
+
+    **No GitHub call and no log edit**: every clone's issue survives as a binding,
+    so the project keeps exactly the issues it had, each still carrying its own
+    sprint's hours.
+
+    Guarded by ``config["recurrent_series_merged"]`` for the one-time pass, but
+    the absorb sweep runs on **every load** so a ``- Sprint N`` clone created by
+    an older wt.py on another Mac is folded in rather than resurrecting the split
+    model — the same defence ``_migrate_shadows_to_bindings`` uses for shadows.
+
+    Returns True if anything changed. Idempotent.
+    """
+    tasks = data.get("tasks", [])
+    if not tasks:
+        return False
+
+    config = data.setdefault("config", {})
+    mutated = False
+
+    groups: dict[str, list[dict]] = {}
+    for task in tasks:
+        canon = recurrent_series_for_title(task.get("title", ""))
+        if canon:
+            groups.setdefault(canon, []).append(task)
+
+    absorbed_ids: set[str] = set()
+    for canon, members in groups.items():
+        if len(members) < 2:
+            # Already a single task for this series: just make sure its title is
+            # canonical so future clones group onto it.
+            only = members[0]
+            if only.get("title") != canon:
+                only["title"] = canon
+                mutated = True
+            continue
+
+        members.sort(key=lambda t: (t.get("created_at") or 0, t.get("id") or ""))
+        survivor, absorbed = members[0], members[1:]
+
+        if survivor.get("title") != canon:
+            survivor["title"] = canon
+            mutated = True
+
+        bindings = _ensure_bindings(survivor)
+        seen_logs = {l.get("id") for l in survivor.get("logs", []) if l.get("id")}
+        for other in absorbed:
+            for log in other.get("logs", []) or []:
+                if log.get("id") and log["id"] in seen_logs:
+                    continue
+                seen_logs.add(log.get("id"))
+                survivor.setdefault("logs", []).append(log)
+            for binding in other.get("sprint_issues") or []:
+                _merge_binding(bindings, dict(binding))
+            if other.get("status") == "recurrent":
+                survivor["status"] = "recurrent"
+            # Inherit GitHub config only where the survivor lacks it; the live
+            # data has these identical across a series, so this is a no-op there.
+            for key in _ROLE_GITHUB_FIELDS:
+                if not survivor.get(key) and other.get(key):
+                    survivor[key] = other[key]
+            absorbed_ids.add(other.get("id"))
+            mutated = True
+
+        survivor["logs"].sort(key=lambda l: log_effective_date(l) or 0)
+        # The clone titles encoded the sprint; the merged task derives it from
+        # logs instead, so drop the now-misleading legacy pointer's title form.
+        survivor.pop("cross_sprint_parent", None)
+
+    if not absorbed_ids:
+        # Nothing to fold in. Still record that the one-time pass has run.
+        if not config.get("recurrent_series_merged"):
+            config["recurrent_series_merged"] = True
+            mutated = True
+        return mutated
+
+    # Re-point anything that referenced an absorbed clone by id.
+    at = data.get("active_timer")
+    if at and at.get("task_id") in absorbed_ids:
+        for canon, members in groups.items():
+            if any(m.get("id") == at["task_id"] for m in members):
+                keep = min(members, key=lambda t: (t.get("created_at") or 0, t.get("id") or ""))
+                logging.warning(
+                    "active timer moved from absorbed clone %s to %r",
+                    at["task_id"], keep.get("title"))
+                at["task_id"] = keep["id"]
+                mutated = True
+                break
+
+    # Calendar mappings store the sprint-stripped base name; re-point any that
+    # named a drifted spelling at the canonical title.
+    mappings = config.get("calendar_event_mappings")
+    if isinstance(mappings, dict):
+        for event, base in list(mappings.items()):
+            canon = recurrent_series_for_title(base or "")
+            if canon and base != canon:
+                mappings[event] = canon
+                mutated = True
+
+    data["tasks"] = [t for t in tasks if t.get("id") not in absorbed_ids]
+
+    sprints = get_cached_sprints(data)
+    for task in data["tasks"]:
+        if recurrent_series_for_title(task.get("title", "")) is None:
+            continue
+        if _dedupe_bindings(task):
+            mutated = True
+        if _sort_task_bindings(task, sprints):
+            mutated = True
+        # The survivor is the *earliest* clone, so its legacy sprint/sprint_id
+        # still name the sprint the series began in. Leaving them there makes the
+        # carry-forward rule (which trusts task["sprint_id"]) treat the oldest
+        # sprint's issue as the live one and re-point it to the current sprint —
+        # vacating the sprint whose hours it actually carries. Point them at the
+        # most recent binding instead, which is what "current" means.
+        bindings = task.get("sprint_issues") or []
+        if bindings:
+            latest = bindings[-1]
+            if latest.get("sprint_id") and task.get("sprint_id") != latest["sprint_id"]:
+                task["sprint_id"] = latest["sprint_id"]
+                task["sprint"] = latest.get("sprint")
+                mutated = True
+        # Re-freeze the start sprint: the merged log set reaches further back
+        # than any single clone's did.
+        if sprints and task.get("logs"):
+            first = min((log_effective_date(l) or 0) for l in task["logs"])
+            if first:
+                start = find_sprint_for_date(
+                    sprints, datetime.fromtimestamp(first).date())
+                if start and task.get("start_sprint_id") != start["id"]:
+                    task["start_sprint_id"] = start["id"]
+                    task["start_sprint"] = start["title"]
+                    mutated = True
+
+    config["recurrent_series_merged"] = True
+    return True
 
 
 def resolve_task_by_id(data: dict, task_id: str) -> dict | None:
@@ -1949,23 +2184,35 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
     # are minted for the sprints left behind. The carry-forward binding is the
     # one holding that issue: the binding for the task's own sprint_id, else an
     # unanchored binding (sprint unknown — a pre-sprint-tracking task).
-    own = task.get("sprint_id")
+    #
+    # A ``recurrent`` series is the exception and gets **no** carry-forward. It
+    # never ends, so there is no single long-lived issue: every sprint is its own
+    # reporting unit, keeps its own issue permanently, and that issue closes when
+    # the sprint does. Carrying forward would move the sprint-just-ended's issue
+    # onto the new sprint and strand the hours it actually carries — e.g. Sprint
+    # 104's #6207 (2h 54m) re-pointed to Sprint 105, leaving 104 unreported. This
+    # is precisely the one-issue-per-sprint shape `wt new-recurrent` used to
+    # produce by hand.
+    recurring = task.get("status") == "recurrent"
+    own = None if recurring else task.get("sprint_id")
     carry = None
-    if own:
-        carry = next((w for w in work if w["sprint_id"] == own and w["issue"]), None)
-    if carry is None:
-        carry = next((w for w in work if w["issue"] and w["sprint_id"] not in by_id), None)
-    if carry is None:
-        # `wt set-sprint` moves sprint_id without touching bindings, so the two
-        # can disagree. Fall back to the newest still-open issue — same rule as
-        # task_current_issue(). Without this we would mint a *second* issue for
-        # a sprint the task's live issue should simply have moved to.
-        still_open = sorted(
-            (w for w in work
-             if w["issue"] and w["state"] != "closed" and w["sprint_id"] in by_id),
-            key=lambda w: by_id[w["sprint_id"]]["start_date"],
-        )
-        carry = still_open[-1] if still_open else None
+    if not recurring:
+        if own:
+            carry = next((w for w in work if w["sprint_id"] == own and w["issue"]), None)
+        if carry is None:
+            carry = next((w for w in work
+                          if w["issue"] and w["sprint_id"] not in by_id), None)
+        if carry is None:
+            # `wt set-sprint` moves sprint_id without touching bindings, so the two
+            # can disagree. Fall back to the newest still-open issue — same rule as
+            # task_current_issue(). Without this we would mint a *second* issue for
+            # a sprint the task's live issue should simply have moved to.
+            still_open = sorted(
+                (w for w in work
+                 if w["issue"] and w["state"] != "closed" and w["sprint_id"] in by_id),
+                key=lambda w: by_id[w["sprint_id"]]["start_date"],
+            )
+            carry = still_open[-1] if still_open else None
     main_issue = carry["issue"] if carry else task.get("github_issue")
 
     latest = target_ids[-1] if target_ids else None
@@ -2137,6 +2384,29 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
                            else f"hours changed {f['hours_synced']} -> {hours}"),
             })
 
+    # 4c. Superseded issues: a sprint that ended up with two issues (see
+    # _merge_binding) has one primary carrying the sprint's full hours. The others
+    # must be zeroed and closed or the project double-counts that sprint.
+    for f in final:
+        for ref in list(f.get("superseded_issues") or []):
+            if not has_project:
+                plan["skipped"].append({
+                    "sprint": by_id.get(f["sprint_id"], {}).get("title"),
+                    "sprint_id": f["sprint_id"], "issue": ref,
+                    "reason": "superseded, but no github project configured",
+                })
+                continue
+            plan["ops"].append({
+                "op": "supersede",
+                "sprint_id": f["sprint_id"],
+                "sprint": by_id.get(f["sprint_id"], {}).get("title"),
+                "issue": ref,
+                "primary": f.get("issue"),
+                "hours": 0.0,
+                "reason": ("its sprint's hours now live on the primary issue; "
+                           "zero and close so the project doesn't double-count"),
+            })
+
     # 5. Bindings whose sprint has ended are final: Status=Done + close.
     for f in final:
         sid = f["sprint_id"]
@@ -2271,6 +2541,7 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
         "errors": [],
         "unassigned_minutes": plan["unassigned_minutes"],
         "unbillable": plan["unbillable"],
+        "superseded": [],
         "bindings": [],
     }
 
@@ -2436,6 +2707,35 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
                 result["closed"].append({
                     "sprint": op["sprint"], "sprint_id": op["sprint_id"],
                     "issue": issue_ref,
+                })
+
+            elif kind == "supersede":
+                # A second issue for a sprint whose hours now live on the primary
+                # binding. Zero it and close it, or the project double-counts.
+                binding = _find_binding(bindings, sprint_id=op["sprint_id"])
+                if binding is None:
+                    raise Exception("binding for the superseded issue has disappeared")
+                progress(f"  {label}: Zeroing superseded {op['issue']}...")
+                item_id = add_issue_to_project(op["issue"], data)
+                if not update_project_hours(op["issue"], 0.0, data,
+                                            project_info=pi, item_id=item_id):
+                    raise Exception(f"failed to zero superseded issue {op['issue']}")
+                if pi:
+                    sync_project_status(op["issue"], "done", data,
+                                        project_info=pi, item_id=item_id)
+                progress(f"  {label}: Closing superseded {op['issue']}...")
+                if not close_github_issue(op["issue"]):
+                    raise Exception(f"failed to close superseded issue {op['issue']}")
+                binding["superseded_issues"] = [
+                    r for r in (binding.get("superseded_issues") or [])
+                    if r != op["issue"]
+                ]
+                if not binding["superseded_issues"]:
+                    binding.pop("superseded_issues", None)
+                did_work = True
+                result.setdefault("superseded", []).append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "issue": op["issue"], "primary": op.get("primary"),
                 })
 
             elif kind == "relabel":
@@ -3133,7 +3433,10 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     # carries its own sprint's hours (Option A, plan §2.4). Idempotent, so this
     # is unconditional — see the docstring for what replaced the old gate.
     all_sprints = get_all_sprints(data)
-    if all_sprints and task.get("status") != "recurrent":
+    # Phase 5: recurrent tasks are no longer per-sprint clones, so they reconcile
+    # like anything else. Closing one ends the recurrence; its per-sprint issues
+    # were already created and closed as each sprint ended.
+    if all_sprints:
         rec = reconcile_task_sprints(task, data, all_sprints, closing=True,
                                      save_callback=save_callback)
         result["reconcile_result"] = rec
@@ -4231,7 +4534,27 @@ def cmd_done(args):
             pass
 
 
+def _recurrent_command_retired(name: str, replacement: str) -> None:
+    """Refuse a retired per-sprint-clone command and point at the replacement.
+
+    Phase 5 merged each recurring series into one perpetual task with a binding
+    per sprint, so there are no longer per-sprint clones to close or recreate.
+    These commands are dangerous now rather than merely obsolete:
+    ``find_recurrent_tasks_to_close`` selects on ``status == "recurrent"`` plus a
+    prior-sprint ``sprint_id``, which the merged task matches — running it would
+    set the whole series to ``done`` and close its live issue, ending the
+    recurrence. So they hard-refuse instead of no-oping quietly.
+    """
+    print(c(f"\n  wt {name} has been retired.", "yellow"))
+    print("  Recurring work is now one perpetual task with a GitHub issue per")
+    print("  sprint, so there are no per-sprint copies to close or recreate.")
+    print(c(f"\n  Use: {replacement}", "bold"))
+    print(c("  It closes the sprint that just ended and opens the new one.\n", "dim"))
+    sys.exit(2)
+
+
 def cmd_close_recurrent(args):
+    _recurrent_command_retired("close-recurrent", "wt sync-sprints --all            (then --create-issues to mint the new sprint's issues)")
     # Flags: --all-previous (close every earlier sprint, not just the immediately
     # previous one) and --dry-run / -n (preview without making changes).
     all_previous = "--all-previous" in args or "--all" in args
@@ -4274,6 +4597,7 @@ def cmd_close_recurrent(args):
 
 
 def cmd_new_recurrent(args):
+    _recurrent_command_retired("new-recurrent", "wt sync-sprints --all --create-issues")
     # Flags: --all-previous (source recurring tasks from every earlier sprint,
     # not just the immediately previous one) and --dry-run / -n (preview only).
     all_previous = "--all-previous" in args or "--all" in args
@@ -6460,6 +6784,9 @@ def _reconcile_plan_lines(res: dict) -> list[str]:
             else:
                 what = "(binding has no issue — nothing to close on GitHub)"
             lines.append(f"close   {sprint:<12} {what} — sprint has ended")
+        elif kind == "supersede":
+            lines.append(f"SUPER   {sprint:<12} {op['issue']}: zero + close "
+                         f"(duplicate of {op.get('primary')} for this sprint)")
         elif kind == "relabel":
             lines.append(f"relabel {sprint:<12} task sprint pointer moves from "
                          f"{op.get('from_sprint') or 'none'}")
@@ -6500,6 +6827,9 @@ def _reconcile_outcome_lines(res: dict) -> list[str]:
     for e in res.get("repointed", []):
         lines.append(f"→ {e['sprint']}: carried {e['issue']} forward from "
                      f"{e.get('from_sprint') or 'no sprint'}")
+    for e in res.get("superseded", []):
+        lines.append(f"✖ {e['sprint']}: {e['issue']} zeroed + closed "
+                     f"(duplicate of {e.get('primary')})")
     for e in res.get("hours_updated", []):
         was = e.get("from_hours")
         was_s = "unknown" if was is None else f"{was}h"
@@ -6574,16 +6904,13 @@ def cmd_sync_sprints(args):
     else:
         candidates = [resolve_task(data, " ".join(query_parts))]
 
-    # Requirement (b): recurrent tasks intentionally span sprints and are handled
-    # by wt close-recurrent / wt new-recurrent, which is also why close_task()
-    # excludes them. Reconciling them would mint past-sprint issues for every
-    # "… - Sprint N" copy, which is not today's behaviour.
-    targets, skipped_tasks = [], []
-    for t in candidates:
-        if t.get("status") == "recurrent":
-            skipped_tasks.append((t, "recurrent — use wt close-recurrent / wt new-recurrent"))
-            continue
-        targets.append(t)
+    # Phase 5 removed the recurrent exclusion. Recurring work used to be a fresh
+    # cloned task per sprint, so reconciling it would have minted a past-sprint
+    # issue for every "… - Sprint N" copy; now a series is one perpetual task with
+    # a binding per sprint, and reconcile is exactly the right thing to run on it —
+    # it opens the new sprint's issue and closes the one that just ended, which is
+    # what wt close-recurrent / wt new-recurrent used to do by hand.
+    targets, skipped_tasks = list(candidates), []
 
     # Plan pass: dry_run=True is structurally read-only (see reconcile_task_sprints).
     plans = []
