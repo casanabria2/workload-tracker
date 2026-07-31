@@ -2156,9 +2156,14 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
     # Working copy of the existing bindings — planning never touches the real ones.
     persisted = task.get("sprint_issues")
     if isinstance(persisted, list):
+        # NB: carry superseded_issues through. The planner works on a copy so it
+        # never mutates the real bindings, but omitting a field here silently
+        # disables anything that depends on it — that is exactly how the
+        # supersede op became unplannable after Phase 5 introduced it.
         work = [
             {"sprint_id": b.get("sprint_id"), "issue": b.get("issue"),
-             "state": b.get("state"), "hours_synced": b.get("hours_synced")}
+             "state": b.get("state"), "hours_synced": b.get("hours_synced"),
+             "superseded_issues": list(b.get("superseded_issues") or [])}
             for b in persisted
         ]
         legacy_issue = task.get("github_issue")
@@ -2289,7 +2294,9 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
     # Post-plan binding set: existing (possibly re-pointed) plus the new ones.
     final = [
         {"sprint_id": w["sprint_id"], "issue": w["issue"], "state": w["state"],
-         "hours_synced": w["hours_synced"], "new": False}
+         "hours_synced": w["hours_synced"],
+         "superseded_issues": list(w.get("superseded_issues") or []),
+         "new": False}
         for w in work
     ]
     for op in created_plan:
