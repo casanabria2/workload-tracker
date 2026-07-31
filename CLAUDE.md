@@ -645,7 +645,12 @@ a pure diff between derived target state and existing bindings —
 3. Create a binding (and issue, if the task has a `github_repo`) for each
    missing target sprint. New issues are for *past* sprints and keep the
    ` (Sprint N)` title suffix.
-4. Set each binding's Hours, but only when it differs from `hours_synced`.
+4. Set each binding's Hours, but only when it differs from `hours_synced` —
+   **unless some of the task's time has no issue to report on** (a sprint
+   deferred by `create_issues=False`, or a binding that was never linked). Then
+   every hours write for that task is withheld and shown as `HOLD`, because
+   narrowing the other issues would delete that time from the project's
+   reporting. `--create-issues` binds the deferred sprint and clears it.
 5. Close any binding whose sprint has ended (Status=Done + `gh issue close`).
 6. Never delete a binding. Never touch `logs`.
 
