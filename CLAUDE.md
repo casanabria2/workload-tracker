@@ -849,6 +849,7 @@ Authoritative signatures (use these instead of guessing — see live values via 
 - `update_project_activity(issue_ref, activity, data, project_info=None, item_id=None) -> bool`
 - `update_project_type(issue_ref, type_val, data, project_info=None, item_id=None) -> bool`
 - `get_project_hours(issue_ref, data) -> float | None`
+- `get_project_info(data, refresh=False) -> dict` — **memoised** for `PROJECT_INFO_TTL_SECONDS` (300s) per (owner, project number); the uncached fetch is `_fetch_project_info` and costs two GraphQL-backed `gh project` calls. Failures are never cached. Use `refresh=True` or `clear_project_info_cache()` to force a re-fetch. Before this, a `sync-sprints --all` over ~75 tasks made 118 metadata calls and exhausted the 5000-point GraphQL budget mid-run — which `gh` reports as the misleading `unknown owner type`.
 - `close_github_issue(issue_ref) -> bool`
 - `delete_github_issue(issue_ref) -> bool`
 - `get_task_repo(task) -> str | None` — reads `task["github_repo"]` (single-arg; roles carry no GitHub fields anymore)
@@ -1002,6 +1003,8 @@ wt.save(data)
 - Don't bypass `resolve_event_to_task()` in new code that logs a calendar event to a mapped task — manual `resolve_task_by_id(get_event_mapping(...))` skips the sprint-aware routing.
 - When reporting hours to a GitHub issue, use the **sprint-filtered** total (`task_reportable_mins(task, data, sprints)`), never `task_logged_mins(task)`. A cross-sprint task keeps *all* its logs on one object as the source of truth while its per-sprint hours live on separate per-sprint issues; reporting the task total double-counts. `sync_project_hours()`, `close_task()` and `reconcile_task_sprints()` all use the sprint-filtered value — keep any new GitHub-hours path consistent.
 - Don't read `task["github_issue"]` directly — use `task_current_issue(task, data)`. A task has one issue *per sprint*; the raw key is a legacy mirror of the current one.
+- Don't call `get_project_info()` in a per-task or per-field loop assuming it's cheap — it's two GraphQL calls. It's memoised now, but don't defeat that by passing `refresh=True` in a loop, and do pass `project_info=` down to the `update_project_*` helpers (they re-fetch when it's omitted).
+- **GraphQL, not REST, is the limit that bites.** `gh project` operations are GraphQL-backed with a 5000-point/hour budget; `gh api rate_limit` shows `resources.graphql` separately from `resources.core`. A rate-limited `gh project item-add` fails with `unknown owner type`, which looks like a config error but isn't.
 - Don't reintroduce a "does this task span sprints?" gate before reconciling. Reconcile is idempotent by construction; gates were how the old code needed 0-minute marker logs.
 - Don't run an all-tasks reconcile with issue creation enabled without showing the plan first — it can mint dozens of issues for sprints predating this workflow.
 

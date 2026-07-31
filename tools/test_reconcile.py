@@ -739,6 +739,117 @@ def test_hours_withheld_guard(wt, migrated, scratch):
           str(rc["unbillable"]))
 
 
+def test_project_info_cache(wt, migrated, scratch):
+    section("13. project metadata is fetched once per run, not once per task")
+    import json as _json
+    import types as _types
+
+    class _CP:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    FIELDS = _json.dumps({"fields": [
+        {"name": "Status", "id": "F1",
+         "options": [{"name": "Done", "id": "o1"}, {"name": "In Progress", "id": "o2"}]},
+        {"name": "Hours", "id": "F2"},
+        {"name": "Activity", "id": "F3", "options": []},
+        {"name": "Type", "id": "F4", "options": []},
+        {"name": "Sprint", "id": "F5"}]})
+
+    def fake_gh(log):
+        def run(argv, *a, **k):
+            log.append(" ".join(argv[:3]))
+            if argv[:3] == ["gh", "project", "view"]:
+                return _CP(_json.dumps({"id": "PVT_x"}))
+            if argv[:3] == ["gh", "project", "field-list"]:
+                return _CP(FIELDS)
+            if argv[:3] == ["gh", "project", "item-add"]:
+                return _CP(_json.dumps({"id": "PVTI_x"}))
+            return _CP("{}")
+        return _types.SimpleNamespace(run=run, PIPE=None)
+
+    real_sub, real_ttl = wt.subprocess, wt.PROJECT_INFO_TTL_SECONDS
+    try:
+        data = load_copy(wt, migrated, scratch / "pinfo.json")
+
+        # Repeated calls collapse to one fetch (two gh calls).
+        log = []
+        wt.subprocess = fake_gh(log)
+        wt.clear_project_info_cache()
+        for _ in range(20):
+            wt.get_project_info(data)
+        check(len(log) == 2, "20 get_project_info() calls make 2 gh calls", str(len(log)))
+
+        wt.get_project_info(data, refresh=True)
+        check(len(log) == 4, "refresh=True forces a re-fetch", str(len(log)))
+        wt.clear_project_info_cache()
+        wt.get_project_info(data)
+        check(len(log) == 6, "clear_project_info_cache() forces a re-fetch", str(len(log)))
+
+        # A cache hit must still return the same metadata.
+        a = wt.get_project_info(data)
+        b = wt.get_project_info(data)
+        check(a == b and a.get("project_id") == "PVT_x",
+              "a cache hit returns identical metadata", str(a.get("project_id")))
+
+        # Expiry: a non-positive TTL always re-fetches.
+        log.clear()
+        wt.PROJECT_INFO_TTL_SECONDS = -1
+        wt.clear_project_info_cache()
+        for _ in range(3):
+            wt.get_project_info(data)
+        check(len(log) == 6, "an expired entry re-fetches", str(len(log)))
+        wt.PROJECT_INFO_TTL_SECONDS = real_ttl
+
+        # Failures must never be cached, or one blip poisons the whole run.
+        attempts = []
+        def boom(argv, *a, **k):
+            attempts.append(1)
+            raise RuntimeError("network down")
+        wt.subprocess = _types.SimpleNamespace(run=boom, PIPE=None)
+        wt.clear_project_info_cache()
+        for _ in range(3):
+            try:
+                wt.get_project_info(data)
+            except Exception:
+                pass
+        check(len(attempts) == 3, "a failed fetch is not cached", str(len(attempts)))
+
+        # The regression that mattered: a whole-run reconcile must not scale its
+        # metadata fetches with the task count. `wt sync-sprints --all` doing so
+        # exhausted the 5000-point GraphQL budget mid-run.
+        sprints = wt.get_cached_sprints(data)
+        tasks = [t for t in data["tasks"] if t.get("status") != "recurrent"]
+        counts = {}
+        for mode, ttl in (("cached", real_ttl), ("uncached", -1)):
+            fresh = load_copy(wt, migrated, scratch / f"pinfo_{mode}.json")
+            log2 = []
+            wt.subprocess = fake_gh(log2)
+            wt.PROJECT_INFO_TTL_SECONDS = ttl
+            wt.clear_project_info_cache()
+            for t in [x for x in fresh["tasks"] if x.get("status") != "recurrent"]:
+                try:
+                    wt.reconcile_task_sprints(t, fresh, sprints, create_issues=False,
+                                              save_callback=lambda _d: None)
+                except Exception:
+                    pass
+            counts[mode] = sum(1 for c in log2
+                               if c in ("gh project view", "gh project field-list"))
+        wt.PROJECT_INFO_TTL_SECONDS = real_ttl
+        print(f"    {len(tasks)} tasks: metadata gh calls "
+              f"uncached={counts['uncached']} cached={counts['cached']}")
+        check(counts["cached"] == 2,
+              "a full-run reconcile fetches project metadata exactly once",
+              str(counts["cached"]))
+        check(counts["uncached"] > counts["cached"],
+              "and that is strictly fewer than the per-task behaviour",
+              f"{counts['uncached']} vs {counts['cached']}")
+    finally:
+        wt.subprocess = real_sub
+        wt.PROJECT_INFO_TTL_SECONDS = real_ttl
+        wt.clear_project_info_cache()
+
+
 def main():
     if len(sys.argv) != 5:
         print(__doc__.strip(), file=sys.stderr)
@@ -766,6 +877,7 @@ def main():
     test_set_sprint_drift(wt, migrated, scratch)
     test_pre_migration(wt, fixture, scratch)
     test_hours_withheld_guard(wt, migrated, scratch)
+    test_project_info_cache(wt, migrated, scratch)
     test_idempotency(wt, migrated, scratch, baseline)
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
