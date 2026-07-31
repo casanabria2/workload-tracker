@@ -41,10 +41,32 @@ it runs on a background thread inside `tracker.py` while the TUI is open.
 
 Install/refresh dependencies: `pip install -r requirements.txt` (inside the venv).
 
-**Tests:** there is no automated test suite. Validate changes by exercising the
-CLI against the real (iCloud-synced) data file — use `--dry-run` flags where
-available (`close-recurrent`, `new-recurrent`) and prefer `wt.load()` in a
-throwaway `python3 -c` snippet to inspect state before mutating. Because the
+**Tests:** there is no pytest suite, but there are runnable stubbed harnesses
+under `tools/` — run these before and after any change to the sprint/GitHub
+paths:
+
+```bash
+# Never point these at the live file. Work on a copy.
+cp ~/.workload_tracker.json /tmp/wt-work.json
+python3 tools/baseline.py /tmp/wt-work.json /tmp/wt-baseline.json
+python3 tools/check_invariants.py /tmp/wt-work.json /tmp/wt-baseline.json
+python3 tools/test_reconcile.py  <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
+python3 tools/test_phase3.py     <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
+python3 tools/test_mcp_phase3.py <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
+```
+
+**`WT_DATA_FILE` overrides the data file path** (`wt.py` and `mcp_server.py`), so
+exercise everything against a throwaway copy rather than the live,
+iCloud-synced source of truth:
+
+```bash
+WT_DATA_FILE=/tmp/wt-work.json python3 wt.py sync-sprints --all --dry-run
+```
+
+The harnesses swap `subprocess` for a guard that raises on any attribute access,
+so a missed stub fails loudly instead of reaching GitHub — **never** let a test
+run `gh issue create`/`close`; those writes are irreversible. Use `--dry-run`
+where available (`sync-sprints`, `close-recurrent`, `new-recurrent`). Because the
 data file is the single source of truth and syncs across Macs, avoid `save()`
 until you've confirmed the in-memory change is correct.
 
@@ -66,17 +88,17 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 > synced copy. If `ls` works but the file is still empty, it's a dataless iCloud
 > placeholder — force a download with `brctl download ~/WorkloadTracker/.workload_tracker.json`.
 
-- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done, non-shadow picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still focuses Arc. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, split-sprint, set-repo, set-activity, set-type.
+- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still focuses Arc. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, close-recurrent, new-recurrent, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, sync-sprints (alias: split-sprint), set-repo, set-activity, set-type.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sprint_split, close_previous_recurrent_tasks.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sync_task_sprints, close_previous_recurrent_tasks, report_time_range, create_task_from_issue, save_task_tabs, open_task_window, list_task_tabs, clear_task_tabs. (43 tools registered.)
 - **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
 ### Data Model
 
 Plain JSON with three top-level keys:
-- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `github_repo`, `activity`, `type`, `calendar_event_uid`, `sprint`, `sprint_id`, `cross_sprint_parent`
+- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `github_repo`, `activity`, `type`, `calendar_event_uid`, `sprint_issues[]`, `start_sprint`/`start_sprint_id` (plus the legacy `sprint`/`sprint_id` mirror)
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color. Roles are pure categorization, user-configurable via `wt roles` commands. GitHub repo/activity/type are **per-task** fields (`wt set-repo/set-activity/set-type <task> ...`), not role fields.
 - `config.sprints_cache[]` — Persisted list of `{id, title, start_date, end_date, field_id}` written by `save_sprints_cache()` after the TUI fetches sprints from GitHub. Used by `get_sprint_date_range_for_task()` to avoid network calls (e.g. for the calendar modal's default range).
@@ -347,7 +369,7 @@ wt config calendar_id your.email@gmail.com  # Use specific calendar (default: pr
 
 Lookup goes through `resolve_event_to_task(data, event)` in `wt.py`, which:
 1. Reads the base name via `get_event_mapping()` (case- and whitespace-insensitive on event titles).
-2. Collects all non-shadow tasks whose `strip_sprint_suffix(title)` matches the base name (case-insensitive). Returns `None` if no candidates.
+2. Collects all tasks whose `strip_sprint_suffix(title)` matches the base name (case-insensitive). Returns `None` if no candidates.
 3. If the event's `start_date` resolves to a sprint via `get_cached_sprints()` → `find_sprint_for_date()` (with `get_all_sprints()` fallback), returns the candidate whose `sprint_id` matches.
 4. Otherwise sorts candidates (prefer non-done, then most recent sprint start_date, then `created_at`) and returns the first.
 
@@ -386,23 +408,23 @@ Linking an issue (`wt link`, MCP `link_github_issue`, `wt add-issue`, `create_ta
 2. If the task **has a repo**:
    - Task must have a linked GitHub issue
    - If no issue exists, user is prompted to create one (with local notes as body)
-   - **Cross-sprint auto-split**: if the task's logs span more than one sprint,
-     `close_task()` runs `split_cross_sprint_task()` *before* reporting hours, so
-     each prior sprint's hours land on their own shadow issue and only the most
-     recent sprint's hours are reported on the main issue (see "Cross-sprint
-     split workflow" below). Shadow tasks (`cross_sprint_parent` set) and
-     `recurrent` tasks are skipped. A failed split aborts the close (the task is
-     **not** marked done) so hours can't be mis-reported.
+   - **Auto-reconcile**: `close_task()` runs `reconcile_task_sprints()` *before*
+     reporting hours, so each prior sprint's hours land on that sprint's own
+     issue and only the current sprint's hours go on the current binding (see
+     "Reconcile workflow" below). It runs unconditionally — reconcile is
+     idempotent, so there's no "does this span sprints?" gate any more.
+     `recurrent` tasks are skipped. A failed reconcile aborts the close (the task
+     is **not** marked done) so hours can't be mis-reported.
    - Issue is added to the configured GitHub project (if configured)
    - Project item is updated with Status=Done, the task's Activity/Type (when
-     set), and the **sprint-filtered** hours (`task_logged_mins_for_sprint`),
+     set), and the **sprint-filtered** hours (`task_reportable_mins`),
      not the task's total
    - **GitHub issue is automatically closed**
 
-   The CLI `wt done` prints the split breakdown (each `Sprint N → Xh (issue)`
-   line plus `Main task kept on Sprint M`) and the sprint-filtered hours synced.
-   `close_task()` returns `split_performed: bool` and `split_result: dict`
-   alongside the existing keys.
+   The CLI `wt done` renders the reconcile outcome (which issues were created,
+   re-pointed, had hours updated, or closed) plus the sprint-filtered hours
+   synced. `close_task()` returns `reconcile_result: dict` alongside the existing
+   keys; `split_performed`/`split_result` are still populated for older callers.
 
 **Configuration:**
 
@@ -465,7 +487,6 @@ fields — Status=Done, Hours, Activity, Sprint, Type — and closes the issue).
 **A task qualifies only if it:**
 - has `status == "recurrent"`,
 - has a linked `github_issue` (tasks without one are skipped entirely),
-- is not a cross-sprint shadow (`cross_sprint_parent` unset), and
 - has a `sprint_id` matching a target sprint.
 
 **Scope (default vs. opt-in):** by default only the sprint *immediately before*
@@ -508,7 +529,7 @@ status alone. A source task in the target sprint(s) is treated as recurring when
   this is the recurring-task naming convention and is the only signal for a
   series whose copies are *all* closed (e.g. `General Demo Kit maintenance -
   Sprint 100`); **or**
-- its base name (`strip_sprint_suffix(title)`) matches some non-shadow task
+- its base name (`strip_sprint_suffix(title)`) matches some task
   anywhere that currently has `status == "recurrent"` (covers recurring tasks
   without the suffix).
 
@@ -549,67 +570,107 @@ wt new-recurrent --dry-run       # preview; combine with --all-previous
 
 ### Sprint Tracking
 
-Tasks are assigned to sprints (GitHub Project iterations). Sprints are auto-assigned on task creation.
+A task is **not assigned to a sprint**. It has a *starting* sprint (the sprint
+of its first log) and one **GitHub issue binding per sprint** it has time in.
+Which sprint any minute of work belongs to is derived from the log's timestamp.
+There are **no shadow tasks** — see `docs/plan-sprint-bindings.md` for the full
+design and the migration away from them.
 
 **Task fields:**
-- `sprint` — Sprint title for display (e.g., "Sprint 43")
-- `sprint_id` — GitHub iteration ID for API calls
-- `cross_sprint_parent` — If set, this is a shadow task created by cross-sprint split (hidden from views)
+- `sprint_issues[]` — the bindings, one per sprint:
+  `{sprint_id, sprint, issue, state, hours_synced, synced_at, created_at}`.
+  `issue` is always a full `owner/repo#n` ref (a task's issues can live in
+  different repos). `state` is the *issue's* open/closed state, independent of
+  the task's `status`. `hours_synced` caches what GitHub was last told so a
+  reconcile can skip no-op API calls — it is never a source of truth; hours are
+  always recomputed from `logs`.
+- `start_sprint_id` / `start_sprint` — derived from the earliest log, then
+  frozen, so a later log edit doesn't silently rewrite history.
+- `sprint` / `sprint_id` — **legacy**, still written and read as a mirror of the
+  current binding. Retiring them is a later, coordinated phase; don't add new
+  readers.
+- `cross_sprint_parent` — **gone.** `_migrate_shadows_to_bindings()` converts
+  any task carrying it into a binding on its parent and deletes it. That sweep
+  runs on *every* `load()`, not just the first, so an older `wt.py` syncing via
+  iCloud from another Mac can't reintroduce one.
+
+**"Current" issue** is derived, not stored: the binding for the current sprint,
+else the binding with the latest sprint start date, else the legacy
+`github_issue`. Always read it via `task_current_issue(task, data)` — never
+`task["github_issue"]` directly.
 
 **CLI commands:**
 ```bash
-wt sprint                           # Show current sprint + tasks by sprint
-wt set-sprint <task> <sprint>       # Set/change sprint for a task
-wt set-sprint <task> none           # Clear sprint
-wt split-sprint <task>              # Split cross-sprint task into per-sprint shadow tasks
+wt sprint                           # Tasks grouped by the current sprint's bindings
+wt set-sprint <task> <sprint>       # Correct the *start* sprint (rare)
+wt set-sprint <task> none           # Clear it, so it re-derives from the logs
+wt sync-sprints <task>              # Reconcile one task's bindings + issues
+wt sync-sprints --all --dry-run     # Preview across every non-recurrent task
+wt sync-sprints --all               # Sync hours + close ended sprints
+wt sync-sprints --all --create-issues   # ...and mint missing past-sprint issues
 wt add "title" --sprint "Sprint 43" # Create task with specific sprint
 wt add "title" --sprint none        # Create task without sprint
 ```
 
+`wt split-sprint` still works as a deprecated alias for `wt sync-sprints`.
+
+**Two safety rules baked into `sync-sprints`:**
+- `--all` **does not create issues** unless `--create-issues` is passed. A
+  blanket run over a long history can want to mint a couple dozen issues for
+  sprints predating this workflow; those show as
+  `SKIP … re-run with --create-issues` rather than being silently bound
+  issue-less. It always prints an itemised plan and prompts `Proceed? [Y/n]`
+  (`--yes` to skip, `--dry-run` to print and exit).
+- **`recurrent` tasks are skipped** and reported as such. They're still one task
+  object per sprint, handled by `close-recurrent` / `new-recurrent`; unifying
+  them into a single task with one binding per sprint is a later phase.
+
 **Three task lifecycle patterns:**
-1. **Single-sprint**: Fully contained in one sprint. Auto-assigned, no special handling.
-2. **Recurrent**: Long-lived tasks that intentionally span sprints (e.g. "Slack questions", on-call). Marked with `status="recurrent"`, displayed in the dedicated bottom table in the TUI, and skipped by cross-sprint detection. Alternatively, the user can still create one regular task per sprint manually.
-3. **Cross-sprint**: A non-recurrent task that ended up with logs in multiple sprints. `split-sprint` or close workflow creates shadow tasks.
+1. **Single-sprint**: fully contained in one sprint. One binding, no special handling.
+2. **Recurrent**: long-lived tasks that intentionally span sprints (e.g. "Slack questions", on-call). `status="recurrent"`, shown in the TUI's bottom table, skipped by reconcile.
+3. **Cross-sprint**: a non-recurrent task with logs in several sprints. It stays **one task object** and grows a binding per sprint.
 
-**Cross-sprint split workflow:**
-When a task has logs in multiple sprints (detected via log timestamps):
-1. For each **previous sprint**: creates a shadow task + GH issue with that sprint's hours, closes it
-2. **Main task**: updated to most recent sprint with only that sprint's hours on GH
-3. Shadow tasks have `cross_sprint_parent` field → hidden from all default views
-4. Original task keeps ALL logs (source of truth)
+**Reconcile workflow** (`reconcile_task_sprints`, replaces the old split):
+a pure diff between derived target state and existing bindings —
+1. Bucket logs by sprint; drop zero-total sprints.
+2. Target set = {sprints with time} ∪ {current sprint, if the task is open}.
+   That second term is why the old **0-minute "rollover marker" log hack is
+   unnecessary** — an open task always has a landing place for new work.
+3. Create a binding (and issue, if the task has a `github_repo`) for each
+   missing target sprint. New issues are for *past* sprints and keep the
+   ` (Sprint N)` title suffix.
+4. Set each binding's Hours, but only when it differs from `hours_synced`.
+5. Close any binding whose sprint has ended (Status=Done + `gh issue close`).
+6. Never delete a binding. Never touch `logs`.
 
-**Triggers:** the split runs from three places — the explicit `wt split-sprint`
-command, the TUI split action, and **automatically inside `close_task()`** when
-you close a multi-sprint task (see "Close Workflow" above). The close-time split
-skips shadow tasks (`cross_sprint_parent` set) and `recurrent` tasks, and aborts
-the close if the split fails.
+**Idempotency is structural**, not a guard: re-running diffs against a derived
+target set, so a second `wt sync-sprints` or `wt done` reports "Nothing to do".
+`dry_run=True` is write-free by construction (the planner is separate from the
+executor), so it makes no GitHub calls and mutates nothing.
 
-**Idempotency:** the main task keeps ALL its logs (step 4), so its
-`sprint_summary_for_task()` still spans multiple sprints *after* a split — a
-naive re-run would re-detect the same previous sprints and create duplicate
-shadow tasks/issues. `split_cross_sprint_task()` guards against this: before the
-per-sprint loop it collects the `sprint_id`s of existing shadows
-(`cross_sprint_parent == task["id"]`) and skips any previous sprint that already
-has one (recording a `{"skipped": "shadow already exists"}` result entry instead
-of creating a duplicate). So both `wt split-sprint` and a second `wt done` are
-safe to re-run; only sprints without a shadow get one, and the main-task
-re-point + hours-sync are no-ops when nothing changed. The `wt split-sprint`
-preview reflects this — already-split sprints are marked `(already split)`, the
-"will create N shadow task(s)" count excludes them, and it short-circuits with
-"All previous sprints are already split. Nothing to do." when none remain.
-
-**Auto-detection:** TUI checks for cross-sprint tasks on mount and shows a notification.
+**Triggers:** `wt sync-sprints`, the TUI reconcile action, and automatically
+inside `close_task()` on every close. Recurrent tasks are excluded; a failed
+reconcile aborts the close so hours can't be mis-reported.
 
 **Key functions in wt.py:**
 - `get_all_sprints(data)` — All sprint iterations from GitHub Project (GraphQL); no caching, network call every time
 - `get_current_sprint(data)` — Current sprint based on today's date
 - `find_sprint_for_date(sprints, dt)` — Find which sprint a date falls in
-- `sprint_summary_for_task(task, sprints)` — Per-sprint time breakdown
-- `split_cross_sprint_task(task, data, save_callback)` — Execute the split
+- `task_sprints_with_time(task, sprints)` — Per-sprint time breakdown, excluding zero-minute sprints. Replaces `sprint_summary_for_task` (kept as a deprecated shim). **Sorts on the `start_date` date object**, not the camelCase `startDate` key that only `get_all_sprints()` emits — passing cached sprints to the old function sorted every entry by `""`.
+- `reconcile_task_sprints(task, data, sprints, *, create_issues=True, close_past=True, sync_hours=True, dry_run=False, save_callback=None, progress_callback=None)` — the reconcile. `split_cross_sprint_task` is a deprecated wrapper.
+- `task_mins_for_sprint(task, sprint_id, sprints)` — minutes in one sprint, from the logs. No "unknown sprint → task total" fallback.
+- `task_reportable_mins(task, data, sprints)` — what to report to GitHub: resolves the sprint from the bindings, falling back to the task total only when *no* sprint resolves, so an unreachable `gh` never under-reports 0.
+- `task_current_issue` / `current_binding` / `task_binding_for_sprint` / `task_issue_refs` / `set_task_current_issue` / `clear_task_current_issue` — the issue accessor layer.
 - `save_sprints_cache(data, sprints)` / `get_cached_sprints(data)` — Persist sprint list (id, title, start_date, end_date, field_id) to `data["config"]["sprints_cache"]` so consumers can resolve sprint dates without hitting GitHub. Caller must `save(data)` after writing.
-- `get_sprint_date_range_for_task(task, data)` — Resolves `(sprint_dict, start_date, end_date)` for a task's sprint context. Looks up the task's `sprint_id` first, falls back to current sprint; tries the persisted cache before the network.
+- `get_sprint_date_range_for_task(task, data)` — Resolves `(sprint_dict, start_date, end_date)` for a task's sprint context. Tries the persisted cache before the network.
 
-**MCP tools:** `list_sprints`, `get_current_sprint_info`, `set_sprint`, `sprint_split`
+**MCP tools:** `list_sprints`, `get_current_sprint_info`, `set_sprint`, `sync_task_sprints`
+
+**Verification:** `python3 tools/check_invariants.py <data.json> [baseline.json]`
+asserts no shadows survive, every binding issue is a full `owner/repo#n`, no two
+bindings share a sprint, and (against a `tools/baseline.py` snapshot) that total
+minutes and log count are unchanged. Sprints with logged time and no binding are
+**warnings**, not failures — reconcile is what closes that gap.
 
 ### GitHub CLI (gh) Reference
 
@@ -791,8 +852,11 @@ Authoritative signatures (use these instead of guessing — see live values via 
 - `save_sprints_cache(data, sprints) -> None` — caller must `save(data)`
 - `get_cached_sprints(data) -> list[dict]` — reads `data["config"]["sprints_cache"]`
 - `get_sprint_date_range_for_task(task, data) -> (sprint, start, end) | None` — cache-first, falls back to live
-- `sprint_summary_for_task(task, sprints) -> list[dict]`
-- `split_cross_sprint_task(task, data, save_callback, all_sprints=None, progress_callback=None) -> dict`
+- `sprint_summary_for_task(task, sprints) -> list[dict]` — *deprecated shim*, zero-minute-inclusive
+- `reconcile_task_sprints(task, data, sprints, *, create_issues=True, close_past=True, sync_hours=True, dry_run=False, save_callback=None, progress_callback=None) -> dict` — replaces `split_cross_sprint_task` (kept as a deprecated wrapper). `dry_run` is write-free by construction.
+- `task_current_issue(task, data=None) -> str | None` — **use this instead of `task["github_issue"]`**; offline, never a network call
+- `task_mins_for_sprint(task, sprint_id, sprints) -> float` / `task_reportable_mins(task, data, sprints) -> float`
+- `task_sprints_with_time(task, sprints) -> list[dict]` — replaces `sprint_summary_for_task`
 
 **Calendar integration**
 - `get_calendar_events(days_back=1, calendar_id="primary", start_date=None, end_date=None) -> list[dict]` — event dict has `uid, title, start_date (ts), end_date (ts), duration_mins, calendar_name`
@@ -925,22 +989,24 @@ wt.save(data)
 - Don't write to `data["config"]["sprints_cache"]` by hand — use `save_sprints_cache(data, sprints)` so the entry shape stays correct (ISO date strings).
 - Don't add new task statuses without updating `PROJECT_STATUS_MAP` (`wt.py`) — missing entries cause silent sync no-ops.
 - Don't bypass `resolve_event_to_task()` in new code that logs a calendar event to a mapped task — manual `resolve_task_by_id(get_event_mapping(...))` skips the sprint-aware routing.
-- When reporting hours to a GitHub issue, use the **sprint-filtered** total (`task_logged_mins_for_sprint(task, all_sprints)`), not `task_logged_mins(task)`. A cross-sprint task keeps *all* its logs locally as the source of truth while its per-sprint hours live on the shadow tasks' issues; reporting the task total double-counts. Both `sync_project_hours()` and `close_task()` (`wt.py`) now use the sprint-filtered value — keep any new GitHub-hours path consistent with them.
+- When reporting hours to a GitHub issue, use the **sprint-filtered** total (`task_reportable_mins(task, data, sprints)`), never `task_logged_mins(task)`. A cross-sprint task keeps *all* its logs on one object as the source of truth while its per-sprint hours live on separate per-sprint issues; reporting the task total double-counts. `sync_project_hours()`, `close_task()` and `reconcile_task_sprints()` all use the sprint-filtered value — keep any new GitHub-hours path consistent.
+- Don't read `task["github_issue"]` directly — use `task_current_issue(task, data)`. A task has one issue *per sprint*; the raw key is a legacy mirror of the current one.
+- Don't reintroduce a "does this task span sprints?" gate before reconciling. Reconcile is idempotent by construction; gates were how the old code needed 0-minute marker logs.
+- Don't run an all-tasks reconcile with issue creation enabled without showing the plan first — it can mint dozens of issues for sprints predating this workflow.
 
-### Cross-sprint tasks (how the split lays out)
+### Cross-sprint tasks (how the bindings lay out)
 
-A non-recurrent task worked across several sprints is split (via `split-sprint`,
-the TUI split action, or **automatically when you close it** — see "Close
-Workflow") into one **shadow task per previous sprint** (`cross_sprint_parent`
-set, hidden from default views, each with its own closed GH issue carrying that
-sprint's hours) plus the **original/main task**, which keeps **every** log
-(source of truth) and is re-pointed to the *most recent* sprint.
+A non-recurrent task worked across several sprints stays **one task object**. It
+keeps **every** log (source of truth) and grows one entry in `sprint_issues[]`
+per sprint it has time in — each with its own GitHub issue carrying only that
+sprint's hours, closed once the sprint ends. Its long-lived original issue is
+carried forward as the *current* binding.
 
-Because `close_task()` now splits on the fly, you usually just run `wt done
-<task>` and it does the right thing: prior-sprint shadows are created + closed,
-the main issue is re-pointed to the latest sprint with only that sprint's hours,
-and the task is marked done. To audit afterwards, check that
-`bucket_logs_by_sprint(task, sprints)` matches each shadow's logged hours and
-that the main GH issue shows only its current-sprint portion. The split is
-skipped for `recurrent` tasks and already-split shadows, and a split failure
-aborts the close (task stays open) so hours are never mis-reported.
+Because `close_task()` reconciles on the fly, you usually just run `wt done
+<task>`: past-sprint issues are created + closed, the current binding is
+carried to the latest sprint with only that sprint's hours, and the task is
+marked done. To audit afterwards, compare `bucket_logs_by_sprint(task, sprints)`
+against each binding's `hours_synced` — or just run
+`tools/check_invariants.py`, which asserts exactly that. Reconcile is skipped for
+`recurrent` tasks, and a failure aborts the close (task stays open) so hours are
+never mis-reported.

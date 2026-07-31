@@ -9,11 +9,14 @@ Keyboard shortcuts:
   d        — Delete selected task
   t        — Toggle timer on selected task
   l        — Manage time logs (add/edit/delete/split/merge)
-  s        — Cycle status of selected task
+  p        — Move a To Do task to In Progress
+  D        — Close the task (GitHub close workflow)
+  S        — Sync the task's per-sprint GitHub issues with its logs
   g        — Create and link GitHub issue
   o        — Open linked GitHub issue in browser
   c        — Import from Google Calendar
   a        — Toggle showing done tasks
+  r        — Reload the data file from disk
   1-4      — Filter by role (1=DemoKit, 2=Demos, 3=Strategic, 4=Other, 0=All)
   tab      — Switch between Task board / Overview panels
   ↑↓       — Navigate tasks
@@ -23,6 +26,11 @@ Notes column indicators:
   C        — Imported from calendar
   #        — Linked to GitHub issue
   +        — Has local notes
+
+Sprint column: the sprint whose GitHub issue the task's hours currently go to.
+"Sprint 105 ← Sprint 103" means the work started in Sprint 103 and carried over;
+Sprint 103's hours live on their own (closed) issue. See `S` above and
+docs/plan-sprint-bindings.md.
 """
 
 import json
@@ -45,22 +53,41 @@ from textual.widgets import (
     Select, Static, Switch, TabbedContent, TabPane, TextArea
 )
 from textual.reactive import reactive
+from rich.markup import escape as _escape_markup
 
 from idle_detector import get_idle_seconds
 from wt import (
     load as wt_load, save as wt_save, resolve_task,
-    get_task_repo, create_github_issue, add_to_project_and_update, close_github_issue, delete_github_issue,
-    sync_project_status, get_task_activity, get_task_type, update_project_activity, update_project_type,
+    get_task_repo, create_github_issue, delete_github_issue,
+    sync_project_status, get_task_activity,
     get_calendar_events,
     get_gcal_service, GCAL_CREDENTIALS_FILE, setup_issue_in_project, sync_project_hours,
     task_logged_mins as wt_task_logged_mins, task_uploaded_mins, task_pending_upload_mins,
-    get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins, get_current_sprint,
-    get_imported_calendar_uids, find_calendar_event_owner, get_all_sprints, sprint_summary_for_task, split_cross_sprint_task,
+    get_project_hours, mins_to_quarter_hours, fmt_mins as wt_fmt_mins,
+    get_imported_calendar_uids, find_calendar_event_owner, get_all_sprints,
     get_event_mapping, set_event_mapping, remove_event_mapping, resolve_task_by_id,
     save_sprints_cache, get_sprint_date_range_for_task,
     resolve_event_to_task, strip_sprint_suffix,
     get_event_names_for_base, round_up_to_30,
     get_project_info, get_cached_project_options, _migrate_role_github_fields,
+    # ── Phase 3 of docs/plan-sprint-bindings.md ──────────────────────────────
+    # Per-sprint issue *bindings* (task["sprint_issues"]) replace the old shadow
+    # task objects, so: every read of task["github_issue"] goes through
+    # task_current_issue(); writes go through set_/clear_task_current_issue()
+    # (which still mirror the legacy flat key — mcp_server.py and an older wt.py
+    # on the other Mac read it); hours reported to GitHub come from
+    # task_reportable_mins() (the current binding's sprint, never the task
+    # total, which would double-count a carry-over); and the cross-sprint split
+    # is now the idempotent reconcile_task_sprints().
+    _migrate_shadows_to_bindings, task_current_issue, set_task_current_issue,
+    clear_task_current_issue, task_binding_for_sprint, task_start_sprint,
+    task_reportable_mins, task_sprints_with_time, reconcile_task_sprints,
+    close_task as wt_close_task, current_binding,
+    get_cached_sprints, find_sprint_for_date,
+    # Shared renderers for a reconcile plan / outcome so the TUI's wording
+    # matches `wt sync-sprints`. Underscore-prefixed but the supported way to
+    # describe a reconcile result (see wt.cmd_sync_sprints).
+    _reconcile_plan_lines, _reconcile_outcome_lines,
 )
 
 DATA_FILE = Path.home() / ".workload_tracker.json"
@@ -88,6 +115,17 @@ def uid() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S") + "".join(random.choices(string.ascii_lowercase, k=4))
 
 
+def esc(text) -> str:
+    """Escape Rich markup in *text*.
+
+    Labels and notifications render markup, so a task title like
+    ``[Oracle] False DB load needed`` (there is one in the live data) or an
+    issue title echoed back from a reconcile plan would otherwise be parsed as
+    a style tag.
+    """
+    return _escape_markup(str(text))
+
+
 def fmt_mins(mins: float) -> str:
     if not mins:
         return "0m"
@@ -110,7 +148,16 @@ def load_data() -> dict:
         data["roles"] = [r.copy() for r in DEFAULT_ROLES]
     # Move role github fields onto tasks (idempotent). Persist with a direct
     # write — save_data() would resurrect the stripped role fields from disk.
-    if _migrate_role_github_fields(data):
+    mutated = _migrate_role_github_fields(data)
+    # Convert cross-sprint shadow tasks into per-sprint issue bindings, and keep
+    # stripping shadows re-introduced by an older wt.py on the other Mac (via
+    # iCloud). Offline + idempotent. The TUI runs its own loader rather than
+    # wt.load(), so it has to run this itself — every cross_sprint_parent filter
+    # was removed from the board/bridge/edit modal on the strength of this
+    # guarantee, and without it a synced-in shadow would show up as a duplicate
+    # task and double-count in the overview totals.
+    mutated = _migrate_shadows_to_bindings(data) or mutated
+    if mutated:
         DATA_FILE.write_text(json.dumps(data, indent=2))
     return data
 
@@ -229,15 +276,29 @@ class TaskModal(ModalScreen):
         else:
             _recent = self._sprints[-5:]
 
-        # Ensure the task's existing sprint is selectable even if it falls outside
-        # the recent window (e.g. recurrent tasks pointing at an older sprint).
-        task_sprint_id = t.get("sprint_id")
+        # The sprint Select edits the task's **start** sprint (plan §2.1/§3):
+        # which sprint's issue carries which hours is derived from log timestamps
+        # and materialised as sprint_issues bindings by a reconcile, so it is not
+        # something you pick from a dropdown any more. start_sprint is only
+        # "when did this work begin" — frozen at migration from the earliest log,
+        # editable here (and via `wt set-sprint`) as a correction.
+        #
+        # Keep the out-of-window injection: start_sprint_id is frozen at the
+        # *earliest* log, so it is out of the "current + previous 4" window far
+        # more often than the old mutable sprint_id was (a task started in
+        # Sprint 95 with current = Sprint 105). Without this, Textual's strict
+        # Select raises InvalidSelectValueError on mount and the edit modal
+        # crashes — exactly the bug the original workaround fixed.
+        task_sprint_id = t.get("start_sprint_id") or t.get("sprint_id")
         if task_sprint_id and not any(s["id"] == task_sprint_id for s in _recent):
             existing = next((s for s in self._sprints if s["id"] == task_sprint_id), None)
             if existing is not None:
                 _recent = [existing] + list(_recent)
             else:
-                _recent = [{"id": task_sprint_id, "title": t.get("sprint") or task_sprint_id}] + list(_recent)
+                _recent = [{
+                    "id": task_sprint_id,
+                    "title": t.get("start_sprint") or t.get("sprint") or task_sprint_id,
+                }] + list(_recent)
 
         sprint_options = [("(none)", "")] + [(s["title"], s["id"]) for s in reversed(_recent)]
         default_sprint = task_sprint_id or ""
@@ -265,7 +326,8 @@ class TaskModal(ModalScreen):
             yield Input(value=t.get("description", ""), placeholder="Description (optional)", id="inp-desc")
             yield Select(role_options, value=t.get("role_id", default_role), id="sel-role", prompt="Select role")
             yield Select(status_options, value=t.get("status", "todo"), id="sel-status", prompt="Select status")
-            yield Select(sprint_options, value=default_sprint, id="sel-sprint", prompt="Select sprint")
+            yield Select(sprint_options, value=default_sprint, id="sel-sprint",
+                         prompt="Select start sprint")
             yield Input(value=t.get("local_folder", ""), placeholder="Local folder path (optional, e.g., ~/dev/myproject)", id="inp-local-folder")
             yield Input(value=t.get("github_repo", ""), placeholder="GitHub repo (owner/repo, optional)", id="inp-repo")
             yield Select(activity_options, value=default_activity, id="sel-activity", prompt="Select activity")
@@ -321,13 +383,13 @@ class TaskModal(ModalScreen):
                 result["local_folder"] = str(folder_path.resolve())
             else:
                 result["local_folder"] = local_folder  # Store as-is, will error on use
-        # Handle sprint selection
+        # Handle sprint selection — the *start* sprint (see compose()).
         sprint_id = self.query_one("#sel-sprint").value
         if sprint_id:
             sprint = next((s for s in self._sprints if s["id"] == sprint_id), None)
             if sprint:
-                result["sprint"] = sprint["title"]
-                result["sprint_id"] = sprint["id"]
+                result["start_sprint"] = sprint["title"]
+                result["start_sprint_id"] = sprint["id"]
         # GitHub fields (per task; empty widget value clears the field)
         github_repo = self.query_one("#inp-repo").value.strip()
         if github_repo:
@@ -338,9 +400,24 @@ class TaskModal(ModalScreen):
         type_val = self.query_one("#sel-type").value
         if type_val:
             result["type"] = type_val
-        # Preserve additional fields from existing task
+        # Preserve additional fields from the existing task. _save() rebuilds the
+        # task dict from scratch, so anything missing from this list is silently
+        # dropped on every edit — sprint_issues especially (losing it would
+        # orphan every past-sprint GitHub issue the task is billed to).
+        #
+        # cross_sprint_parent is gone: shadows no longer exist (load_data() runs
+        # the migration), so there is nothing to carry over.
+        #
+        # start_sprint/start_sprint_id are in the list even though the Select
+        # writes them: when self._sprints is empty (the TUI's fetch hasn't landed
+        # and there is no cached sprint list) the Select renders "(none)" and
+        # writes nothing, and preserving is far better than silently clearing.
+        # Clearing a start sprint is `wt set-sprint <task> none`.
         if self._task_data:
-            for key in ("github_issue", "arc_folder_id", "archived_tabs", "iterm_session_name", "task_folder_path", "calendar_event_uid", "sprint", "sprint_id", "tabs", "active_window_id", "cross_sprint_parent"):
+            for key in ("github_issue", "sprint_issues", "arc_folder_id", "archived_tabs",
+                        "iterm_session_name", "task_folder_path", "calendar_event_uid",
+                        "sprint", "sprint_id", "start_sprint", "start_sprint_id",
+                        "tabs", "active_window_id"):
                 if key in self._task_data and key not in result:
                     result[key] = self._task_data[key]
             # Track if title changed for GitHub issue update
@@ -692,19 +769,35 @@ class ConfirmCloseTaskModal(ModalScreen):
     .hours-row { margin-bottom: 1; }
     """
 
-    def __init__(self, task_title: str, local_mins: float, gh_hours: float | None):
+    def __init__(self, task_title: str, local_mins: float, gh_hours: float | None,
+                 sprint_title: str | None = None, total_mins: float | None = None,
+                 n_sprints: int = 0):
         super().__init__()
         self._task_title = task_title
+        # local_mins is the *reportable* total: the hours that will be pushed to
+        # this issue, i.e. only the current binding's sprint (plan §2.4 Option A).
         self._local_mins = local_mins
         self._gh_hours = gh_hours
+        self._sprint_title = sprint_title
+        self._total_mins = total_mins
+        self._n_sprints = n_sprints
 
     def compose(self) -> ComposeResult:
         local_hours = mins_to_quarter_hours(self._local_mins) if self._local_mins > 0 else 0
+        label = f"Local logged ({self._sprint_title})" if self._sprint_title else "Local logged"
         with Container(id="close-task-box"):
             yield Label("[bold]Close Task?[/]")
             yield Label(f"Task: '{self._task_title}'")
             yield Label("")
-            yield Label(f"[bold]Local logged:[/] {fmt_mins(self._local_mins)} → [green]{local_hours}h[/]", classes="hours-row")
+            yield Label(f"[bold]{label}:[/] {fmt_mins(self._local_mins)} → [green]{local_hours}h[/]", classes="hours-row")
+            if self._total_mins is not None and abs(self._total_mins - self._local_mins) > 1e-9:
+                # Earlier sprints' hours live on their own issues, so they are
+                # deliberately not part of what this close reports.
+                where = f"{self._n_sprints} sprints" if self._n_sprints else "all sprints"
+                yield Label(
+                    f"[dim]Task total across {where}: {fmt_mins(self._total_mins)}[/]",
+                    classes="hours-row",
+                )
             if self._gh_hours is not None:
                 yield Label(f"[bold]GitHub project:[/] [cyan]{self._gh_hours}h[/]", classes="hours-row")
                 if local_hours != self._gh_hours:
@@ -730,6 +823,84 @@ class ConfirmCloseTaskModal(ModalScreen):
         self.dismiss(True)
 
     @on(Button.Pressed, "#btn-cancel-close")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ──────────────────────────────────────────────────────────
+# Modal: Sync sprint bindings (reconcile preview)
+# ──────────────────────────────────────────────────────────
+
+class SyncSprintsModal(ModalScreen):
+    """Preview of a ``reconcile_task_sprints`` dry run, with a confirm button.
+
+    The TUI counterpart of ``wt sync-sprints <task> --dry-run`` followed by the
+    "Proceed? [Y/n]" prompt: the plan lines come from the same
+    ``wt._reconcile_plan_lines`` renderer the CLI uses, so both surfaces describe
+    a reconcile identically. Dismissing with True runs it for real.
+
+    Reconciling can *create* GitHub issues (one per past sprint that has hours but
+    no issue yet), which is irreversible, so the count is called out and the
+    Cancel button takes focus.
+    """
+    CSS = """
+    SyncSprintsModal { align: center middle; }
+    #sync-sprints-box {
+        width: 90;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #sync-sprints-box Label { margin-bottom: 1; }
+    #sync-sprints-plan { height: auto; max-height: 20; }
+    #sync-sprints-actions { margin-top: 1; }
+    """
+
+    def __init__(self, task_title: str, breakdown: str, plan_lines: list[str],
+                 n_new_issues: int = 0):
+        super().__init__()
+        self._task_title = task_title
+        self._breakdown = breakdown
+        self._plan_lines = plan_lines
+        self._n_new_issues = n_new_issues
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sync-sprints-box"):
+            yield Label("[bold]Sync sprint bindings?[/]")
+            yield Label(f"Task: '{esc(self._task_title)}'")
+            if self._breakdown:
+                yield Label(f"[dim]Logs by sprint: {esc(self._breakdown)}[/]")
+            yield Label("")
+            with ScrollableContainer(id="sync-sprints-plan"):
+                for line in self._plan_lines:
+                    # Plan lines quote issue titles, i.e. task titles.
+                    yield Label(esc(line))
+            yield Label("")
+            if self._n_new_issues:
+                yield Label(
+                    f"[yellow]This creates {self._n_new_issues} new GitHub "
+                    f"issue(s) — not reversible.[/]"
+                )
+            with Horizontal(id="sync-sprints-actions"):
+                yield Button("Sync  [y]", variant="primary", id="btn-sync-sprints")
+                yield Button("Cancel  [esc]", id="btn-cancel-sync-sprints")
+
+    def on_mount(self):
+        self.query_one("#btn-cancel-sync-sprints").focus()
+
+    def on_key(self, event):
+        if event.key == "escape":
+            self.dismiss(False)
+        elif event.key == "y":
+            self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-sync-sprints")
+    def confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-cancel-sync-sprints")
     def cancel(self):
         self.dismiss(False)
 
@@ -2857,6 +3028,7 @@ class WorkloadTracker(App):
         Binding("l",   "log_time",    "Manage logs"),
         Binding("p",   "start_progress", "Start"),
         Binding("D",   "mark_done",   "Done"),
+        Binding("S",   "sync_sprints", "Sync sprints"),
         Binding("g",   "link_github", "GitHub"),
         Binding("u",   "update_github", "Update GH"),
         Binding("o",   "open_github", "Open issue"),
@@ -2887,6 +3059,28 @@ class WorkloadTracker(App):
         self._sprints_cache: list[dict] = []
         self._sprints_fetched = False
         self._bridge_server: Optional[HTTPServer] = None
+
+    # ── Sprint context (offline) ───────────────────────────
+
+    def _sprints(self) -> list:
+        """Sprint list for UI code: live fetch if it has landed, else the cache.
+
+        ``_fetch_sprints_worker`` only fills ``_sprints_cache`` after a GitHub
+        round-trip, so until then the board, the edit modal's sprint Select and
+        the reconcile preview would see *no* sprints at all. Falling back to
+        ``config.sprints_cache`` makes all of them work from the first frame and
+        keeps every sprint lookup on the event loop offline. Both sources use the
+        same date-object contract (``start_date``/``end_date``).
+        """
+        return self._sprints_cache or get_cached_sprints(self._data)
+
+    def _current_sprint(self) -> Optional[dict]:
+        """Today's sprint, resolved offline. None when no sprint list is known.
+
+        Replaces ``wt.get_current_sprint()`` on the event loop, which fetches
+        from GitHub (a blocking ``gh`` call) on every keypress that needed it.
+        """
+        return find_sprint_for_date(self._sprints(), datetime.now().date())
 
     def _bg_start(self, label: str):
         """Show a background operation in the header subtitle."""
@@ -2968,7 +3162,15 @@ class WorkloadTracker(App):
 
     @work(thread=True)
     def _fetch_sprints_worker(self):
-        """Fetch sprints from GitHub and check for cross-sprint tasks."""
+        """Fetch sprints from GitHub and persist them for offline use.
+
+        Phase 3 dropped the "'<task>' has time in N sprints. Use 'wt
+        split-sprint' to split." notification this used to raise on mount (plan
+        §3): a task with hours in several sprints is now a normal, supported
+        state, and bringing its per-sprint issues in line is an idempotent
+        reconcile the user can run whenever (``S`` here, ``wt sync-sprints``
+        outside) rather than a ritual they have to be nagged about.
+        """
         self._bg_start("Fetching sprints")
         try:
             sprints = get_all_sprints(self._data)
@@ -2991,31 +3193,11 @@ class WorkloadTracker(App):
             if sprints or self._data.get("config", {}).get("project_options_cache"):
                 save_data(self._data)
 
-            # Auto-detect cross-sprint tasks
+            # The board's Sprint column and the edit modal both read the sprint
+            # list, so re-render once the live one lands (it may differ from the
+            # cache _sprints() served until now — e.g. a brand-new sprint).
             if sprints:
-                from datetime import datetime
-                current = None
-                today = datetime.now().date()
-                for s in sprints:
-                    if s["start_date"] <= today < s["end_date"]:
-                        current = s
-                        break
-
-                if current:
-                    for task in self._data.get("tasks", []):
-                        if task.get("status") in ("done", "recurrent") or task.get("cross_sprint_parent"):
-                            continue
-                        if not task.get("logs"):
-                            continue
-                        summary = sprint_summary_for_task(task, sprints)
-                        if len(summary) > 1:
-                            self.call_from_thread(
-                                self.notify,
-                                f"'{task['title']}' has time in {len(summary)} sprints. Use 'wt split-sprint' to split.",
-                                title="Cross-sprint detected",
-                                severity="warning",
-                                timeout=8,
-                            )
+                self.call_from_thread(self._populate_table)
         finally:
             self._bg_end("Fetching sprints")
 
@@ -3065,6 +3247,7 @@ class WorkloadTracker(App):
         role_map = get_role_map(self._data)
         roles = get_roles(self._data)
         default_role = roles[-1] if roles else {"id": "other", "label": "Other", "color": "white"}
+        sprints = self._sprints()
         for task in tasks:
             logged = task_logged_mins(task) + task_live_mins(task, self._data.get("active_timer"))
             role = role_map.get(task["role_id"], default_role)
@@ -3077,13 +3260,13 @@ class WorkloadTracker(App):
             # Notes indicator: # for GitHub issue, + for local notes, C for calendar
             if task.get("calendar_event_uid"):
                 notes_icon = "C"
-            elif task.get("github_issue"):
+            elif task_current_issue(task, self._data):
                 notes_icon = "#"
             elif has_local_notes(task["id"]):
                 notes_icon = "+"
             else:
                 notes_icon = " "
-            sprint_label = task.get("sprint", "")
+            sprint_label = self._sprint_cell(task, sprints)
             table.add_row(
                 timer_dot,
                 task["title"],
@@ -3106,6 +3289,26 @@ class WorkloadTracker(App):
             except Exception:
                 pass
 
+    def _sprint_cell(self, task: dict, sprints: list) -> str:
+        """The board's Sprint column for *task*.
+
+        Shows the sprint of the task's **current binding** — the sprint whose
+        GitHub issue the task's hours are currently reported to — falling back to
+        the legacy ``task["sprint"]`` for data that has no bindings. A carry-over
+        (work that began in a strictly earlier sprint) is marked ``← Sprint N``,
+        the board's equivalent of the "started Sprint N" note in ``wt sprint``.
+        """
+        binding = current_binding(task, self._data)
+        label = (binding or {}).get("sprint") or task.get("sprint", "") or ""
+        if not sprints:
+            return label
+        by_id = {s["id"]: s for s in sprints if s.get("id")}
+        shown = by_id.get((binding or {}).get("sprint_id") or task.get("sprint_id"))
+        start = task_start_sprint(task, sprints)
+        if start and shown and start["id"] != shown["id"] and start["start_date"] < shown["start_date"]:
+            return f"{label} ← {start['title']}"
+        return label
+
     def _populate_table(self):
         main_tasks, recurrent_tasks = self._visible_tasks_split()
         self._populate_one_table(self.query_one("#task-table", DataTable), main_tasks)
@@ -3119,9 +3322,11 @@ class WorkloadTracker(App):
         return main, recurrent
 
     def _visible_tasks(self) -> list:
+        # Every task in data["tasks"] is now a real unit of work: the shadow
+        # tasks the old cross-sprint split created are gone (converted into
+        # sprint_issues bindings by load_data()'s migration), so there is nothing
+        # left to hide here.
         tasks = self._data.get("tasks", [])
-        # Always hide shadow tasks (cross-sprint splits)
-        tasks = [t for t in tasks if not t.get("cross_sprint_parent")]
         if self.filter_role != "all":
             tasks = [t for t in tasks if t.get("role_id") == self.filter_role]
         if not self.show_done:
@@ -3323,7 +3528,7 @@ class WorkloadTracker(App):
         save_data(self._data)
 
         # Sync hours to GitHub project if task has linked issue
-        if task.get("github_issue"):
+        if task_current_issue(task, self._data):
             self._sync_task_hours_async(task)
 
         # Notify user
@@ -3337,13 +3542,16 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _sync_task_hours_async(self, task: dict):
         """Sync task hours to GitHub project in background thread."""
-        issue_ref = task.get("github_issue")
+        issue_ref = task_current_issue(task, self._data)
         if not issue_ref:
             return
         self.call_from_thread(self._bg_start, "Syncing hours")
         try:
             if sync_project_hours(issue_ref, task, self._data, save_data):
-                hours = mins_to_quarter_hours(task_logged_mins(task))
+                # Report what sync_project_hours actually pushed: the current
+                # binding's sprint hours, not the task total (which for a
+                # carry-over task also covers sprints billed to other issues).
+                hours = mins_to_quarter_hours(task_reportable_mins(task, self._sprints()))
                 self.call_from_thread(
                     self.notify, f"Synced {hours}h to {issue_ref}", severity="information"
                 )
@@ -3427,7 +3635,7 @@ class WorkloadTracker(App):
             task = res["task"]
             self.call_from_thread(
                 self.notify,
-                f"Created: {task['title']} ({task['github_issue']})",
+                f"Created: {task['title']} ({task_current_issue(task, self._data)})",
                 severity="information",
             )
             self.call_from_thread(self._populate_table)
@@ -3528,15 +3736,17 @@ class WorkloadTracker(App):
         existing = next((i for i, t in enumerate(tasks) if t["id"] == result["id"]), None)
         is_new = existing is None
 
-        # Auto-assign current sprint for new tasks if not set by modal
-        if is_new and not result.get("sprint_id") and self._sprints_cache:
-            from datetime import datetime
-            today = datetime.now().date()
-            for s in self._sprints_cache:
-                if s["start_date"] <= today < s["end_date"]:
-                    result["sprint"] = s["title"]
-                    result["sprint_id"] = s["id"]
-                    break
+        # Auto-assign the current sprint to a new task. `sprint`/`sprint_id` are
+        # still written because `wt add` does (and set_task_current_issue() picks
+        # the binding to fill from task["sprint_id"]); `start_sprint*` is the
+        # Phase-3 field — a task created today starts in today's sprint.
+        if is_new and not result.get("sprint_id"):
+            current = self._current_sprint()
+            if current:
+                result["sprint"] = current["title"]
+                result["sprint_id"] = current["id"]
+                result.setdefault("start_sprint", current["title"])
+                result.setdefault("start_sprint_id", current["id"])
 
         if existing is not None:
             tasks[existing] = result
@@ -3545,7 +3755,7 @@ class WorkloadTracker(App):
         save_data(self._data)
 
         # Update GitHub issue title if needed
-        if title_changed and result.get("github_issue"):
+        if title_changed and task_current_issue(result, self._data):
             self._update_github_issue_title(result)
 
         # Create GitHub issue for new task if requested
@@ -3558,13 +3768,19 @@ class WorkloadTracker(App):
 
     @work(thread=True)
     def _update_github_issue_title(self, task: dict):
-        """Update GitHub issue title in background thread."""
+        """Update GitHub issue title in background thread.
+
+        Only the *current* binding's issue is retitled. Past-sprint issues keep
+        the title they were closed with (they are historical records, and they
+        carry a ``(Sprint N)`` suffix the new title wouldn't have anyway).
+        """
+        issue_ref = task_current_issue(task, self._data)
         self.call_from_thread(self._bg_start, "Updating issue title")
         try:
             from wt import update_issue_title
-            if update_issue_title(task["github_issue"], task["title"]):
+            if update_issue_title(issue_ref, task["title"]):
                 self.call_from_thread(
-                    self.notify, f"Updated GitHub issue: {task['github_issue']}", severity="information"
+                    self.notify, f"Updated GitHub issue: {issue_ref}", severity="information"
                 )
             else:
                 self.call_from_thread(
@@ -3584,9 +3800,9 @@ class WorkloadTracker(App):
             return
         self.call_from_thread(self._bg_start, "Creating GitHub issue")
         try:
-            # Create the issue
+            # Create the issue and bind it to the task's current sprint.
             issue_ref = create_github_issue(task, repo)
-            task["github_issue"] = issue_ref
+            set_task_current_issue(task, issue_ref, self._data)
             save_data(self._data)
             self.call_from_thread(
                 self.notify, f"Created issue: {issue_ref}", severity="information"
@@ -3596,7 +3812,8 @@ class WorkloadTracker(App):
             result = setup_issue_in_project(issue_ref, task, self._data)
             if result["success"]:
                 save_data(self._data)  # Save uploaded_at markers
-                hours = mins_to_quarter_hours(task_logged_mins(task))
+                # setup_issue_in_project() sets Hours from task_reportable_mins.
+                hours = mins_to_quarter_hours(task_reportable_mins(task, self._sprints()))
                 self.call_from_thread(
                     self.notify, f"Added to project: {hours}h", severity="information"
                 )
@@ -3620,7 +3837,7 @@ class WorkloadTracker(App):
         if not task:
             return
 
-        if task.get("github_issue"):
+        if task_current_issue(task, self._data):
             # Issue exists - offer to sync project fields
             self._sync_existing_issue(task)
             return
@@ -3629,10 +3846,11 @@ class WorkloadTracker(App):
         if not repo:
             self.notify("No GitHub repo set on this task (edit with 'e')", severity="warning")
             return
-        # Show modal with project field preview
-        logged_mins = task_logged_mins(task)
+        # Show modal with project field preview. The Hours preview has to match
+        # what setup_issue_in_project() will push, i.e. the sprint-filtered total.
+        logged_mins = task_reportable_mins(task, self._sprints())
         activity = get_task_activity(task)
-        sprint = get_current_sprint(self._data)
+        sprint = self._current_sprint()
         sprint_title = sprint["title"] if sprint else None
         status = task.get("status", "todo")
         self.push_screen(
@@ -3642,15 +3860,19 @@ class WorkloadTracker(App):
 
     def _sync_existing_issue(self, task: dict):
         """Sync project fields for an existing GitHub issue."""
-        logged_mins = task_logged_mins(task)
+        sprints = self._sprints()
+        logged_mins = task_reportable_mins(task, sprints)
         activity = get_task_activity(task)
-        sprint = get_current_sprint(self._data)
-        sprint_title = sprint["title"] if sprint else None
+        binding = current_binding(task, self._data)
+        sprint_title = (binding or {}).get("sprint") or (
+            (self._current_sprint() or {}).get("title")
+        )
         status = task.get("status", "todo")
         hours = mins_to_quarter_hours(logged_mins) if logged_mins > 0 else 0
 
         self.push_screen(
-            SyncIssueModal(task["title"], task["github_issue"], status, activity, sprint_title, hours),
+            SyncIssueModal(task["title"], task_current_issue(task, self._data),
+                           status, activity, sprint_title, hours),
             lambda confirmed: self._on_sync_issue_confirmed(task, confirmed)
         )
 
@@ -3663,7 +3885,7 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _sync_issue_to_project(self, task: dict):
         """Sync all project fields for an existing issue."""
-        issue_ref = task.get("github_issue")
+        issue_ref = task_current_issue(task, self._data)
         if not issue_ref:
             return
 
@@ -3672,9 +3894,9 @@ class WorkloadTracker(App):
             result = setup_issue_in_project(issue_ref, task, self._data)
             if result["success"]:
                 save_data(self._data)
-                hours = mins_to_quarter_hours(task_logged_mins(task))
-                sprint = get_current_sprint(self._data)
-                sprint_title = sprint["title"] if sprint else "N/A"
+                hours = mins_to_quarter_hours(task_reportable_mins(task, self._sprints()))
+                sprint = (current_binding(task, self._data) or {}).get("sprint")
+                sprint_title = sprint or (self._current_sprint() or {}).get("title") or "N/A"
                 self.call_from_thread(
                     self.notify, f"Synced to project: {hours}h, {sprint_title}", severity="information"
                 )
@@ -3691,7 +3913,7 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if not task:
             return
-        if not task.get("github_issue"):
+        if not task_current_issue(task, self._data):
             self.notify("No GitHub issue linked", severity="warning")
             return
         self._bg_start("Updating GitHub")
@@ -3701,10 +3923,11 @@ class WorkloadTracker(App):
     def _update_github_project(self, task: dict):
         """Push current task state to GitHub project in background."""
         try:
-            result = setup_issue_in_project(task["github_issue"], task, self._data)
+            result = setup_issue_in_project(
+                task_current_issue(task, self._data), task, self._data)
             if result["success"]:
                 save_data(self._data)
-                hours = mins_to_quarter_hours(task_logged_mins(task))
+                hours = mins_to_quarter_hours(task_reportable_mins(task, self._sprints()))
                 self.call_from_thread(
                     self.notify, f"GitHub updated: {hours}h", severity="information"
                 )
@@ -3727,7 +3950,7 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if not task:
             return
-        issue_ref = task.get("github_issue")
+        issue_ref = task_current_issue(task, self._data)
         if not issue_ref:
             self.notify("No GitHub issue linked to this task", severity="warning")
             return
@@ -3742,11 +3965,15 @@ class WorkloadTracker(App):
         self.notify(f"Opened: {issue_ref}", severity="information")
 
     def action_delete_github_issue(self):
-        """Delete the GitHub issue linked to the selected task."""
+        """Delete the GitHub issue linked to the selected task.
+
+        Only the current binding's issue — past-sprint issues stay put (they hold
+        hours already reported for closed sprints).
+        """
         task = self._selected_task()
         if not task:
             return
-        issue_ref = task.get("github_issue")
+        issue_ref = task_current_issue(task, self._data)
         if not issue_ref:
             self.notify("No GitHub issue linked to this task", severity="warning")
             return
@@ -3764,10 +3991,13 @@ class WorkloadTracker(App):
     @work(thread=True)
     def _delete_github_issue_worker(self, task: dict):
         """Delete GitHub issue in background thread."""
-        issue_ref = task["github_issue"]
+        issue_ref = task_current_issue(task, self._data)
         try:
             if delete_github_issue(issue_ref):
-                del task["github_issue"]
+                # Unlinks the ref from whichever binding holds it (the binding
+                # itself survives — bindings are never deleted, plan §2.3 step 6)
+                # and drops the legacy flat key.
+                clear_task_current_issue(task, self._data)
                 save_data(self._data)
                 self.call_from_thread(
                     self.notify, f"Deleted issue: {issue_ref}", severity="information"
@@ -3795,7 +4025,10 @@ class WorkloadTracker(App):
         task = next((t for t in self._data["tasks"] if t["id"] == task_id), None)
         if not task:
             return
-        issue_ref = task.get("github_issue")
+        # Only the current binding's issue is deleted with the task. Past-sprint
+        # issues are left alone, matching the pre-Phase-3 behaviour where each
+        # past sprint lived on its own shadow *task* that this delete never saw.
+        issue_ref = task_current_issue(task, self._data)
         if self._is_running(task):
             self._data["active_timer"] = None
         self._data["tasks"] = [t for t in self._data["tasks"] if t["id"] != task_id]
@@ -3853,7 +4086,7 @@ class WorkloadTracker(App):
         save_data(self._data)
 
         # Sync hours to GitHub project if task has linked issue
-        if task and task.get("github_issue"):
+        if task and task_current_issue(task, self._data):
             self._sync_task_hours_async(task)
 
         # Safari window integration: snapshot+close the stopped task's window
@@ -3891,7 +4124,7 @@ class WorkloadTracker(App):
                     stopped_task = prev
                     save_data(self._data)
                     # Sync hours for the stopped task
-                    if prev.get("github_issue"):
+                    if task_current_issue(prev, self._data):
                         self._sync_task_hours_async(prev)
 
             self._data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
@@ -4074,7 +4307,7 @@ class WorkloadTracker(App):
         task["status"] = "inprogress"
         save_data(self._data)
         self._populate_table()
-        if task.get("github_issue"):
+        if task_current_issue(task, self._data):
             self._sync_project_status_async(task, "inprogress")
 
     def action_mark_done(self):
@@ -4093,12 +4326,10 @@ class WorkloadTracker(App):
         # Recurrent tasks in the current sprint need an extra confirmation
         # before we close them and their GitHub issue.
         if current == "recurrent":
-            current_sprint = get_current_sprint(self._data)
-            task_sprint_id = task.get("sprint_id")
-            in_current_sprint = (
-                current_sprint is not None
-                and task_sprint_id is not None
-                and task_sprint_id == current_sprint["id"]
+            current_sprint = self._current_sprint()
+            in_current_sprint = current_sprint is not None and (
+                task_binding_for_sprint(task, current_sprint["id"]) is not None
+                or task.get("sprint_id") == current_sprint["id"]
             )
             if in_current_sprint:
                 self.push_screen(
@@ -4125,20 +4356,20 @@ class WorkloadTracker(App):
         repo = get_task_repo(task)
 
         # If task already has a GitHub issue, always show confirmation and update project
-        if task.get("github_issue"):
+        if task_current_issue(task, self._data):
             self._fetch_gh_hours_and_confirm_close(task)
             return
 
         # Task has no GitHub issue - check if it has a repo to create one
         if repo:
             # Prompt to create issue with project field preview
-            logged_mins = task_logged_mins(task)
+            logged_mins = task_reportable_mins(task, self._sprints())
             activity = get_task_activity(task)
-            sprint = get_current_sprint(self._data)
+            sprint = self._current_sprint()
             sprint_title = sprint["title"] if sprint else None
             self.push_screen(
                 CreateIssueModal(task["title"], repo, logged_mins, activity, sprint_title, "done"),
-                lambda confirmed: self._on_create_issue_for_close(task, repo, confirmed)
+                lambda confirmed: self._on_create_issue_for_close(task, confirmed)
             )
         else:
             # No GitHub integration - confirm before closing
@@ -4169,19 +4400,35 @@ class WorkloadTracker(App):
     def _fetch_gh_hours_worker(self, task: dict):
         """Fetch GitHub project hours in background."""
         try:
-            gh_hours = None
-            if task.get("github_issue"):
-                gh_hours = get_project_hours(task["github_issue"], self._data)
+            issue_ref = task_current_issue(task, self._data)
+            gh_hours = get_project_hours(issue_ref, self._data) if issue_ref else None
 
-            local_mins = task_logged_mins(task)
-            self.call_from_thread(self._show_close_confirmation, task, local_mins, gh_hours)
+            # Compare like with like: the close pushes the *current sprint's*
+            # hours to this issue, not the task total, so that is what the modal
+            # must show. The total is passed alongside for context when they
+            # differ (a carry-over task whose earlier sprints are billed to
+            # their own issues).
+            sprints = self._sprints()
+            local_mins = task_reportable_mins(task, sprints)
+            total_mins = task_logged_mins(task)
+            # Sprints with >0 logged minutes (task_sprints_with_time, the
+            # start_date-sorted replacement for sprint_summary_for_task).
+            n_sprints = len(task_sprints_with_time(task, sprints)) if sprints else 0
+            binding = current_binding(task, self._data)
+            sprint_title = (binding or {}).get("sprint") or task.get("sprint")
+            self.call_from_thread(self._show_close_confirmation, task, local_mins,
+                                  gh_hours, sprint_title, total_mins, n_sprints)
         finally:
             self.call_from_thread(self._bg_end, "Fetching GitHub hours")
 
-    def _show_close_confirmation(self, task: dict, local_mins: float, gh_hours: float | None):
+    def _show_close_confirmation(self, task: dict, local_mins: float, gh_hours: float | None,
+                                 sprint_title: str | None = None,
+                                 total_mins: float | None = None, n_sprints: int = 0):
         """Show the close confirmation modal with hours comparison."""
         self.push_screen(
-            ConfirmCloseTaskModal(task["title"], local_mins, gh_hours),
+            ConfirmCloseTaskModal(task["title"], local_mins, gh_hours,
+                                  sprint_title=sprint_title, total_mins=total_mins,
+                                  n_sprints=n_sprints),
             lambda confirmed: self._on_close_confirmed(task, confirmed)
         )
 
@@ -4191,105 +4438,105 @@ class WorkloadTracker(App):
             return
         self._complete_close_workflow(task)
 
-    def _on_create_issue_for_close(self, task: dict, repo: str, confirmed: bool):
+    def _on_create_issue_for_close(self, task: dict, confirmed: bool):
         """Handle response from create issue modal during close workflow."""
         if not confirmed:
             self.notify("Task must have GitHub issue to close (task has a repo configured)", severity="warning")
             return
 
         # Run blocking GitHub operations in a worker thread
-        self._run_close_workflow(task, repo, create_issue=True)
-
-    def _on_create_issue_response(self, task: dict, repo: str, create: bool):
-        """Handle response from create issue modal."""
-        if not create:
-            self.notify("Task must have GitHub issue to close (task has a repo configured)", severity="warning")
-            return
-
-        # Run blocking GitHub operations in a worker thread
-        self._run_close_workflow(task, repo, create_issue=True)
+        self._run_close_workflow(task, create_issue=True)
 
     @work(thread=True)
-    def _run_close_workflow(self, task: dict, repo: str, create_issue: bool = False):
-        """Run the close workflow in a background thread to avoid blocking."""
+    def _run_close_workflow(self, task: dict, create_issue: bool = False):
+        """Run the close workflow in a background thread to avoid blocking.
+
+        Phase 3 replaced this method's hand-rolled copy of the close steps with a
+        call to :func:`wt.close_task`, the same function ``wt done`` and the MCP
+        server use. That is what brings the TUI in line with Option A of the plan
+        (§2.4): before any hours are reported, ``close_task`` reconciles the
+        task's per-sprint bindings, so each earlier sprint's hours land on their
+        own issue and the current issue is told only its own sprint's total. The
+        old inline version pushed ``task_logged_mins(task)`` — the whole task
+        total — to the single linked issue, which double-counted every carry-over.
+
+        Behaviour that is deliberately preserved:
+          * the user has already confirmed via CreateIssueModal /
+            ConfirmCloseTaskModal, so ``prompt_callback`` just says yes when this
+            was invoked with ``create_issue=True`` and is absent otherwise;
+          * no closing-comment prompt (``comment_callback=None``), as before;
+          * a failed ``gh issue close`` still leaves the task marked done locally
+            (``close_task`` warns via its result rather than raising);
+          * a failed *reconcile* aborts the close and leaves the task open —
+            matching ``wt done``, so hours can never be mis-reported.
+        """
         self.call_from_thread(self._bg_start, "Closing task")
         try:
-            # Create issue if needed
-            if create_issue:
-                try:
-                    issue_ref = create_github_issue(task, repo)
-                    task["github_issue"] = issue_ref
-                    save_data(self._data)
-                    self.call_from_thread(self.notify, f"Created issue: {issue_ref}", severity="information")
+            res = wt_close_task(
+                task, self._data, save_data,
+                prompt_callback=(lambda _msg: True) if create_issue else None,
+            )
 
-                    # Set up project fields for new issue (status, activity, sprint, hours)
-                    result = setup_issue_in_project(issue_ref, task, self._data)
-                    if result["success"]:
-                        save_data(self._data)
-                except Exception as e:
-                    self.call_from_thread(self.notify, f"Failed to create issue: {e}", severity="error")
-                    return
+            if res.get("issue_created"):
+                self.call_from_thread(
+                    self.notify,
+                    f"Created issue: {task_current_issue(task, self._data)}",
+                    severity="information",
+                )
 
-            # Update project if configured
-            config = self._data.get("config", {})
-            if config.get("github_project_number"):
-                try:
-                    total_mins = task_logged_mins(task)
-                    hours = mins_to_quarter_hours(total_mins)
-                    add_to_project_and_update(task["github_issue"], hours, self._data)
-
-                    # Mark logs as uploaded
-                    from wt import mark_logs_uploaded, update_project_sprint
-                    mark_logs_uploaded(task)
-                    save_data(self._data)
-
-                    # Set activity if the task has one
-                    activity = get_task_activity(task)
-                    if activity:
-                        update_project_activity(task["github_issue"], activity, self._data)
-
-                    # Set type if the task has one
-                    type_val = get_task_type(task)
-                    if type_val:
-                        update_project_type(task["github_issue"], type_val, self._data)
-
-                    # Set sprint from task's stored sprint
-                    sprint_id = task.get("sprint_id")
-                    if sprint_id:
-                        sprints = get_all_sprints(self._data)
-                        field_id = sprints[0]["field_id"] if sprints else None
-                        if field_id:
-                            update_project_sprint(task["github_issue"], sprint_id, field_id, self._data)
-
-                    self.call_from_thread(self.notify, f"Updated project (Hours: {hours}h, Sprint: {task.get('sprint', '?')})", severity="information")
-                except Exception as e:
-                    self.call_from_thread(self.notify, f"Project update failed: {e}", severity="warning")
-
-            # Close the GitHub issue. Failures here must not prevent the local
-            # status update — the user already confirmed they want the task closed.
-            if task.get("github_issue"):
-                try:
-                    if close_github_issue(task["github_issue"]):
-                        self.call_from_thread(self.notify, f"Closed issue: {task['github_issue']}", severity="information")
-                    else:
-                        self.call_from_thread(
-                            self.notify,
-                            f"Failed to close issue {task['github_issue']} (gh returned non-zero). Task marked done locally.",
-                            severity="warning",
-                        )
-                except Exception as e:
+            # Per-sprint reconcile summary, rendered exactly like `wt done`.
+            rec = res.get("reconcile_result")
+            if rec:
+                for line in _reconcile_outcome_lines(rec):
                     self.call_from_thread(
-                        self.notify,
-                        f"Error closing issue {task['github_issue']}: {e}. Task marked done locally.",
-                        severity="warning",
+                        self.notify, esc(line),
+                        title="Sprint reconcile",
+                        severity="warning" if line.startswith(("✗", "!")) else "information",
+                        timeout=8,
                     )
 
-            # Mark as done
-            task["status"] = "done"
-            save_data(self._data)
+            if not res.get("success"):
+                self.call_from_thread(
+                    self.notify,
+                    esc(res.get("error") or "Close failed"),
+                    severity="error",
+                    timeout=10,
+                )
+                # Reconcile/issue-creation failures leave the task open on
+                # purpose; still re-render so any bindings it did create show up.
+                self.call_from_thread(self._bridge_refresh_ui)
+                return
+
+            if res.get("project_updated"):
+                sprints = self._sprints()
+                hours = mins_to_quarter_hours(task_reportable_mins(task, sprints))
+                sprint_label = (current_binding(task, self._data) or {}).get("sprint") \
+                    or task.get("sprint", "?")
+                self.call_from_thread(
+                    self.notify,
+                    f"Updated project (Hours: {hours}h, Sprint: {sprint_label})",
+                    severity="information",
+                )
+            elif res.get("error"):
+                # close_task reports a non-fatal project failure this way.
+                self.call_from_thread(self.notify, esc(res["error"]), severity="warning")
+
+            issue_ref = task_current_issue(task, self._data)
+            if res.get("issue_closed"):
+                self.call_from_thread(
+                    self.notify, f"Closed issue: {issue_ref}", severity="information")
+            elif issue_ref and not res.get("skipped_github"):
+                self.call_from_thread(
+                    self.notify,
+                    f"Failed to close issue {issue_ref} (gh returned non-zero). "
+                    f"Task marked done locally.",
+                    severity="warning",
+                )
 
             # Update UI from main thread
             self.call_from_thread(self._finish_close_workflow, task)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Close failed: {e}", severity="error")
         finally:
             self.call_from_thread(self._bg_end, "Closing task")
 
@@ -4302,7 +4549,94 @@ class WorkloadTracker(App):
 
     def _complete_close_workflow(self, task: dict):
         """Complete the close workflow for task that already has an issue."""
-        self._run_close_workflow(task, "", create_issue=False)
+        self._run_close_workflow(task, create_issue=False)
+
+    # ── Sprint bindings reconcile (`S`) ───────────────────
+
+    def action_sync_sprints(self):
+        """Reconcile the selected task's per-sprint issue bindings with its logs.
+
+        The in-TUI equivalent of ``wt sync-sprints <task>`` (plan §2.3): work that
+        crossed a sprint boundary gets one issue per sprint, each carrying that
+        sprint's hours, past ones closed. Replaces the old "use 'wt split-sprint'"
+        notification with something the user can actually act on.
+
+        A dry run is computed first and shown for confirmation.
+        ``reconcile_task_sprints(..., dry_run=True)`` is structurally write-free
+        (it returns the pure plan without executing it) and makes no network call,
+        so it is safe to run here on the event loop.
+        """
+        task = self._selected_task()
+        if not task:
+            return
+        # Recurrent tasks are deliberately excluded: they intentionally span
+        # sprints with one per-sprint copy each, and are handled by
+        # `wt close-recurrent` / `wt new-recurrent`. Reconciling them would mint a
+        # past-sprint issue for every copy. (Unifying the two models is Phase 5.)
+        if task.get("status") == "recurrent":
+            self.notify(
+                "Recurrent tasks are handled by 'wt close-recurrent' / "
+                "'wt new-recurrent', not by a sprint reconcile.",
+                severity="warning",
+            )
+            return
+
+        sprints = self._sprints()
+        if not sprints:
+            self.notify("No sprint list available yet (project not configured?)",
+                        severity="warning")
+            return
+
+        plan = reconcile_task_sprints(task, self._data, sprints, dry_run=True)
+        if plan.get("error"):
+            self.notify(esc(plan["error"]), severity="error")
+            return
+        lines = _reconcile_plan_lines(plan)
+        if not lines:
+            self.notify(f"'{esc(task['title'])}' is already in sync with its logs.",
+                        severity="information")
+            return
+        breakdown = ", ".join(
+            f"{e['sprint']}={fmt_mins(e['minutes'])}" for e in plan.get("target", [])
+        )
+        n_new = sum(1 for op in plan.get("planned", [])
+                    if op["op"] == "create" and op.get("create_issue"))
+        self.push_screen(
+            SyncSprintsModal(task["title"], breakdown, lines, n_new),
+            lambda confirmed: self._on_sync_sprints_confirmed(task, confirmed),
+        )
+
+    def _on_sync_sprints_confirmed(self, task: dict, confirmed: bool):
+        if not confirmed:
+            return
+        self._bg_start("Syncing sprints")
+        self._sync_sprints_worker(task)
+
+    @work(thread=True)
+    def _sync_sprints_worker(self, task: dict):
+        """Execute the reconcile (creates/closes GitHub issues) off the event loop."""
+        try:
+            # save_callback runs after each created binding, so an interrupted
+            # run never loses an issue it just minted; the final save covers the
+            # hours/close bookkeeping.
+            res = reconcile_task_sprints(
+                task, self._data, self._sprints(), save_callback=save_data,
+            )
+            save_data(self._data)
+            lines = _reconcile_outcome_lines(res) or ["(nothing to do)"]
+            for line in lines:
+                self.call_from_thread(
+                    self.notify, esc(line),
+                    title="Sprint reconcile",
+                    severity="warning" if line.startswith(("✗", "!")) else "information",
+                    timeout=8,
+                )
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Sprint reconcile failed: {e}",
+                                  severity="error")
+        finally:
+            self.call_from_thread(self._bg_end, "Syncing sprints")
+            self.call_from_thread(self._bridge_refresh_ui)
 
     def _arc_on_task_completed(self, task: dict):
         """Arc integration: archive tabs and remove folder when task is done."""
@@ -4321,7 +4655,7 @@ class WorkloadTracker(App):
         """Sync task status to GitHub project in background thread."""
         self.call_from_thread(self._bg_start, "Syncing status")
         try:
-            if sync_project_status(task["github_issue"], status, self._data):
+            if sync_project_status(task_current_issue(task, self._data), status, self._data):
                 status_label = {"todo": "Todo", "inprogress": "In Progress", "done": "Done"}.get(status, status)
                 self.call_from_thread(self.notify, f"Project status: {status_label}", severity="information")
         finally:
@@ -4379,10 +4713,14 @@ class WorkloadTracker(App):
         }
 
     def _bridge_list_tasks(self) -> dict:
-        """Non-done, non-shadow tasks for the client's task picker."""
+        """Non-done tasks for the client's task picker.
+
+        The old shadow-task exclusion is gone — cross-sprint work is now one task
+        with several issue bindings, so every entry here is a real unit of work.
+        """
         tasks = []
         for t in self._data.get("tasks", []):
-            if t.get("status") == "done" or t.get("cross_sprint_parent"):
+            if t.get("status") == "done":
                 continue
             tasks.append({
                 "id": t["id"],
@@ -4490,7 +4828,7 @@ class WorkloadTracker(App):
         if not task:
             return {"error": f"No task matching '{query}'", "_status": 404}
 
-        issue_ref = task.get("github_issue")
+        issue_ref = task_current_issue(task, wt_data)
         if not issue_ref:
             return {"error": f"Task '{task['title']}' has no linked GitHub issue", "_status": 400}
 

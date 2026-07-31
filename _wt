@@ -77,8 +77,9 @@ _wt() {
         'split-log:Split a log entry'
         'merge-logs:Merge two log entries'
         'sprint:Show sprint info'
-        'set-sprint:Set sprint for a task'
-        'split-sprint:Split cross-sprint task'
+        'set-sprint:Correct the sprint a task started in'
+        'sync-sprints:Reconcile per-sprint GitHub issues with a task'"'"'s logs'
+        'split-sprint:Deprecated alias for sync-sprints'
         'set-repo:Set GitHub repo for a task'
         'set-activity:Set GitHub Project activity for a task'
         'set-type:Set GitHub Project type for a task'
@@ -103,14 +104,17 @@ for t in data.get('tasks', []):
             compadd -Q "${tasks[@]}"
             ;;
         unlink)
-            # Only show tasks that have github_issue
+            # Only show tasks linked to an issue — via a sprint_issues binding or
+            # the legacy github_issue field.
             local -a tasks
             tasks=("${(@f)$(python3 -c "
 import json
 from pathlib import Path
 data = json.loads((Path.home() / '.workload_tracker.json').read_text())
 for t in data.get('tasks', []):
-    if t.get('github_issue'):
+    linked = t.get('github_issue') or any(
+        b.get('issue') for b in (t.get('sprint_issues') or []))
+    if linked:
         print(t['title'])
 " 2>/dev/null)}")
             compadd -Q "${tasks[@]}"
@@ -405,7 +409,7 @@ for t in data.get('tasks', []):
                 _describe -t options 'presence option' options
             fi
             ;;
-        rename|mv|logs|edit-log|delete-log|split-log|merge-logs|split-sprint)
+        rename|mv|logs|edit-log|delete-log|split-log|merge-logs)
             local -a tasks
             tasks=("${(@f)$(python3 -c "
 import json
@@ -416,20 +420,35 @@ for t in data.get('tasks', []):
 " 2>/dev/null)}")
             compadd -Q "${tasks[@]}"
             ;;
+        sync-sprints|split-sprint)
+            # Flags first, then task titles. --all is mutually exclusive with a
+            # task argument, and --create-issues only matters alongside --all.
+            if [[ "${words[CURRENT]}" == -* ]]; then
+                _arguments \
+                    '--all[Reconcile every non-recurrent task]' \
+                    '--create-issues[Allow minting new past-sprint issues]' \
+                    '--dry-run[Print the plan and exit]' \
+                    '-n[Print the plan and exit]' \
+                    '--yes[Skip the confirmation prompt]' \
+                    '-y[Skip the confirmation prompt]'
+            else
+                _wt_complete_tasks
+            fi
+            ;;
         set-sprint)
             if (( CURRENT == 3 )); then
-                # Complete task names
-                local -a tasks
-                tasks=("${(@f)$(python3 -c "
+                _wt_complete_tasks
+            elif (( CURRENT == 4 )); then
+                # Complete sprint titles from the cache, plus "none" to clear.
+                local -a sprints
+                sprints=("${(@f)$(python3 -c "
 import json
 from pathlib import Path
 data = json.loads((Path.home() / '.workload_tracker.json').read_text())
-for t in data.get('tasks', []):
-    print(t['title'])
+for s in data.get('config', {}).get('sprints_cache', []):
+    print(s['title'])
 " 2>/dev/null)}")
-                compadd -Q "${tasks[@]}"
-            elif (( CURRENT == 4 )); then
-                # Complete sprint names (includes "none")
+                compadd -Q "${sprints[@]}"
                 compadd "none"
             fi
             ;;
