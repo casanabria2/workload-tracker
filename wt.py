@@ -1797,7 +1797,7 @@ def _find_binding(bindings: list[dict], issue: str = None, sprint_id: str = None
 
 def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
                     create_issues: bool = True, close_past: bool = True,
-                    sync_hours: bool = True) -> dict:
+                    sync_hours: bool = True, closing: bool = False) -> dict:
     """Pure planner behind :func:`reconcile_task_sprints` (plan §2.3).
 
     Reads ``task``/``data``/``sprints`` and returns the ordered list of
@@ -1856,11 +1856,17 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
     # 2. …plus the current sprint while the task is still open. This is what
     #    makes the marker-log ritual of plan §1.3 unnecessary: an open task
     #    always has a binding for new work to land on, even at 0 minutes.
+    #
+    #    ``closing=True`` suppresses that: a task being closed has no future work
+    #    to land, so reserving an empty current-sprint binding would carry its
+    #    long-lived issue onto a sprint it was never worked in and report 0h
+    #    there. With the reservation gone, ``latest`` below is the newest sprint
+    #    that actually *has* time, which is what the close reports against.
     current = find_sprint_for_date(sprints, today)
     if current:
         plan["current_sprint"] = current["title"]
         plan["current_sprint_id"] = current["id"]
-        if task.get("status") != "done":
+        if task.get("status") != "done" and not closing:
             targets.setdefault(current["id"], 0.0)
 
     target_ids = sorted((sid for sid in targets if sid in by_id), key=sort_key)
@@ -2104,6 +2110,7 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
 def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
                            create_issues: bool = True, close_past: bool = True,
                            sync_hours: bool = True, dry_run: bool = False,
+                           closing: bool = False,
                            save_callback=None, progress_callback=None) -> dict:
     """Bring a task's per-sprint issue bindings in line with its logs.
 
@@ -2112,7 +2119,10 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
 
       1. Bucket logs by sprint; sprints with 0 minutes are not targets.
       2. Target set = {sprints with time} ∪ {current sprint, if the task is
-         open}. The second term replaces the marker-log ritual (plan §1.3).
+         open and ``closing`` is False}. The second term replaces the marker-log
+         ritual (plan §1.3); ``closing=True`` drops it so a task being closed
+         reports against the newest sprint that actually has time instead of an
+         empty current sprint.
       3. Target sprints with no binding get one, plus a GitHub issue when the
          task has a ``github_repo``. With ``create_issues=False`` a sprint that
          *would* need a new issue is reported in ``skipped`` (flagged
@@ -2143,6 +2153,8 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
         close_past: close issues whose sprint has ended.
         sync_hours: push recomputed hours to the project.
         dry_run: plan only.
+        closing: the task is being closed, so don't reserve an empty
+            current-sprint binding for future work. Set by :func:`close_task`.
         save_callback: called after each created binding and once at the end.
         progress_callback: ``f(msg)`` progress updates.
 
@@ -2159,7 +2171,8 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
             progress_callback(msg)
 
     plan = _reconcile_plan(task, data, sprints, create_issues=create_issues,
-                           close_past=close_past, sync_hours=sync_hours)
+                           close_past=close_past, sync_hours=sync_hours,
+                           closing=closing)
 
     result = {
         "success": plan["error"] is None,
@@ -2981,6 +2994,11 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
       * Hours reported to the current issue come from
         :func:`task_reportable_mins`, i.e. the *current binding's* sprint rather
         than the task's mutable ``sprint_id``.
+      * The reconcile is passed ``closing=True``, so it does **not** reserve an
+        empty binding for the current sprint. A task being closed has no future
+        work to land, so the old behaviour carried its long-lived issue onto a
+        sprint it was never worked in and reported 0h there. Now the issue lands
+        on — and reports against — the newest sprint that actually has time.
 
     ``recurrent`` tasks still skip the reconcile entirely: they intentionally span
     sprints and are handled by ``close-recurrent`` / ``new-recurrent`` (plan
@@ -3036,7 +3054,7 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
     # is unconditional — see the docstring for what replaced the old gate.
     all_sprints = get_all_sprints(data)
     if all_sprints and task.get("status") != "recurrent":
-        rec = reconcile_task_sprints(task, data, all_sprints,
+        rec = reconcile_task_sprints(task, data, all_sprints, closing=True,
                                      save_callback=save_callback)
         result["reconcile_result"] = rec
         result["split_result"] = _legacy_split_result(rec, task)

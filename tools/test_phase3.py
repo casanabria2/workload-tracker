@@ -845,13 +845,56 @@ def test_close_task_github_diff(migrated, scratch):
     check(err == 0, "no task errored under either version", f"{err} error(s)")
     check(same >= 10, "at least 10 of 12 tasks have a byte-identical write sequence",
           f"same={same} diff={diff}")
-    # The two known diffs are extra writes of the *same* values — never a
-    # different value — plus one Sprint field that used to be left unset.
-    changed_values = [l for l in run.stdout.splitlines()
-                      if l.strip().startswith("-") and "---" not in l]
-    check(not changed_values,
-          "no GitHub write was REMOVED or had its value changed "
-          "(diffs are additions only)", "\n      ".join(changed_values))
+
+    # NOTE: this check used to assert "diffs are additions only", i.e. that the
+    # refactor never changed a GitHub-visible value (Option A's premise). The
+    # `closing=True` change to close_task deliberately breaks that, so the
+    # assertion is now narrower: the only writes a close may *remove* are
+    #   (a) Sprint-field writes pointing at the CURRENT sprint — the close no
+    #       longer parks a task's issue on a sprint it was never worked in, and
+    #   (b) the whole mint-a-past-sprint-issue block (NEW#n) for the newest
+    #       sprint with time, because the carried-forward issue now covers it.
+    # Anything else disappearing is a regression.
+    removed = [l.strip() for l in run.stdout.splitlines()
+               if l.strip().startswith("-") and "---" not in l]
+    import wt as _wt
+    current = _wt.find_sprint_for_date(
+        _wt.get_cached_sprints(json.loads(Path(migrated).read_text())),
+        __import__("datetime").date.today())
+    cur_id = (current or {}).get("id") or "\0"
+    def explained(line):
+        # (a) a Sprint field write parking an issue on the current sprint
+        if "update_project_sprint" in line and cur_id in line:
+            return True
+        # (b) any write against a newly-minted issue the new code doesn't need…
+        if "NEW#" in line:
+            return True
+        # …including the mint itself, whose line names the title, not NEW#n
+        if re.search(r"create_github_issue\('.*\(Sprint \d+\)'", line):
+            return True
+        # (c) the 0.0h report that this change exists to replace
+        if "add_to_project_and_update" in line and ", 0.0," in line:
+            return True
+        return False
+
+    unexplained = [l for l in removed if not explained(l)]
+    check(not unexplained,
+          "the only removed writes are current-sprint Sprint fields, absorbed "
+          "past-sprint issue mints, and the 0.0h report",
+          "\n      ".join(unexplained))
+    check(any("NEW#" in l for l in removed),
+          "at least one past-sprint issue is no longer minted "
+          "(absorbed by the carried-forward issue)", str(len(removed)))
+    # The point of the change: the main issue stops being told 0.0h.
+    zero_before = [l for l in run.stdout.splitlines()
+                   if l.strip().startswith("-")
+                   and "add_to_project_and_update" in l and ", 0.0," in l]
+    nonzero_after = [l for l in run.stdout.splitlines()
+                     if l.strip().startswith("+")
+                     and "add_to_project_and_update" in l and ", 0.0," not in l]
+    check(zero_before and nonzero_after,
+          "a close that used to report 0.0h now reports its real sprint hours",
+          f"before={len(zero_before)} after={len(nonzero_after)}")
 
 
 def test_reconcile_harness_still_passes(fixture, migrated, baseline, scratch):

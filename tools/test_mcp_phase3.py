@@ -535,8 +535,12 @@ def test_close_end_to_end(wt, mcp_server, migrated, scratch):
     print(f"       task={title[:52]!r} sprints={per_sprint} "
           f"bindings={len(bound_before)} unbound={[e['sprint_title'] for e in unbound]}")
 
+    # Plan with closing=True, which is what close_task passes: a task being
+    # closed gets no empty current-sprint binding, so its carried-forward issue
+    # lands on the newest sprint *with* time and one fewer issue is minted.
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
-        plan = wt.reconcile_task_sprints(task, data, sprints, dry_run=True)
+        plan = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                         closing=True)
     want_mints = sum(1 for op in plan["planned"]
                      if op["op"] == "create" and op.get("create_issue"))
     want_closes = sum(1 for op in plan["planned"] if op["op"] == "close") + 1
