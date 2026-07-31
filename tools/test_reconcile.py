@@ -965,6 +965,25 @@ def test_phase5_merge(wt, fixture, scratch):
                   f"{t.get('sprint')} vs {ids[-1]}")
 
     # Reconcile must plan a superseded-issue cleanup so nothing double-counts.
+    # This ran only `if supers:` before, which was False for this fixture — so the
+    # op was never exercised and a dropped field in the planner's working copy
+    # made it unplannable without any test noticing. Force the state instead.
+    forced = next(t for t in data["tasks"]
+                  if len([b for b in (t.get("sprint_issues") or []) if b.get("issue")]) >= 2)
+    fb = [b for b in forced["sprint_issues"] if b.get("issue")][0]
+    fb["superseded_issues"] = ["o/r#4242"]
+    with Stubs(wt, mode="strict", sprints=wt.get_cached_sprints(data)):
+        fr = wt.reconcile_task_sprints(forced, data, wt.get_cached_sprints(data),
+                                       dry_run=True, create_issues=True)
+    fops = [o for o in fr["planned"] if o["op"] == "supersede"]
+    check(len(fops) == 1, "a superseded issue is always planned for cleanup",
+          str([o["op"] for o in fr["planned"]]))
+    check(fops and fops[0]["issue"] == "o/r#4242" and fops[0]["hours"] == 0.0,
+          "the supersede op names the duplicate and zeroes it", str(fops))
+    check(any("SUPER" in l for l in wt._reconcile_plan_lines(fr)),
+          "and it is visible in the rendered plan")
+    fb.pop("superseded_issues", None)
+
     if supers:
         owner = next(t for t in data["tasks"]
                      if any(b.get("superseded_issues") for b in t.get("sprint_issues") or []))
