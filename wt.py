@@ -61,7 +61,7 @@ Usage:
     wt sync-sprints <task>            — Reconcile a task's per-sprint GitHub
                                         issues with its logs (idempotent)
     wt sync-sprints --all [--create-issues] [--dry-run]
-                                      — Reconcile every non-recurrent task.
+                                      — Reconcile every task, recurrent included.
                                         Never mints new issues unless
                                         --create-issues is given; always prints
                                         an itemised plan and asks first.
@@ -3612,9 +3612,12 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
         sprint it was never worked in and reported 0h there. Now the issue lands
         on — and reports against — the newest sprint that actually has time.
 
-    ``recurrent`` tasks still skip the reconcile entirely: they intentionally span
-    sprints and are handled by ``close-recurrent`` / ``new-recurrent`` (plan
-    Phase 5 unifies them; out of scope here).
+    ``recurrent`` tasks are reconciled like anything else. Phase 5 merged the old
+    per-sprint clones into one perpetual task with a binding per sprint, so the
+    reconcile below runs for them too — see the ``recurring`` branch in
+    ``reconcile_task_sprints``, which withholds the carry-forward so each sprint
+    keeps its own issue and its own hours. ``close-recurrent`` / ``new-recurrent``
+    are retired and hard-refuse.
     """
     result = {
         "success": False,
@@ -7101,8 +7104,8 @@ def cmd_sync_sprints(args):
         elif a in ("-h", "--help"):
             print("Usage: wt sync-sprints [<task>] [--all] [--create-issues] [--dry-run] [--yes]")
             print("  <task>           reconcile one task (mints past-sprint issues as needed)")
-            print("  --all            reconcile every non-recurrent task; does NOT create")
-            print("                   issues unless --create-issues is also given")
+            print("  --all            reconcile every task, recurrent included; does NOT")
+            print("                   create issues unless --create-issues is also given")
             print("  --create-issues  allow minting new past-sprint GitHub issues")
             print("  --dry-run / -n   print the plan and exit, changing nothing")
             print("  --yes / -y       skip the confirmation prompt")
