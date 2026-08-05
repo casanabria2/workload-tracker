@@ -34,25 +34,21 @@ import os
 import shutil
 import subprocess as real_subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
-REPO = Path("/Users/carlos/dev/carlos/workload-tracker/.claude/worktrees/sprint-bindings-plan")
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
 
-from test_reconcile import Stubs, SubprocessGuard, sig  # noqa: E402
+from test_reconcile import (  # noqa: E402
+    Stubs, SubprocessGuard, sig, pick_multi_sprint, unreconcile,
+)
+from test_phase3 import new_sprint_boundary  # noqa: E402
 
 FAILURES = []
 _WANT = [0]   # expected post-migration task count, filled in main()
 CHECKS = 0
-
-RECURRENT_TITLES = [
-    "Time tracking - Sprint 104",
-    "Stand Up Calls - casanabria - Sprint 104",
-    "General Demo Kit maintenance - Sprint 104",
-    "Ana 1:1 calls - casanabria - Sprint 104",
-    "Ad-hoc Slack Questions - Sprint 104",
-]
 
 # gh subcommands that mutate GitHub. Any of these reaching the fake subprocess is
 # reported so a "read-only" claim can be checked rather than asserted.
@@ -230,9 +226,23 @@ def test_load_migrates(wt, mcp_server, fixture, scratch):
     section("2. mcp_server.load() runs the shadow->bindings migration (the fix)")
     dst = point_at(wt, mcp_server, fixture, scratch / "premigration.json")
     raw = json.loads(dst.read_text())
-    check(len(raw["tasks"]) == 92, "fixture starts at 92 tasks", str(len(raw["tasks"])))
+    # Counts are read off the fixture, not hardcoded. The old constants (92 tasks
+    # / 12 shadows / 82 bindings / 26620.71 minutes / 392 logs) described one
+    # specific July-2026 snapshot that no longer exists; see tools/README.md and
+    # tools/make_fixtures.py for how the pre-migration fixture is produced now.
+    n_raw = len(raw["tasks"])
     n_shadow = sum(1 for t in raw["tasks"] if t.get("cross_sprint_parent"))
-    check(n_shadow == 12, "fixture starts with 12 shadows", str(n_shadow))
+    n_clone = sum(1 for t in raw["tasks"]
+                  if wt.recurrent_series_for_title(t.get("title", "")))
+    check(n_shadow > 0,
+          f"fixture is really pre-migration: {n_raw} tasks, {n_shadow} shadow(s)",
+          "0 shadows — this section would pass vacuously; rebuild the fixture "
+          "with tools/make_fixtures.py")
+    print(f"       ({n_raw} tasks, {n_shadow} shadows, {n_clone} recurrent clones)")
+    pre_total = sum(l.get("minutes", 0) for t in raw["tasks"]
+                    for l in t.get("logs", []) if not t.get("cross_sprint_parent"))
+    pre_logs = sum(len(t.get("logs", [])) for t in raw["tasks"]
+                   if not t.get("cross_sprint_parent"))
 
     data = mcp_server.load()
     check(len(data["tasks"]) == _WANT[0], f"mcp_server.load() returns {_WANT[0]} tasks",
@@ -240,9 +250,17 @@ def test_load_migrates(wt, mcp_server, fixture, scratch):
     check(not any(t.get("cross_sprint_parent") for t in data["tasks"]),
           "no shadow survives mcp_server.load()")
     n_bind = sum(len(t.get("sprint_issues") or []) for t in data["tasks"])
-    check(n_bind == 82, "82 bindings after mcp_server.load()", str(n_bind))
+    # Every shadow and every clone contributes its issue as a binding, and every
+    # surviving task keeps at least one. Exact equality is not asserted (a sprint
+    # that ends up with two issues collapses to one binding plus a superseded
+    # entry), but the count must at least cover the shadows.
+    check(n_bind >= n_shadow,
+          f"{n_bind} bindings after mcp_server.load() (>= {n_shadow} shadows)",
+          str(n_bind))
     check(data.get("config", {}).get("sprint_bindings_migrated") is True,
           "migration flag set")
+    check(data.get("config", {}).get("recurrent_series_merged") is True,
+          "recurrent-merge flag set")
     # It persisted, and a second load is a no-op.
     on_disk = json.loads(dst.read_text())
     check(len(on_disk["tasks"]) == _WANT[0], "migration was saved to disk",
@@ -253,8 +271,9 @@ def test_load_migrates(wt, mcp_server, fixture, scratch):
 
     total = sum(l.get("minutes", 0) for t in data["tasks"] for l in t.get("logs", []))
     logs = sum(len(t.get("logs", [])) for t in data["tasks"])
-    check(abs(total - 26620.71) < 1e-6, "total minutes preserved", f"{total}")
-    check(logs == 392, "log count preserved", str(logs))
+    check(abs(total - pre_total) < 1e-6,
+          f"total minutes preserved ({pre_total})", f"{total}")
+    check(logs == pre_logs, f"log count preserved ({pre_logs})", str(logs))
 
 
 def test_list_tasks(wt, mcp_server, migrated, scratch):
@@ -277,8 +296,9 @@ def test_list_tasks(wt, mcp_server, migrated, scratch):
     check(out_done.count("\n  ID: ") == n_done,
           f'status="done" lists {n_done}', str(out_done.count("\n  ID: ")))
 
+    n_rec = sum(1 for t in data["tasks"] if t.get("status") == "recurrent")
     out_rec = mcp_server.list_tasks(status="recurrent")
-    check(out_rec.count("\n  ID: ") == 5, 'status="recurrent" lists 5',
+    check(out_rec.count("\n  ID: ") == n_rec, f'status="recurrent" lists {n_rec}',
           str(out_rec.count("\n  ID: ")))
 
     role = data["tasks"][0]["role_id"]
@@ -336,10 +356,16 @@ def test_sync_dry_run(wt, mcp_server, migrated, scratch):
     dst = point_at(wt, mcp_server, migrated, scratch / "dry.json")
     data = mcp_server.load()
     sprints = sprints_of(data, wt)
+    # Rolled back to its pre-reconcile shape so the dry run has a plan to print.
+    # Against the untouched fixture the task is already in sync, so the output is
+    # "Nothing to do" and the dry-run banner never appears.
+    subject, _per = pick_multi_sprint(wt, data, sprints)
+    unreconcile(wt, subject, sprints, anchor="oldest")
+    mcp_server.save(data)
     disk_before = dst.read_text()
-    # By id: "IRON Infusion" is a substring of 5 other titles and mcp_server's
-    # resolve_task deliberately returns None on an ambiguous match.
-    iron = next(t for t in data["tasks"] if t["title"] == "IRON Infusion")["id"]
+    # By id: a title like "IRON Infusion" is a substring of several others and
+    # mcp_server's resolve_task deliberately returns None on an ambiguous match.
+    iron = subject["id"]
 
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints) as st:
         fake = FakeSubprocess()
@@ -420,6 +446,20 @@ def test_recurrent_reconciles(wt, mcp_server, migrated, scratch):
           "none still carries a '- Sprint N' suffix",
           str([t["title"] for t in recurrent if " - Sprint " in t["title"]]))
 
+    # The live fixture is normally *past* the sprint boundary (the owner's
+    # sprint-start ritual already ran `wt sync-sprints --all`), so every series
+    # is in sync and the plan is empty. Rebuild the boundary first — otherwise
+    # "appears in the plan" is asserting against "Nothing to do".
+    cur = wt.find_sprint_for_date(sprints, datetime.now().date())
+    rolled = [t for t in recurrent
+              if cur and new_sprint_boundary(wt, t, sprints, cur)]
+    check(bool(rolled),
+          f"{len(rolled)} of {len(recurrent)} series have an earlier sprint to "
+          "roll back to",
+          "every recurrent series started this sprint — section 7 would be vacuous")
+    wt.save(data)
+    mcp_server.save(data)
+
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
@@ -427,12 +467,12 @@ def test_recurrent_reconciles(wt, mcp_server, migrated, scratch):
     check("recurrent task(s)" not in out or "Skipped 0 recurrent" in out,
           "no recurrent tasks are reported as skipped",
           [l for l in out.splitlines() if "Skipped" in l][:2])
-    for t in recurrent:
+    for t in rolled:
         check(t["title"] in out, f"appears in the plan: {t['title'][:34]}")
 
     # Single-task form: a perpetual series closes the ended sprint and mints the
     # new one, never carrying an issue forward (that would strand hours).
-    target = recurrent[0]["title"]
+    target = rolled[0]["title"]
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
@@ -447,7 +487,19 @@ def test_sync_real_run(wt, mcp_server, migrated, scratch):
     dst = point_at(wt, mcp_server, migrated, scratch / "real.json")
     data = mcp_server.load()
     sprints = sprints_of(data, wt)
-    task = next(t for t in data["tasks"] if t["title"] == "Assist on Banco Galicia")
+    # Subject picked from the fixture and rolled back to its pre-reconcile shape
+    # (was pinned to 'Assist on Banco Galicia', which the owner has since
+    # reconciled for real — leaving "at least one issue minted" unsatisfiable).
+    task, _per = pick_multi_sprint(wt, data, sprints)
+    # Keep the real bindings so the rollback can be undone before section 13.
+    pristine = copy.deepcopy({k: task.get(k) for k in
+                              ("sprint_issues", "github_issue", "sprint_id", "sprint")})
+    unreconcile(wt, task, sprints, anchor="oldest")
+    # By id, not title: mcp_server.resolve_task returns None on an ambiguous
+    # substring match, and several fixture titles are prefixes of others.
+    subject_id = task["id"]
+    subject = task["title"]
+    mcp_server.save(data)
     before_bindings = len(task.get("sprint_issues") or [])
     # Compare log *content* ignoring the uploaded_at marker that
     # mark_logs_uploaded stamps (pre-existing behaviour, not a reconcile change).
@@ -455,11 +507,12 @@ def test_sync_real_run(wt, mcp_server, migrated, scratch):
         return json.dumps([{k: v for k, v in l.items() if k != "uploaded_at"}
                            for l in t["logs"]], sort_keys=True)
     before_logs = logsig(task)
+    print(f"    subject: {subject!r} ({before_bindings} binding before)")
 
     with McpStubs(wt, mcp_server, mode="record", sprints=sprints) as st:
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
-            out = mcp_server.sync_task_sprints("Assist on Banco Galicia")
+            out = mcp_server.sync_task_sprints(subject_id)
         created = st.count("create_github_issue")
         closed = st.count("close_github_issue")
     print("\n".join("       " + l for l in out.splitlines()[-10:]))
@@ -468,7 +521,7 @@ def test_sync_real_run(wt, mcp_server, migrated, scratch):
     check(closed >= 1, "at least one issue closed (stub)", str(closed))
 
     data2 = mcp_server.load()
-    t2 = next(t for t in data2["tasks"] if t["title"] == "Assist on Banco Galicia")
+    t2 = next(t for t in data2["tasks"] if t["title"] == subject)
     check(len(t2["sprint_issues"]) > before_bindings,
           "bindings grew", f"{before_bindings} -> {len(t2['sprint_issues'])}")
     check(logsig(t2) == before_logs,
@@ -479,11 +532,21 @@ def test_sync_real_run(wt, mcp_server, migrated, scratch):
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints) as st2:
         fake = FakeSubprocess()
         with SwapSubprocess(fake):
-            again = mcp_server.sync_task_sprints("Assist on Banco Galicia")
+            again = mcp_server.sync_task_sprints(subject_id)
         check(st2.count("create_github_issue") == 0, "2nd run: no GitHub write")
         check(fake.calls == [], "2nd run: no subprocess call")
     check("Nothing to do" in again, "2nd run reports nothing to do", again[:160])
     check(dst.read_text() == disk_before, "2nd run leaves the file byte-identical")
+
+    # Undo the synthetic rollback before this file becomes section 13's subject.
+    # check_invariants compares against the Phase-0 baseline, which records which
+    # binding each *shadow* became; a task whose bindings we deliberately deleted
+    # and then re-minted with stub issue refs fails that comparison for reasons
+    # that have nothing to do with the MCP layer.
+    restored = mcp_server.load()
+    rt = next(t for t in restored["tasks"] if t["id"] == subject_id)
+    rt.update(pristine)
+    mcp_server.save(restored)
     return dst
 
 
@@ -491,19 +554,26 @@ def test_set_sprint(wt, mcp_server, migrated, scratch):
     section("9. set_sprint now corrects start_sprint")
     point_at(wt, mcp_server, migrated, scratch / "setsprint.json")
     data = mcp_server.load()
-    task = next(t for t in data["tasks"] if t["title"] == "IRON Infusion")
+    sprints = sprints_of(data, wt)
+    # Subject and both sprint names derived: the start sprint is whatever the
+    # task's earliest log says, and the correction target is the sprint before it
+    # (was pinned to 'IRON Infusion' / 'Sprint 98' / 'Sprint 96').
+    task, _per = pick_multi_sprint(wt, data, sprints)
     iron = task["id"]
+    start = task.get("start_sprint")
+    by_start = sorted(sprints, key=lambda s: s["start_date"])
+    idx = next((i for i, s in enumerate(by_start) if s["title"] == start), None)
+    earlier = by_start[idx - 1]["title"] if idx else by_start[0]["title"]
     old_sprint_id = task.get("sprint_id")
     old_bindings = copy.deepcopy(task.get("sprint_issues"))
-    check(task.get("start_sprint") == "Sprint 98", "starts out on Sprint 98",
-          str(task.get("start_sprint")))
+    check(bool(start), f"{task['title'][:34]!r} starts out on {start}", str(start))
 
-    with McpStubs(wt, mcp_server, mode="strict", sprints=sprints_of(data, wt)):
-        out = mcp_server.set_sprint(iron, "Sprint 96")
-    check("now starts in Sprint 96" in out, "set_sprint says start sprint", out)
+    with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
+        out = mcp_server.set_sprint(iron, earlier)
+    check(f"now starts in {earlier}" in out, "set_sprint says start sprint", out)
     d2 = mcp_server.load()
     t2 = next(t for t in d2["tasks"] if t["id"] == iron)
-    check(t2.get("start_sprint") == "Sprint 96", "start_sprint written",
+    check(t2.get("start_sprint") == earlier, f"start_sprint written ({earlier})",
           str(t2.get("start_sprint")))
     check(t2.get("start_sprint_id"), "start_sprint_id written")
     check(t2.get("sprint_id") == old_sprint_id,
@@ -781,22 +851,27 @@ def test_link_unlink_push(wt, mcp_server, migrated, scratch):
     check(len(mcp_server.load()["tasks"]) == n_before - 1, "task removed")
 
 
-def test_read_only_tools(wt, mcp_server, migrated, scratch):
+def test_read_only_tools(wt, mcp_server, migrated, baseline, scratch):
     section("12. list_sprints / get_current_sprint_info / get_status")
     dst = point_at(wt, mcp_server, migrated, scratch / "read.json")
     data = mcp_server.load()
     sprints = sprints_of(data, wt)
     disk_before = dst.read_text()
+    # The current sprint is resolved from the cache, not spelled out: it rolls
+    # over every two weeks, so 'Sprint 105' was a two-week-lived assertion.
+    cur = wt.find_sprint_for_date(sprints, datetime.now().date())
 
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         ls = mcp_server.list_sprints()
         info = mcp_server.get_current_sprint_info()
         status = mcp_server.get_status()
-    check("Sprint 105" in ls and "← current" in ls, "list_sprints marks the current sprint",
+    check(cur is not None and cur["title"] in ls and "← current" in ls,
+          f"list_sprints marks the current sprint ({cur and cur['title']})",
           [l for l in ls.splitlines() if "current" in l])
     check(ls.count("\n  Sprint") == len(sprints), f"lists all {len(sprints)} sprints",
           str(ls.count("\n  Sprint")))
-    check("Current sprint: Sprint 105" in info, "get_current_sprint_info", info[:60])
+    check(cur is not None and f"Current sprint: {cur['title']}" in info,
+          "get_current_sprint_info", info[:60])
     check("Duration: 14 days" in info, "duration derived from date objects",
           info.replace("\n", " | "))
     check(dst.read_text() == disk_before, "read-only tools change nothing")
@@ -813,8 +888,10 @@ def test_read_only_tools(wt, mcp_server, migrated, scratch):
           f"{total_line}  (expected {int(mins // 60)}h)")
     logged_only = sum(l.get("minutes", 0)
                       for t in data["tasks"] for l in t.get("logs", []))
-    check(abs(logged_only - 26620.71) < 1e-6,
-          "…and the logged part is still the invariant total", str(logged_only))
+    want = json.loads(Path(baseline).read_text())["total_minutes_excluding_shadows"]
+    check(abs(logged_only - want) < 1e-6,
+          f"…and the logged part is still the baseline total ({want})",
+          str(logged_only))
     print(f"       (active timer contributes {mins - logged_only:.1f}m live)")
     print(f"       {total_line}")
 
@@ -829,9 +906,9 @@ def test_read_only_tools(wt, mcp_server, migrated, scratch):
         finally:
             wt.get_all_sprints = saved
             mcp_server.get_all_sprints = saved
-    check("offline" in ls2 and "Sprint 105" in ls2,
+    check("offline" in ls2 and cur is not None and cur["title"] in ls2,
           "list_sprints works from the cache alone", ls2.splitlines()[0])
-    check("Current sprint: Sprint 105" in info2,
+    check(cur is not None and f"Current sprint: {cur['title']}" in info2,
           "get_current_sprint_info works from the cache alone", info2[:60])
 
     # close_previous_recurrent_tasks dry run reads issues via bindings.
@@ -853,8 +930,16 @@ def test_invariants(wt, worked, baseline):
     print("\n".join("       " + l for l in head))
     check(proc.returncode == 0, "check_invariants exits 0",
           f"rc={proc.returncode} {proc.stdout[-400:]}")
-    check(any("minutes=26620.71" in l for l in head), "minutes unchanged", str(head))
-    check(any("logs=392" in l for l in head), "log count unchanged", str(head))
+    # Totals come from the Phase-0 baseline snapshot rather than a constant
+    # (26620.71 / 392) frozen on the day this was written — which went stale the
+    # next time any time was logged.
+    snap = json.loads(Path(baseline).read_text())
+    want_mins = snap["total_minutes_excluding_shadows"]
+    want_logs = snap["total_log_count_excluding_shadows"]
+    check(any(f"minutes={want_mins}" in l for l in head),
+          f"minutes unchanged ({want_mins})", str(head))
+    check(any(f"logs={want_logs}" in l for l in head),
+          f"log count unchanged ({want_logs})", str(head))
 
 
 def test_other_harnesses(fixture, migrated, baseline, scratch):
@@ -905,7 +990,7 @@ def main():
     test_set_sprint(wt, mcp_server, migrated, scratch)
     test_close_end_to_end(wt, mcp_server, migrated, scratch)
     test_link_unlink_push(wt, mcp_server, migrated, scratch)
-    test_read_only_tools(wt, mcp_server, migrated, scratch)
+    test_read_only_tools(wt, mcp_server, migrated, baseline, scratch)
     test_invariants(wt, worked, baseline)
     test_other_harnesses(fixture, migrated, baseline, scratch)
 

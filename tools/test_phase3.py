@@ -29,6 +29,7 @@ import shutil
 import subprocess as real_subprocess
 import sys
 from contextlib import redirect_stdout, redirect_stderr
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -37,19 +38,13 @@ sys.path.insert(0, str(REPO / "tools"))
 
 # Reuse Phase 2's stubbing machinery verbatim so both harnesses share one
 # definition of "no GitHub call can escape".
-from test_reconcile import Stubs, SubprocessGuard, load_copy, find, sig  # noqa: E402
+from test_reconcile import (  # noqa: E402
+    Stubs, SubprocessGuard, load_copy, find, sig,
+    multi_sprint_tasks, pick_multi_sprint, sprint_time, unreconcile,
+)
 
 FAILURES = []
 CHECKS = 0
-
-# The four recurrent per-sprint copies a blanket reconcile would mint issues for.
-RECURRENT_WOULD_MINT = [
-    "Time tracking - Sprint 104",
-    "Stand Up Calls - casanabria - Sprint 104",
-    "Ana 1:1 calls - casanabria - Sprint 104",
-    "Ad-hoc Slack Questions - Sprint 104",
-]
-
 
 class CliStubs(Stubs):
     """``Stubs``, but ``get_all_sprints`` always answers from the offline cache.
@@ -163,14 +158,61 @@ class Env:
         return json.loads(self.path.read_text())
 
 
+def new_sprint_boundary(wt, task, sprints, current):
+    """Rebuild the "a new sprint just started" state on *task*.
+
+    The live data file is normally *past* the sprint boundary — the owner runs
+    `wt sync-sprints --all` as part of the sprint-start ritual, so this sprint's
+    issues already exist and last sprint's are already closed. Asserting the
+    boundary plan against that fixture asserts an empty plan.
+
+    So the boundary is reconstructed: drop the current sprint's binding, re-open
+    the newest binding whose sprint has ended, and re-point the legacy
+    ``github_issue``/``sprint_id`` mirror at it (otherwise the planner re-seeds a
+    binding from the legacy key and the drop is undone). ``logs`` are untouched.
+
+    Returns ``{"reopened": <sprint title>}`` or None when the task has no ended
+    binding to work with.
+    """
+    today = datetime.now().date()
+    by_id = {s["id"]: s for s in sprints if s.get("id")}
+    kept = [b for b in (task.get("sprint_issues") or [])
+            if b.get("sprint_id") != current["id"]]
+    ended = [b for b in kept
+             if b.get("sprint_id") in by_id
+             and by_id[b["sprint_id"]].get("end_date")
+             and by_id[b["sprint_id"]]["end_date"] <= today]
+    if not ended:
+        return None
+    ended.sort(key=lambda b: by_id[b["sprint_id"]]["start_date"])
+    last = ended[-1]
+    last["state"] = "open"
+    task["sprint_issues"] = kept
+    task["github_issue"] = last.get("issue")
+    task["sprint_id"] = last.get("sprint_id")
+    task["sprint"] = last.get("sprint")
+    return {"reopened": last.get("sprint")}
+
+
 # ------------------------------------------------------------------ 1. smoke --
 
 def test_cli_smoke(wt, migrated, scratch):
     section("1. every touched CLI command runs end to end (all gh stubbed)")
     env = Env(wt, migrated, scratch / "smoke.json")
+
+    # Subject picked from the fixture, and rolled back to the one-issue shape so
+    # `sync-sprints --dry-run` has a real plan to render. Everything below is
+    # derived from that pick — the old version hardcoded 'Assist on Banco
+    # Galicia' / 'Sprint 95' / 'Sprint 104' / 'Sprint 105', all of which expire.
+    cur = wt.find_sprint_for_date(env.sprints, datetime.now().date())
+    prev = max((s for s in env.sprints if cur and s["start_date"] < cur["start_date"]),
+               key=lambda s: s["start_date"], default=None)
+    subject, per = pick_multi_sprint(wt, env.data, env.sprints)
+    info = unreconcile(wt, subject, env.sprints, anchor="oldest")
+    wt.save(env.data)
+    multi = subject["title"]
     before = env.path.read_text()
 
-    multi = "Assist on Banco Galicia"
     cases = [
         ("list", wt.cmd_list, []),
         ("list --all", wt.cmd_list, ["--all"]),
@@ -178,7 +220,8 @@ def test_cli_smoke(wt, migrated, scratch):
         ("sprint", wt.cmd_sprint, []),
         ("status", wt.cmd_status, []),
         ("roles", wt.cmd_roles, []),
-        ('report --sprint "Sprint 104"', wt.cmd_report, ["--sprint", "Sprint 104"]),
+        (f'report --sprint "{(prev or cur)["title"]}"', wt.cmd_report,
+         ["--sprint", (prev or cur)["title"]]),
         ("report --last 14d", wt.cmd_report, ["--last", "14d"]),
         (f"logs {multi!r}", wt.cmd_logs, [multi]),
         ("sync-sprints --dry-run <task>", wt.cmd_sync_sprints, ["--dry-run", multi]),
@@ -199,17 +242,18 @@ def test_cli_smoke(wt, migrated, scratch):
           "read-only commands did not touch the data file")
 
     # A couple of content assertions so "exits cleanly" isn't the whole story.
-    check("Current sprint: Sprint 105" in outs["sprint"],
-          "wt sprint names the current sprint", outs["sprint"][:300])
-    check("Assist on Banco Galicia" in outs[f"logs {multi!r}"],
-          "wt logs prints the task")
-    check("Sprint 95" in outs["sync-sprints --dry-run <task>"]
+    check(cur is not None and f"Current sprint: {cur['title']}" in outs["sprint"],
+          f"wt sprint names the current sprint ({cur and cur['title']})",
+          outs["sprint"][:300])
+    check(multi in outs[f"logs {multi!r}"], "wt logs prints the task")
+    check(info["anchor"] in outs["sync-sprints --dry-run <task>"]
           and "Dry run" in outs["sync-sprints --dry-run <task>"],
-          "sync-sprints --dry-run shows the plan and says it changed nothing",
+          f"sync-sprints --dry-run shows the plan ({info['anchor']}) and says it "
+          "changed nothing",
           outs["sync-sprints --dry-run <task>"][:800])
     print("\n--- wt sprint ---")
     print("\n".join("   " + l for l in outs["sprint"].strip().splitlines()[:14]))
-    print("\n--- wt sync-sprints --dry-run 'Assist on Banco Galicia' ---")
+    print(f"\n--- wt sync-sprints --dry-run {multi!r} ---")
     print("\n".join("   " + l for l in
                     outs["sync-sprints --dry-run <task>"].strip().splitlines()))
 
@@ -234,8 +278,9 @@ def test_sprint_offline(wt, migrated, scratch):
     check(code in (None, 0) and "KeyError" not in out,
           "wt sprint survives get_all_sprints() == [] by using the cache",
           f"code={code}\n{out[:400]}")
-    check("offline" in out and "Sprint 105" in out,
-          "…and says it is offline", out[:300])
+    cur = wt.find_sprint_for_date(env.sprints, datetime.now().date())
+    check("offline" in out and cur is not None and cur["title"] in out,
+          f"…and says it is offline (current = {cur and cur['title']})", out[:300])
     print("\n".join("   " + l for l in out.strip().splitlines()[:8]))
 
 
@@ -336,24 +381,56 @@ def test_recurrent_reconciles(wt, migrated, scratch):
     # A perpetual series must never carry an issue forward: each sprint keeps its
     # own issue, so the sprint that just ended closes and the new one is minted.
     # Carrying forward would strand the ended sprint's hours (plan §6b/Phase 5).
+    #
+    # The interesting plan only exists at a sprint boundary, *before* the owner
+    # runs `wt sync-sprints --all`. The live fixture is normally on the far side
+    # of that (the sprint-start ritual already minted this sprint's issues), so
+    # asserting "create + close" against it as-is fails for every series — which
+    # is how this section rotted. The boundary state is rebuilt per task instead:
+    # drop the current sprint's binding and re-open the newest ended one.
+    cur = wt.find_sprint_for_date(env.sprints, datetime.now().date())
+    check(cur is not None, "today falls inside a cached sprint",
+          "no current sprint — section 4 cannot rebuild the boundary state")
+    rolled_tasks = []
+    young = []
     for t in recurrent:
+        rolled = new_sprint_boundary(wt, t, env.sprints, cur)
+        if not rolled:
+            # A series first worked in the current sprint has no earlier binding,
+            # so there is no boundary to rebuild. Reported, not silently dropped.
+            young.append(t["title"])
+            continue
+        rolled_tasks.append((t, rolled))
+    if young:
+        print(f"    not yet multi-sprint, no boundary to rebuild: "
+              f"{', '.join(repr(y[:34]) for y in young)}")
+    check(bool(rolled_tasks),
+          f"{len(rolled_tasks)} perpetual series have an earlier sprint to roll back to",
+          "every recurrent task started this sprint — section 4 would be vacuous")
+    wt.save(env.data)   # cmd_sync_sprints re-reads from disk
+    for t, rolled in rolled_tasks:
         with CliStubs(wt, mode="strict", sprints=env.sprints):
             r = wt.reconcile_task_sprints(t, env.data, env.sprints, dry_run=True,
                                           create_issues=True)
         ops = [o["op"] for o in r["planned"]]
         check("repoint" not in ops,
               f"no carry-forward for perpetual {t['title'][:34]!r}", str(ops))
-        check("create" in ops,
+        check(any(o["op"] == "create" and o["sprint"] == cur["title"]
+                  for o in r["planned"]),
               f"mints the current sprint's issue for {t['title'][:34]!r}", str(ops))
-        check(any(o["op"] == "close" for o in r["planned"]),
-              f"closes the ended sprint for {t['title'][:34]!r}", str(ops))
+        check(any(o["op"] == "close" and o["sprint"] == rolled["reopened"]
+                  for o in r["planned"]),
+              f"closes the ended sprint ({rolled['reopened']}) for "
+              f"{t['title'][:34]!r}", str(ops))
 
-    # That pair of ops is exactly what close-recurrent + new-recurrent did.
+    # That pair of ops is exactly what close-recurrent + new-recurrent did. The
+    # boundary state rebuilt above is still in place on env.data, so the whole
+    # `--all --create-issues` run should mint one issue per series.
     with CliStubs(wt, mode="record", sprints=env.sprints) as st:
         run_cmd(wt, wt.cmd_sync_sprints,
                 ["--all", "--create-issues", "--yes"], Answers("y"))
         made = [a[0].get("title") for n, a, k in st.calls if n == "create_github_issue"]
-    for t in recurrent:
+    for t, _rolled in rolled_tasks:
         want = t["title"]
         check(any(m == want or m.startswith(want) for m in made),
               f"a current-sprint issue was minted for {want[:34]!r}",
@@ -365,15 +442,23 @@ def test_recurrent_reconciles(wt, migrated, scratch):
 def test_split_sprint_alias(wt, migrated, scratch):
     section("5. `wt split-sprint` still works and warns")
     env = Env(wt, migrated, scratch / "alias.json")
+    # Same rollback as section 1: without it the chosen task is already in sync
+    # and the alias renders "Nothing to do", so "it renders the plan" can't be
+    # told apart from "it rendered nothing".
+    subject, _per = pick_multi_sprint(wt, env.data, env.sprints)
+    info = unreconcile(wt, subject, env.sprints, anchor="oldest")
+    wt.save(env.data)
     with CliStubs(wt, mode="strict", sprints=env.sprints) as st:
         out, code = run_cmd(wt, wt.cmd_split_sprint,
-                            ["--dry-run", "Assist on Banco Galicia"])
+                            ["--dry-run", subject["title"]])
         check(st.calls == [], "alias dry run makes no GitHub call")
     check(code in (None, 0), f"alias exits cleanly (code={code})", out[-400:])
     first = out.strip().splitlines()[0]
     check("deprecated" in first and "sync-sprints" in first,
           "prints a one-line deprecation notice first", repr(first))
-    check("Sprint 95" in out, "and then renders the sync-sprints plan")
+    check(info["anchor"] in out and info["latest"] in out,
+          f"and then renders the sync-sprints plan ({info['anchor']} → "
+          f"{info['latest']})", out[:600])
     check(wt.COMMANDS["split-sprint"] is wt.cmd_split_sprint
           and wt.COMMANDS["sync-sprints"] is wt.cmd_sync_sprints,
           "both names are wired into COMMANDS")
@@ -729,9 +814,17 @@ def test_invariants(wt, work, baseline):
     if proc.stderr.strip():
         print("    stderr:", proc.stderr.strip()[:400])
     check(proc.returncode == 0, "check_invariants exits 0", f"rc={proc.returncode}")
+    # The totals come from the Phase-0 baseline snapshot, not from a constant
+    # frozen on the day this harness was written. The old hardcoded pair
+    # (26620.71 / 392) went stale the next time the owner logged any time, which
+    # turned "totals unchanged" into a permanent red herring.
+    snap = json.loads(Path(baseline).read_text())
+    want_mins = snap["total_minutes_excluding_shadows"]
+    want_logs = snap["total_log_count_excluding_shadows"]
     m = re.search(r"minutes=([\d.]+)\s+logs=(\d+)", proc.stdout)
-    check(bool(m) and m.group(1) == "26620.71" and m.group(2) == "392",
-          "minutes 26620.71 and 392 logs, unchanged",
+    check(bool(m) and abs(float(m.group(1)) - want_mins) < 1e-6
+          and int(m.group(2)) == want_logs,
+          f"minutes {want_mins} and {want_logs} logs, unchanged vs the baseline",
           m.group(0) if m else proc.stdout[:200])
 
 
@@ -780,16 +873,30 @@ def test_creation_paths(wt, migrated, scratch):
     check(again["existed"] is True and again["task"] is res["task"],
           "…and dedupes off the binding even with no legacy key", str(again))
 
-    # new-recurrent
+    # new-recurrent / close-recurrent are RETIRED (Phase 5 merged the per-sprint
+    # clones into one perpetual task, and these commands' selection rule —
+    # status=="recurrent" + a prior-sprint sprint_id — matches that merged task,
+    # so running one would close a live recurring series). This used to assert
+    # that new-recurrent creates tasks with issues; that expectation is now
+    # exactly backwards, so it asserts the retirement instead.
     env3 = Env(wt, migrated, scratch / "create3.json")
-    with CliStubs(wt, mode="record", sprints=env3.sprints):
+    with CliStubs(wt, mode="record", sprints=env3.sprints) as st3:
         summary = wt.create_current_sprint_recurrent_tasks(env3.data, wt.save)
     made = [r for r in summary["results"] if r.get("issue")]
-    check(summary["error"] is None and made,
-          "new-recurrent created tasks with issues", str(summary)[:300])
-    for r in made[:3]:
-        t = next(x for x in env3.data["tasks"] if x["title"] == r["title"])
-        one_binding(t, f"new-recurrent {r['title'][:28]!r}")
+    check(summary["error"] is None and not made,
+          "the retired new-recurrent planner creates nothing for a merged series",
+          str(summary)[:300])
+    check(st3.count("create_github_issue") == 0,
+          "…and mints no GitHub issue", str(st3.names()))
+    check(wt.find_recurrent_tasks_to_recreate(env3.data) == [],
+          "…because no per-sprint clone is left to use as a template")
+    for name, fn in (("close-recurrent", wt.cmd_close_recurrent),
+                     ("new-recurrent", wt.cmd_new_recurrent)):
+        with CliStubs(wt, mode="strict", sprints=env3.sprints) as st4:
+            out, code = run_cmd(wt, fn, ["--dry-run"])
+        check(code == 2 and "has been retired" in out and st4.calls == [],
+              f"`wt {name}` hard-refuses (exit 2, no GitHub call)",
+              f"code={code} {out[:160]!r}")
 
 
 class FakeGhAddIssue:
