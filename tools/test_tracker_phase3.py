@@ -23,7 +23,13 @@ The TUI itself is driven through Textual's official headless driver
 
 Usage:
 
-    venv/bin/python test_tracker_phase3.py <fixture.json> <migrated.json> <scratch-dir>
+    venv/bin/python tools/test_tracker_phase3.py <pre-migration.json> \\
+                                                 <migrated.json> [baseline.json] \\
+                                                 <scratch-dir>
+
+The baseline argument is accepted and ignored, purely so this harness takes the
+same four arguments as the other three (it does its own before/after totals
+rather than comparing against a Phase-0 snapshot).
 """
 import asyncio
 import copy
@@ -35,7 +41,7 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path("/Users/carlos/dev/carlos/workload-tracker/.claude/worktrees/sprint-bindings-plan")
+REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
 
@@ -106,10 +112,16 @@ def lock_down_subprocess():
 # ───────────────────────────────────────────────────────────── main test body ──
 
 def main():
-    if len(sys.argv) != 4:
+    if len(sys.argv) == 4:
+        fixture, migrated, scratch = (Path(a).expanduser() for a in sys.argv[1:4])
+    elif len(sys.argv) == 5:
+        # Uniform 4-argument form shared with the other harnesses; the baseline
+        # slot is ignored here.
+        fixture, migrated, _baseline, scratch = (
+            Path(a).expanduser() for a in sys.argv[1:5])
+    else:
         print(__doc__)
         return 2
-    fixture, migrated, scratch = (Path(a) for a in sys.argv[1:4])
     scratch.mkdir(parents=True, exist_ok=True)
 
     data_file = build_home(scratch, migrated)

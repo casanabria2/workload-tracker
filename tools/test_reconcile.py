@@ -218,6 +218,112 @@ def brief(res):
     return "\n".join(out) or "      (empty plan)"
 
 
+# ------------------------------------------------------------ scenario builders --
+#
+# These harnesses run against a *copy of the live data file*, and that file keeps
+# moving: `wt sync-sprints --all` reconciles tasks (so the plan a test used to
+# assert becomes an empty plan), logs get edited or deleted, and the current
+# sprint advances every two weeks. Pinning an assertion to "Assist on Banco
+# Galicia mints an issue for Sprint 95" therefore expires the first time the
+# owner closes a sprint — which is exactly how this harness rotted (it was
+# written when Banco Galicia was un-reconciled and the current sprint was 104).
+#
+# The fix is not to re-pin to today's values. It is to pick the subject task out
+# of whatever the fixture contains, rebuild the *precondition* the behaviour
+# needs, and derive the expectation from that rebuild. Nothing below hardcodes a
+# task title, sprint name, issue number or minute total.
+
+def sprint_time(wt, task, sprints):
+    """``[{sprint_id, sprint, minutes}]`` for sprints with logged time, oldest first."""
+    return [
+        {"sprint_id": e["sprint_id"], "sprint": e["sprint_title"],
+         "minutes": e["total_mins"]}
+        for e in wt.task_sprints_with_time(task, sprints)
+    ]
+
+
+def multi_sprint_tasks(wt, data, sprints, *, status=None, min_sprints=2,
+                       need_repo=True, need_issue=True):
+    """Fixture tasks whose *logs* span at least *min_sprints* sprints.
+
+    Ordered most-spanning first, then by title, so the pick is deterministic for
+    a given fixture but never tied to one particular task surviving.
+    """
+    out = []
+    for t in data["tasks"]:
+        if status is not None and t.get("status") != status:
+            continue
+        if t.get("status") == "recurrent":
+            continue          # perpetual series: no carry-forward, different rules
+        if need_repo and not wt.get_task_repo(t):
+            continue
+        if need_issue and not t.get("github_issue"):
+            continue
+        per = sprint_time(wt, t, sprints)
+        if len(per) >= min_sprints:
+            out.append((t, per))
+    out.sort(key=lambda p: (-len(p[1]), p[0].get("title", "")))
+    return out
+
+
+def pick_multi_sprint(wt, data, sprints, **kw):
+    """First task from :func:`multi_sprint_tasks`, or SystemExit with a reason.
+
+    A hard exit rather than a skipped check: if the fixture contains no
+    cross-sprint task at all, the harness is not testing what its name claims and
+    that must be loud.
+    """
+    cands = multi_sprint_tasks(wt, data, sprints, **kw)
+    if not cands:
+        raise SystemExit(
+            f"fixture has no task matching {kw!r} with logged time in "
+            "2+ sprints — cannot exercise the cross-sprint path"
+        )
+    return cands[0]
+
+
+def unreconcile(wt, task, sprints, *, anchor="oldest"):
+    """Roll *task* back to the one-issue-per-task shape reconcile exists to fix.
+
+    Collapses ``sprint_issues`` down to a single binding carrying the task's own
+    ``github_issue``, anchored at the oldest (or newest) sprint that has logged
+    time, and points the legacy ``sprint``/``sprint_id`` mirror at it. This is
+    the state every cross-sprint task was in before it was first reconciled:
+    real work in several sprints, one long-lived issue.
+
+    ``logs`` are never touched, so the derived target state is unchanged — only
+    the bookkeeping that reconcile is supposed to reproduce is removed.
+
+    Returns ``{issue, anchor, anchor_id, targets, latest, latest_id}``.
+    """
+    per = sprint_time(wt, task, sprints)
+    assert len(per) >= 2, f"{task.get('title')!r} is not multi-sprint"
+    pick = per[0] if anchor == "oldest" else per[-1]
+    issue = task.get("github_issue")
+    assert issue, f"{task.get('title')!r} has no legacy issue to carry"
+    task["sprint_issues"] = [{
+        "sprint_id": pick["sprint_id"],
+        "sprint": pick["sprint"],
+        "issue": issue,
+        "state": "closed" if task.get("status") == "done" else "open",
+        "hours_synced": None,
+        "synced_at": None,
+        "created_at": task.get("created_at"),
+    }]
+    task["sprint_id"] = pick["sprint_id"]
+    task["sprint"] = pick["sprint"]
+    return {
+        "issue": issue,
+        "anchor": pick["sprint"], "anchor_id": pick["sprint_id"],
+        "targets": per,
+        "latest": per[-1]["sprint"], "latest_id": per[-1]["sprint_id"],
+    }
+
+
+def current_sprint(wt, sprints):
+    return wt.find_sprint_for_date(sprints, datetime.now().date())
+
+
 # ----------------------------------------------------------------------- tests --
 
 def test_dry_run_purity(wt, migrated, scratch):
@@ -248,43 +354,64 @@ def test_historical(wt, migrated, scratch):
     section("2. historical multi-sprint tasks — plan only, nothing executed")
     data = load_copy(wt, migrated, scratch / "hist.json")
     sprints = wt.get_cached_sprints(data)
+
+    # Two closed cross-sprint tasks, chosen from the fixture. A `done` task has
+    # no current-sprint reservation, so its target set is exactly "the sprints it
+    # has time in" and the expected plan is fully determined by the logs.
+    cands = multi_sprint_tasks(wt, data, sprints, status="done")
+    if len(cands) < 2:
+        raise SystemExit("fixture has fewer than two closed cross-sprint tasks")
+    subjects = cands[:2]
+
+    # Every one of these has long since been reconciled for real (the owner runs
+    # `wt sync-sprints --all` at each sprint boundary), so the interesting plan
+    # only exists if the pre-reconcile state is rebuilt first.
+    rolled = {}
+    for task, _per in subjects:
+        rolled[task["id"]] = unreconcile(wt, task, sprints, anchor="oldest")
+
     before = sig(data)
-    results = {}
     with Stubs(wt, mode="strict", sprints=sprints) as st:
-        for title in ("Assist on Banco Galicia",
-                      "casanabria - Brokkr support for GrafanaCon"):
-            task = find(data, title)
+        for task, _per in subjects:
+            info = rolled[task["id"]]
             res = wt.reconcile_task_sprints(task, data, sprints, dry_run=True)
-            results[title] = res
-            print(f"    {title}  (status={task['status']}, "
-                  f"issue={task.get('github_issue')})")
+            title = task["title"]
+            print(f"    {title}  (status={task['status']}, issue={info['issue']}, "
+                  f"rolled back to a single {info['anchor']} binding)")
             print(f"      target: "
                   + ", ".join(f"{t['sprint']}={t['minutes']:.0f}m/{t['hours']}h"
                               for t in res["target"]))
             print(brief(res))
+
+            creates = [o for o in res["planned"] if o["op"] == "create"]
+            repoints = [o for o in res["planned"] if o["op"] == "repoint"]
+            short = title[:34]
+
+            # Expectation derived from the logs: Option A carries the task's one
+            # issue to its most recent sprint and mints an issue for each sprint
+            # left behind — including the one the issue vacated.
+            want_creates = [t["sprint"] for t in info["targets"][:-1]]
+            check([o["sprint"] for o in creates] == want_creates,
+                  f"{short}…: mints one issue per sprint left behind "
+                  f"({len(want_creates)})",
+                  f"got {[o['sprint'] for o in creates]} want {want_creates}")
+            check(len(repoints) == 1
+                  and repoints[0]["issue"] == info["issue"]
+                  and repoints[0]["sprint"] == info["latest"]
+                  and repoints[0].get("from_sprint") == info["anchor"],
+                  f"{short}…: carries {info['issue']} forward to "
+                  f"{info['latest']} (Option A)",
+                  f"got {repoints}")
+            check(creates and all(
+                      o["issue_title"].endswith(f"({o['sprint']})") for o in creates),
+                  f"{short}…: past-sprint issues keep the ' (Sprint N)' title suffix",
+                  str([o["issue_title"] for o in creates]))
+            check(all(o["hours"] == wt.mins_to_quarter_hours(t["minutes"])
+                      for o, t in zip(creates, info["targets"][:-1])),
+                  f"{short}…: each minted issue carries only its own sprint's hours",
+                  str([(o['sprint'], o['hours']) for o in creates]))
         check(st.calls == [], "no GitHub calls while planning")
     check(sig(data) == before, "no mutation while planning")
-
-    bg = results["Assist on Banco Galicia"]
-    creates = [o for o in bg["planned"] if o["op"] == "create"]
-    repoints = [o for o in bg["planned"] if o["op"] == "repoint"]
-    check([o["sprint"] for o in creates] == ["Sprint 95"],
-          "Banco Galicia mints exactly one new issue, for Sprint 95",
-          f"got {[o['sprint'] for o in creates]}")
-    check(len(repoints) == 1 and repoints[0]["issue"] == "grafana/field-eng#5069"
-          and repoints[0]["sprint"] == "Sprint 96",
-          "Banco Galicia carries #5069 forward to Sprint 96 (Option A)",
-          f"got {repoints}")
-    check(creates and creates[0]["issue_title"].endswith("(Sprint 95)"),
-          "past-sprint issue keeps the ' (Sprint N)' title suffix")
-
-    bk = results["casanabria - Brokkr support for GrafanaCon"]
-    bkc = [o["sprint"] for o in bk["planned"] if o["op"] == "create"]
-    bkr = [o for o in bk["planned"] if o["op"] == "repoint"]
-    check(bkc == ["Sprint 97"], "Brokkr mints one new issue, for Sprint 97",
-          f"got {bkc}")
-    check(len(bkr) == 1 and bkr[0]["sprint"] == "Sprint 98",
-          "Brokkr carries #5263 forward to Sprint 98", f"got {bkr}")
 
     # Blast radius of a blanket run, for the record (plan §5: opt-in backfill).
     with Stubs(wt, mode="strict", sprints=sprints):
@@ -329,28 +456,48 @@ def test_already_split(wt, migrated, scratch):
           "planned hours equal the round-up-per-sprint value from the logs")
 
 
+def marker_log_tasks(wt, data):
+    """Titles of fixture tasks carrying a 0-minute 'Sprint rollover marker' log.
+
+    Selected from the fixture rather than listed: the markers are leftovers of a
+    retired ritual, so their number only ever goes down as the owner tidies logs.
+    """
+    out = []
+    for t in data["tasks"]:
+        if any(l.get("minutes", 0) == 0 and "rollover marker" in (l.get("note") or "")
+               for l in t.get("logs", []) or []):
+            out.append(t["title"])
+    return sorted(out)
+
+
 def test_marker_logs(wt, migrated, scratch):
     section("4. marker-log independence (plan §1.3)")
-    # The three 0-minute "Sprint rollover marker" logs in the live data. NOTE:
-    # the brief named 'Document current FE platform' as one of them; in this data
-    # its Sprint-104 presence is a real 0.13-minute Timer session log, not a
-    # marker, so it is exercised separately below.
-    for title in ("Implement Sigil instrumentation in /validate-demo-blocks-steps",
-                  "CI Check to read Demo Blocks content and verify if the change "
-                  "would break the demo block",
-                  "Move demo block scripts to the new field-eng-demo-blocks repo"):
+    # Every 0-minute "Sprint rollover marker" log left in the fixture. The point
+    # of the section is that reconcile derives its target set from *minutes*, so
+    # a marker changes nothing — whichever tasks still carry one.
+    probe = load_copy(wt, migrated, scratch / "marker.json")
+    titles = marker_log_tasks(wt, probe)
+    check(bool(titles), f"fixture still carries marker logs ({len(titles)} task(s))",
+          "no 0-minute rollover markers left — this section is now vacuous")
+    for title in titles:
         data = load_copy(wt, migrated, scratch / "marker.json")
         sprints = wt.get_cached_sprints(data)
         task = find(data, title)
         markers = [l for l in task["logs"]
                    if l.get("minutes", 0) == 0
                    and "rollover marker" in (l.get("note") or "")]
+        marker_sprints = {
+            (wt.find_sprint_for_date(
+                sprints, datetime.fromtimestamp(wt.log_effective_date(l)).date()) or {})
+            .get("title")
+            for l in markers
+        } - {None}
         with Stubs(wt, mode="strict", sprints=sprints):
             res_with = wt.reconcile_task_sprints(task, data, sprints, dry_run=True)
         short = title[:38]
         print(f"    {title[:60]}  status={task['status']}  markers={len(markers)}")
         print(brief(res_with))
-        check(len(markers) == 1, f"{short}…: fixture really has a marker log")
+        check(len(markers) >= 1, f"{short}…: fixture really has a marker log")
 
         cur = res_with["current_sprint"]
         existing = {b.get("sprint") for b in task.get("sprint_issues") or []}
@@ -366,9 +513,14 @@ def test_marker_logs(wt, migrated, scratch):
             check(cur in bound_after,
                   f"{short}…: open task ends up bound to the current sprint ({cur})",
                   f"bound={bound_after}")
-        check(not any(o["op"] == "create" and o["sprint"] == "Sprint 104"
-                      for o in res_with["planned"]),
-              f"{short}…: no issue minted for the marker's sprint")
+        # The marker's own sprint, derived from its timestamp — a 0-minute log
+        # must never be enough on its own to mint that sprint an issue.
+        minted = {o["sprint"] for o in res_with["planned"] if o["op"] == "create"}
+        with_time = {e["sprint"] for e in sprint_time(wt, task, sprints)}
+        check(not (minted & (marker_sprints - with_time)),
+              f"{short}…: no issue minted for a marker-only sprint "
+              f"({', '.join(sorted(marker_sprints)) or 'n/a'})",
+              f"minted={sorted(minted)} marker_sprints={sorted(marker_sprints)}")
 
         # Same plan with the marker log deleted.
         task["logs"] = [l for l in task["logs"] if l not in markers]
@@ -379,27 +531,47 @@ def test_marker_logs(wt, migrated, scratch):
               f"\n      with:    {[o['op'] for o in res_with['planned']]}"
               f"\n      without: {[o['op'] for o in res_without['planned']]}")
 
-    # The task the brief named. Its Sprint-104 bucket is a real 0.13m log, so
-    # round-up-per-sprint (deliberately preserved) mints a 0.25h issue for it.
+    # The counterpart to a marker: a *real* sub-quarter-hour log is not a marker
+    # and must be billed, rounded up per sprint. This used to be pinned to a
+    # 0.13-minute Timer session that happened to exist on 'Document current FE
+    # platform' in Sprint 104; the owner has since deleted that stray 8-second
+    # entry, which silently turned the assertion into a permanent failure. It is
+    # injected now, so the arithmetic is tested regardless of what the live logs
+    # happen to contain.
     data = load_copy(wt, migrated, scratch / "marker2.json")
     sprints = wt.get_cached_sprints(data)
-    task = find(data, "Document current FE platform")
+    task, _per = pick_multi_sprint(wt, data, sprints)
+    if task.get("status") == "done":
+        task["status"] = "inprogress"      # an open task reserves the current sprint
+    info = unreconcile(wt, task, sprints, anchor="oldest")
+    today = datetime.now().date()
+    used = {e["sprint_id"] for e in sprint_time(wt, task, sprints)}
+    spare = next((s for s in sorted(sprints, key=lambda s: s["start_date"], reverse=True)
+                  if s["id"] not in used and s.get("end_date")
+                  and s["end_date"] <= today), None)
+    if spare is None:
+        raise SystemExit("fixture has no spare ended sprint to inject a tiny log into")
+    stamp = datetime.combine(spare["start_date"], datetime.min.time()).timestamp() + 3600
+    task["logs"].append({"id": wt.uid(), "minutes": 0.13, "note": "Timer session",
+                         "at": stamp, "started_at": stamp, "ended_at": stamp + 8})
     with Stubs(wt, mode="strict", sprints=sprints):
         res = wt.reconcile_task_sprints(task, data, sprints, dry_run=True)
-    print("    Document current FE platform  status=%s" % task["status"])
+    print(f"    {task['title'][:60]}  status={task['status']}  "
+          f"+0.13m real log in {spare['title']}")
     print(brief(res))
-    s104_id = next(s["id"] for s in sprints if s["title"] == "Sprint 104")
-    s104 = wt.bucket_logs_by_sprint(task, sprints).get(s104_id, [])
-    check(len(s104) == 1 and s104[0].get("minutes", 0) > 0
-          and "marker" not in (s104[0].get("note") or ""),
-          "its Sprint-104 log is a real 0.13m Timer session, not a marker",
-          str(s104))
-    check(any(o["op"] == "create" and o["sprint"] == "Sprint 104"
+    tiny = wt.bucket_logs_by_sprint(task, sprints).get(spare["id"], [])
+    check(len(tiny) == 1 and tiny[0].get("minutes", 0) > 0
+          and "marker" not in (tiny[0].get("note") or ""),
+          f"the injected {spare['title']} log is a real Timer session, not a marker",
+          str(tiny))
+    check(any(o["op"] == "create" and o["sprint"] == spare["title"]
               and o["hours"] == 0.25 for o in res["planned"]),
-          "round-up-per-sprint (preserved by design) bills that 0.13m as 0.25h")
+          "round-up-per-sprint (preserved by design) bills that 0.13m as 0.25h",
+          str([(o["sprint"], o.get("hours")) for o in res["planned"]
+               if o["op"] == "create"]))
     check(res["current_sprint"] in {o["sprint"] for o in res["planned"]
                                     if o["op"] == "repoint"},
-          "its current issue is carried forward to the current sprint",
+          "an open task's current issue is carried forward to the current sprint",
           str(res["planned"]))
 
 
@@ -588,8 +760,21 @@ def test_close_task(wt, migrated, scratch):
     section("11. close_task() still works end to end (reconcile via the wrapper)")
     data = load_copy(wt, migrated, scratch / "close.json")
     sprints = wt.get_cached_sprints(data)
-    task = find(data, "Document current FE platform")
-    issue = task["github_issue"]
+    # An *open* cross-sprint task, rolled back to the one-issue shape it had
+    # before it was ever reconciled — otherwise there is nothing left for the
+    # close to do and the section asserts an empty plan. Pinning this to one task
+    # title plus the sprint names of the day is what broke it (it expected
+    # Sprint 104 to be the newest sprint with time; a stray 8-second log there
+    # was later deleted, and the current sprint has since rolled over twice).
+    task, _per = pick_multi_sprint(wt, data, sprints)
+    if task.get("status") == "done":
+        task["status"] = "inprogress"
+    info = unreconcile(wt, task, sprints, anchor="oldest")
+    issue = info["issue"]
+    want_bindings = {t["sprint"] for t in info["targets"]}
+    last = info["latest"]
+    print(f"    subject: {task['title']!r} (issue {issue}, "
+          f"time in {len(info['targets'])} sprints, rolled back to {info['anchor']})")
     with Stubs(wt, mode="record", sprints=sprints) as st:
         res = wt.close_task(task, data, wt.save)
     print(f"    result: success={res['success']} split_performed={res['split_performed']} "
@@ -610,18 +795,23 @@ def test_close_task(wt, migrated, scratch):
           f'{len(data["tasks"])} vs expected {want}')
     bound = {b["sprint"]: b for b in task["sprint_issues"]}
     # close_task passes closing=True, so no empty binding is reserved for the
-    # current sprint (Sprint 105 has no logs). The task's long-lived issue lands
-    # on the newest sprint that actually has time instead of reporting 0h against
-    # a sprint it was never worked in.
-    check(set(bound) == {"Sprint 97", "Sprint 98", "Sprint 104"},
+    # current sprint. The task's long-lived issue lands on the newest sprint that
+    # actually has time instead of reporting 0h against a sprint it was never
+    # worked in — so the binding set is exactly "the sprints with logged time".
+    current = current_sprint(wt, sprints)
+    check(set(bound) == want_bindings,
           "a binding per sprint with time, and no empty current-sprint binding",
+          f"{sorted(bound)} vs want {sorted(want_bindings)}")
+    check(current is None or current["title"] not in bound
+          or current["title"] in want_bindings,
+          "the current sprint is bound only if it has logged time",
           str(sorted(bound)))
-    last = "Sprint 104"  # newest sprint with logged time
     check(bound[last]["issue"] == issue,
-          "the original issue lands on the newest sprint with time (Option A)",
+          f"the original issue lands on the newest sprint with time ({last}, Option A)",
           str(bound[last]))
-    check(st.count("create_github_issue") == 1,
-          "only Sprint 98 is minted (Sprint 104 took the carried-forward issue)",
+    check(st.count("create_github_issue") == len(want_bindings) - 1,
+          f"one issue minted per sprint left behind ({len(want_bindings) - 1}); "
+          f"{last} took the carried-forward issue",
           str(st.count("create_github_issue")))
     check(all(b["state"] == "closed" for b in bound.values()),
           "every binding closed (all their sprints have ended)", str(bound))
@@ -655,13 +845,36 @@ def test_set_sprint_drift(wt, migrated, scratch):
     section("10. sprint_id ahead of the bindings (wt set-sprint) mints no duplicate")
     data = load_copy(wt, migrated, scratch / "drift.json")
     sprints = wt.get_cached_sprints(data)
-    task = find(data, "Update brokkr to use github app at run time")
+    current = current_sprint(wt, sprints)
+    if current is None:
+        raise SystemExit("today falls in no cached sprint — cannot run section 10")
+    # Subject: an open task whose logged time is entirely in *ended* sprints, so
+    # the current sprint is a pure carry-forward target. Rolled back to one
+    # binding on its newest worked sprint, which is where a task sits before its
+    # first reconcile of a new sprint.
+    cands = [(t, per) for t, per in
+             multi_sprint_tasks(wt, data, sprints, min_sprints=1)
+             if t.get("status") not in ("done", "recurrent")
+             and all(e["sprint_id"] != current["id"] for e in per)]
+    if not cands:
+        raise SystemExit("fixture has no open task worked only in ended sprints")
+    task, per = cands[0]
+    info = unreconcile(wt, task, sprints, anchor="newest") if len(per) > 1 else None
+    if info is None:
+        task["sprint_issues"] = [{
+            "sprint_id": per[0]["sprint_id"], "sprint": per[0]["sprint"],
+            "issue": task["github_issue"], "state": "open",
+            "hours_synced": None, "synced_at": None,
+            "created_at": task.get("created_at"),
+        }]
     issue = task["github_issue"]
-    current = wt.find_sprint_for_date(sprints, datetime.now().date())
-    # Simulate `wt set-sprint <task> "Sprint 105"`: sprint_id jumps forward, the
-    # binding stays behind on Sprint 101 with the live issue.
+    vacated = per[-1]["sprint"]
+    # Simulate `wt set-sprint <task> <current>`: sprint_id jumps forward while the
+    # binding stays behind on the worked sprint, still holding the live issue.
     task["sprint_id"] = current["id"]
     task["sprint"] = current["title"]
+    print(f"    subject: {task['title'][:52]!r}  issue={issue}  "
+          f"binding on {vacated}, sprint_id set to {current['title']}")
     with Stubs(wt, mode="strict", sprints=sprints):
         res = wt.reconcile_task_sprints(task, data, sprints, dry_run=True)
     print(f"    bindings: {[(b['sprint'], b['issue'], b['state']) for b in task['sprint_issues']]}")
@@ -676,8 +889,9 @@ def test_set_sprint_drift(wt, migrated, scratch):
     check(not any(o["op"] == "close" and o["issue"] == issue
                   for o in res["planned"]),
           "the live issue is not closed out from under the open task")
-    check([o["sprint"] for o in creates] == ["Sprint 101"],
-          "the sprint it vacated (65m of real work) gets its own past-sprint issue",
+    check([o["sprint"] for o in creates] == [e["sprint"] for e in per],
+          f"every sprint it vacated ({vacated} + {len(per) - 1} older) gets its "
+          "own past-sprint issue",
           str([o["sprint"] for o in creates]))
 
 
@@ -704,11 +918,17 @@ def test_hours_withheld_guard(wt, migrated, scratch):
     data = load_copy(wt, migrated, scratch / "hold.json")
     sprints = wt.get_cached_sprints(data)
 
-    # Assist on Banco Galicia: 12h30m in Sprint 95 + 6h30m in Sprint 96, one
-    # issue. Narrowing that issue to Sprint 96 alone while Sprint 95 has nowhere
-    # to go would delete 12h30m from the project's reporting.
-    task = find(data, "Assist on Banco Galicia")
-    per = {e["sprint_title"]: e["total_mins"] for e in wt.task_sprints_with_time(task, sprints)}
+    # A closed cross-sprint task rolled back to a single issue on its *newest*
+    # sprint — the shape the guard exists for. Narrowing that one issue to its
+    # own sprint while the older sprints have nowhere to report would delete the
+    # difference from the project's reporting. (Originally pinned to 'Assist on
+    # Banco Galicia' / Sprint 95; that task has since been reconciled for real,
+    # which made the precondition unreachable and the assertions permanently red.)
+    task, _per = pick_multi_sprint(wt, data, sprints, status="done")
+    info = unreconcile(wt, task, sprints, anchor="newest")
+    per = {e["sprint"]: e["minutes"] for e in info["targets"]}
+    deferred = [e["sprint"] for e in info["targets"][:-1]]
+    print(f"    subject: {task['title'][:52]!r}  issue={info['issue']}")
     print(f"    logs by sprint: { {k: round(v) for k, v in per.items()} }")
     check(len(per) > 1, "the fixture task really does span sprints", str(per))
 
@@ -724,8 +944,8 @@ def test_hours_withheld_guard(wt, migrated, scratch):
           str(held_hours))
     check(len(withheld) == 1, "and reports exactly one withheld hours write",
           str(withheld))
-    check([e["sprint"] for e in held["unbillable"]] == ["Sprint 95"],
-          "naming the sprint whose time has no issue",
+    check([e["sprint"] for e in held["unbillable"]] == deferred,
+          f"naming every sprint whose time has no issue ({', '.join(deferred)})",
           str(held["unbillable"]))
     # The withheld value must be the *narrowing* one — that's the whole hazard.
     check(withheld and withheld[0]["hours"] < wt.mins_to_quarter_hours(sum(per.values())),
@@ -747,8 +967,19 @@ def test_hours_withheld_guard(wt, migrated, scratch):
     check(not any(s.get("withheld_hours") for s in freed["skipped"]),
           "with nothing withheld", str(freed["skipped"]))
 
-    # A single-sprint task has nothing unbillable, so it is unaffected.
-    solo = find(data, "Broken New Relic Dashboard")
+    # A single-sprint task has nothing unbillable, so it is unaffected. Picked
+    # from the fixture; its cached hours are cleared so an hours op is guaranteed
+    # to be planned (otherwise the assertion depends on the live sync state).
+    solo = next((t for t in data["tasks"]
+                 if t.get("status") not in ("recurrent",)
+                 and wt.get_task_repo(t)
+                 and len(sprint_time(wt, t, sprints)) == 1
+                 and any(b.get("issue") for b in t.get("sprint_issues") or [])), None)
+    if solo is None:
+        raise SystemExit("fixture has no single-sprint task with a linked issue")
+    for b in solo["sprint_issues"]:
+        b["hours_synced"] = None
+    print(f"    single-sprint control: {solo['title'][:52]!r}")
     with Stubs(wt, mode="strict", sprints=sprints):
         r = wt.reconcile_task_sprints(solo, data, sprints, dry_run=True,
                                       create_issues=False)
@@ -758,7 +989,7 @@ def test_hours_withheld_guard(wt, migrated, scratch):
           "and still syncs its hours", str(r["planned"]))
 
     # close_task always mints, so the guard must never withhold on a close.
-    closing = find(data, "Assist on Banco Galicia")
+    closing = task
     with Stubs(wt, mode="strict", sprints=sprints):
         rc = wt.reconcile_task_sprints(closing, data, sprints, dry_run=True,
                                        closing=True)
