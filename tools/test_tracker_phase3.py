@@ -366,17 +366,40 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         check(data_file.read_bytes() == before_bytes,
               "cancelling the preview left the data file byte-identical")
 
-        section("7. sync-sprints skips recurrent tasks")
+        section("7. sync-sprints treats recurrent tasks like any other")
+        # Phase 5 merged the per-sprint recurrent clones into one perpetual task
+        # with a binding per sprint, so `S` must reconcile them rather than
+        # refuse. The TUI used to send the user to `wt close-recurrent` /
+        # `wt new-recurrent`, both of which are retired and hard-refuse — a dead
+        # end. Either outcome below is correct and data-dependent: a preview when
+        # there is work to plan, an "already in sync" notice when there is not.
+        # What must never come back is the refusal.
         rec_task = [t for t in data["tasks"] if t.get("status") == "recurrent"][0]
         select(rec_tbl, rec_task["id"]); rec_tbl.focus()
         rec_tbl.focus()
         await pilot.pause()
         n_calls = len(stubs.calls)
+        n_notes = len(notes)
+        before_bytes = data_file.read_bytes()
         await pilot.press("S")
         await pilot.pause()
-        check(not isinstance(app.screen, tracker.SyncSprintsModal),
-              "no reconcile preview for a recurrent task", type(app.screen).__name__)
-        check(len(stubs.calls) == n_calls, "and no GitHub call was made")
+
+        new_notes = [m for _, m in notes[n_notes:]]
+        check(not any("close-recurrent" in m or "new-recurrent" in m for m in new_notes),
+              "no longer points the user at the retired recurrent commands",
+              str(new_notes))
+        previewed = isinstance(app.screen, tracker.SyncSprintsModal)
+        check(previewed or any("in sync" in m for m in new_notes),
+              "recurrent task is reconciled: preview or 'already in sync'",
+              f"screen={type(app.screen).__name__} notes={new_notes}")
+        check(len(stubs.calls) == n_calls,
+              "and the dry-run preview made zero GitHub calls",
+              str([c[0] for c in stubs.calls[n_calls:]]))
+        if previewed:
+            await pilot.press("escape")
+            await pilot.pause()
+        check(data_file.read_bytes() == before_bytes,
+              "and wrote nothing to the data file")
 
         section("8. sync-sprints execution reconciles per sprint")
         select(main_tbl, multi["id"])

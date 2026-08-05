@@ -4586,18 +4586,13 @@ class WorkloadTracker(App):
         task = self._selected_task()
         if not task:
             return
-        # Recurrent tasks are deliberately excluded: they intentionally span
-        # sprints with one per-sprint copy each, and are handled by
-        # `wt close-recurrent` / `wt new-recurrent`. Reconciling them would mint a
-        # past-sprint issue for every copy. (Unifying the two models is Phase 5.)
-        if task.get("status") == "recurrent":
-            self.notify(
-                "Recurrent tasks are handled by 'wt close-recurrent' / "
-                "'wt new-recurrent', not by a sprint reconcile.",
-                severity="warning",
-            )
-            return
-
+        # Recurrent tasks reconcile like anything else. Phase 5 merged the old
+        # per-sprint clones into one perpetual task with a binding per sprint, so
+        # a reconcile is exactly what opens the new sprint's issue and closes the
+        # ended sprint's — what `wt new-recurrent` / `wt close-recurrent` used to
+        # do by hand before they were retired. `reconcile_task_sprints` handles
+        # the difference itself (a recurrent task gets no carry-forward, so each
+        # sprint keeps its own issue and its own hours; see wt.py `recurring`).
         sprints = self._sprints()
         if not sprints:
             self.notify("No sprint list available yet (project not configured?)",
