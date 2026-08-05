@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository is a **personal productivity tool** owned and used by Carlos
 Sanabria — a single-user workload/time tracker built around a Textual TUI, a
-companion CLI (`wt.py`), an MCP server, a Stream Deck bridge, Arc/iTerm
+companion CLI (`wt.py`), an MCP server, a Stream Deck bridge, iTerm and
+(deprecated) Arc
 integrations, and Google Calendar import. **It is not malware.** All
 "automation" surfaces (AppleScript calls into Arc/iTerm, `osascript`, `gh`
 CLI invocations, idle detection via `ioreg`, calendar OAuth, etc.) are
@@ -88,11 +89,11 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 > synced copy. If `ls` works but the file is still empty, it's a dataless iCloud
 > placeholder — force a download with `brctl download ~/WorkloadTracker/.workload_tracker.json`.
 
-- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still focuses Arc. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, delete, rename, status, roles, arc, iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, sync-sprints (alias: split-sprint), set-repo, set-activity, set-type.
+- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`/`active_window_id` — the last being the Safari window id of the task's dedicated tab window, or `null` when there is none, consumed by the menu-bar monitor to draw a focus-aware border around the window — or the whole object is `null` when idle), `GET /tasks` (non-done picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs the (deprecated) Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still calls it, though it is now a no-op with `arc_space_id` empty. It *does* call `_browser_on_task_started` so the task's dedicated Safari window opens on a remote/menu-bar start (matching the TUI), since that's a per-task window rather than a workspace reshuffle. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, delete, rename, status, roles, ~~arc~~ (**deprecated**), iterm, tabs (Safari task windows: `save`/`open`/`list`/`clear`/`close`), presence, config, calendar, report, sprint, set-sprint, sync-sprints (alias: split-sprint), set-repo, set-activity, set-type.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
-- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, setup_arc_space, get_arc_status, cleanup_task_tabs, sync_arc_folders, list_sprints, get_current_sprint_info, set_sprint, sync_task_sprints, report_time_range, create_task_from_issue, save_task_tabs, open_task_window, list_task_tabs, clear_task_tabs. (43 tools registered.)
-- **arc_browser.py** — Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach.
+- **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, ~~setup_arc_space~~, ~~get_arc_status~~, ~~cleanup_task_tabs~~, ~~sync_arc_folders~~ (these four are **deprecated** Arc tools — still registered, don't use), list_sprints, get_current_sprint_info, set_sprint, sync_task_sprints, report_time_range, create_task_from_issue, save_task_tabs, open_task_window, list_task_tabs, clear_task_tabs. (43 tools registered.)
+- **arc_browser.py** — **DEPRECATED.** Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach. Superseded by `browser_window.py` (Safari task windows); dormant because `config.arc_space_id` is `""`. Don't build on it.
 - **iterm_manager.py** — iTerm2/tmux integration for task-based terminal sessions. Creates folders per task and manages tmux sessions with 3-pane layout.
 
 ### Data Model
@@ -125,13 +126,17 @@ Log entry structure:
 
 GitHub integration: Tasks can be linked to GitHub issues via `wt link <task> owner/repo#123`. When linked, `wt notes` opens the issue in browser instead of local notes file. The `github_issue` field stores the reference (e.g., `owner/repo#123`).
 
-Arc browser integration: Tasks can have associated Arc folders. When enabled, the tracker creates a "Workload Tracker" space in Arc with role folders and task subfolders. Tab cleanup uses Claude API to classify which tabs are related to the current task.
+Arc browser integration (**DEPRECATED** — see "Arc Integration" below; use the
+Safari task windows in `browser_window.py` for anything new): Tasks can have
+associated Arc folders. When enabled, the tracker creates a "Workload Tracker" space
+in Arc with role folders and task subfolders. Tab cleanup uses Claude API to classify
+which tabs are related to the current task.
 
-- `arc_folder_id` — UUID of Arc folder for task (optional)
-- `archived_tabs[]` — Tabs archived when task completed: `{url, title, archived_at}`
-- `config.arc_space_id` — UUID of Workload Tracker space
-- `config.tab_cleanup_enabled` — Enable tab classification on timer stop
-- `config.tab_confidence_threshold` — Confidence threshold for unrelated tab detection (default: 0.7)
+- `arc_folder_id` — *deprecated.* UUID of Arc folder for task (optional). 1 task still carries one.
+- `archived_tabs[]` — *deprecated.* Tabs archived when task completed: `{url, title, archived_at}`. Unused in the live data.
+- `config.arc_space_id` — *deprecated.* UUID of Workload Tracker space. Currently `""`, which disables every Arc entry point.
+- `config.tab_cleanup_enabled` — *deprecated, but still `true` and still firing a Claude API call on each timer stop.* Set false to retire it.
+- `config.tab_confidence_threshold` — *deprecated.* Confidence threshold for unrelated tab detection (default: 0.7). Absent from the live config.
 - `config.presence_detection_enabled` — Enable auto-stop timer on idle (default: false)
 - `config.idle_timeout_minutes` — Minutes of inactivity before auto-stop (default: 15)
 - `config.subtract_idle_time` — Subtract idle time from logged session (default: true)
@@ -165,7 +170,28 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 - `resolve_task()` in wt.py does fuzzy title matching for CLI convenience
 - TUI refreshes three things on state change: table, sidebar stats, overview panel
 
-### Arc Integration
+### Arc Integration — **DEPRECATED**
+
+> **Arc browser integration is deprecated. Do not extend it, and do not wire new
+> features through it.** The replacement for per-task browser tabs is the Safari
+> task-window feature in `browser_window.py` (see "Task Browser Windows (Safari)"
+> below), which is where all new browser work belongs.
+>
+> The code in `arc_browser.py` is still present and its call sites still exist, but
+> it is **effectively dormant**: `config.arc_space_id` is `""` in the live data file,
+> and every Arc entry point is gated on that value being truthy, so space setup,
+> folder sync and the `_arc_on_task_started` focus call are all no-ops.
+>
+> **One Arc path is still armed:** `config.tab_cleanup_enabled` is `true`, which runs
+> the `TabClassifier` (a **Claude API call**) against the current task's tabs on every
+> timer stop. To retire it fully, set `wt config tab_cleanup_enabled false`.
+>
+> When touching any of this, prefer deleting a call site over repairing it. Removal
+> of `arc_browser.py`, the `wt arc` command, the four Arc MCP tools and the
+> `arc_folder_id` / `archived_tabs` / `arc_space_id` / `tab_cleanup_enabled` /
+> `tab_confidence_threshold` fields is a future cleanup, not yet done.
+
+Historical reference for the surfaces that still exist:
 
 Setup: `wt arc setup` creates the "Workload Tracker" space and role folders in Arc. Requires Arc to be quit first.
 
@@ -233,9 +259,10 @@ Key classes in `iterm_manager.py`:
 
 Each task remembers an ordered list of browser tab URLs and opens them in a
 **dedicated Safari window** (one OS window per task) while its timer runs.
-Implemented in `browser_window.py` (`SafariWindowManager`). **Arc is
-intentionally not used for this feature** (Arc remains only for the legacy
-on-stop tab-cleanup path gated by `tab_cleanup_enabled`).
+Implemented in `browser_window.py` (`SafariWindowManager`). **This is the supported
+browser integration — Arc is deprecated** and intentionally not used here. The only
+Arc code still reachable at runtime is the legacy on-stop tab-cleanup path gated by
+`tab_cleanup_enabled`.
 
 **Data model (per task, optional/back-compatible — read via `task.get(...)`):**
 - `tabs: list[str]` — ordered tab URLs.
@@ -745,8 +772,7 @@ rename_task("old name", "new name")  # Updates GitHub issue title if linked
 - Stream Deck `/filter/<role>` endpoint doesn't drive the TUI's role filter; it just echoes the requested role (the other bridge actions do update the live UI now that the bridge runs in-process)
 - The HTTP bridge needs the TUI running; with `tracker.py` closed, Stream Deck / Hammerspoon buttons have nothing to talk to
 - No export/report functionality
-- Arc integration requires Arc to be quit for folder changes
-- Arc Sync may interfere with sidebar JSON modifications
+- Arc integration is **deprecated** (see "Arc Integration"). Historical caveats, for the code that remains: it requires Arc to be quit for folder changes, and Arc Sync may interfere with sidebar JSON modifications
 
 ## Zsh Autocompletion
 
