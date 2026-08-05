@@ -96,12 +96,16 @@ Notes are stored in ~/.workload_tracker_notes/<task_id>.md
 Tasks linked to GitHub issues use the issue for notes instead.
 """
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -121,6 +125,210 @@ def _resolve_data_file() -> Path:
 
 DATA_FILE = _resolve_data_file()
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
+
+# ── Phase 0 of docs/plan-macos-app.md §3: atomic + mutually exclusive writes ──
+#
+# Three processes write this file today (CLI, TUI, MCP server) and a fourth is
+# coming (wt_daemon.py). Two problems, two mechanisms:
+#
+#   1. *Torn file* — a half-written JSON document. Fixed by ``_atomic_write_json``
+#      (temp file in the same directory, fsync, ``os.replace``), which is what
+#      makes every write all-or-nothing. A reader therefore always sees a
+#      complete document: either the old one or the new one, never a splice.
+#   2. *Lost update* — two writers each load, mutate, and save, and the later
+#      save discards the earlier writer's mutation. Fixed by ``data_lock()``,
+#      an advisory ``flock`` held across a whole read-modify-write.
+#
+# The lock lives in a **sidecar** file, never the data file itself: the data
+# file is replaced wholesale by ``os.replace``, so a lock held on its inode
+# would be silently abandoned on every save. And it is kept out of
+# ``~/Library/Mobile Documents`` — advisory locking on an iCloud-synced path is
+# unreliable, and iCloud would happily sync a lock file between Macs, which is
+# meaningless (the lock is per-machine by design).
+
+# How long to wait for the sidecar lock before giving up. Bounded on purpose:
+# the TUI's ``_tick()`` runs once a second and can reach save(), so an unbounded
+# ``LOCK_EX`` would let a stuck holder (say a ``wt done`` mid-way through a slow
+# ``gh`` round trip) freeze the UI indefinitely. Long enough to outlast any
+# normal save (a 209 KB write is sub-millisecond), short enough to never look
+# like a hang.
+DATA_LOCK_TIMEOUT_SECONDS = 5.0
+_DATA_LOCK_POLL_SECONDS = 0.02
+
+# Re-entrancy: ``data_lock()`` is re-entrant *within a process*.
+#
+# THIS IS THE CONTRACT PHASE 2 DEPENDS ON: a caller may hold ``data_lock()``
+# across a whole transaction and call ``save()`` inside it. ``save()`` takes the
+# same lock, the nested acquisition is counted rather than re-flocked, and the
+# ``flock`` is released only when the outermost block exits. There is no
+# separate ``_save_locked()`` to remember — ``save()`` is always the right call.
+#
+#   with wt.data_lock():          # daemon transaction
+#       data = wt.load()
+#       ...mutate...
+#       wt.save(data)             # re-enters, does not deadlock
+#
+# ``_DATA_LOCK_MUTEX`` is an RLock so the same thread re-enters freely while a
+# *different* thread still blocks (flock is per-open-file, so without this two
+# threads in one process would both hold their own fd and neither would be
+# excluded... and worse, the first to finish would unlock for both).
+_DATA_LOCK_MUTEX = threading.RLock()
+_DATA_LOCK_STATE = {"depth": 0, "fh": None}
+
+
+class DataLockTimeout(RuntimeError):
+    """Raised when ``data_lock()`` cannot acquire the sidecar lock in time."""
+
+
+def _resolve_lock_file(path=None) -> Path:
+    """Sidecar advisory-lock path for *path* (default: the current DATA_FILE).
+
+    For the real data file this is ``~/.workload_tracker.lock``. For a
+    ``WT_DATA_FILE`` copy it is a deterministic sibling (``<copy>.lock``), so a
+    test never contends with the live lock and two concurrent test runs against
+    different copies never contend with each other.
+
+    Note the deliberate lack of ``.resolve()``: ``~/.workload_tracker.json`` is
+    a symlink chain into iCloud Drive, and the lock must stay in ``$HOME``.
+    """
+    data = Path(path) if path is not None else Path(DATA_FILE)
+    if data == Path.home() / ".workload_tracker.json":
+        return Path.home() / ".workload_tracker.lock"
+    return data.with_name(data.name + ".lock")
+
+
+@contextlib.contextmanager
+def data_lock(path=None, timeout: float = None, required: bool = True):
+    """Hold the exclusive advisory lock guarding the data file.
+
+    Wrap a whole read-modify-write in it so no other process can interleave::
+
+        with data_lock():
+            data = load()
+            data["tasks"].append(...)
+            save(data)
+
+    Re-entrant within a process (see the module notes above), so the nested
+    ``save()`` is free.
+
+    *timeout* defaults to ``DATA_LOCK_TIMEOUT_SECONDS``. On expiry:
+
+    - ``required=True`` (the default, and what a daemon transaction wants):
+      raise ``DataLockTimeout``. Better to fail loudly than to silently run a
+      transaction unprotected.
+    - ``required=False`` (what ``save()`` uses): log a warning and proceed
+      *without* the lock. This degrades to the pre-Phase-0 behaviour — a lost
+      update is possible — but never to a torn file, because the write itself is
+      atomic regardless. Chosen so a stuck lock holder can never wedge the TUI's
+      1-second tick loop or drop a user's time entry on the floor.
+    """
+    if timeout is None:
+        timeout = DATA_LOCK_TIMEOUT_SECONDS
+    deadline = time.monotonic() + max(timeout, 0.0)
+
+    if not _DATA_LOCK_MUTEX.acquire(timeout=max(timeout, 0.001)):
+        if required:
+            raise DataLockTimeout(
+                f"another thread has held the data lock for >{timeout}s"
+            )
+        logging.warning("data_lock: thread contention timeout — proceeding unlocked")
+        yield False
+        return
+    try:
+        nested = _DATA_LOCK_STATE["depth"] > 0
+        fh = None
+        if not nested:
+            lock_path = _resolve_lock_file(path)
+            try:
+                fh = open(lock_path, "a+")
+            except OSError as exc:
+                if required:
+                    raise DataLockTimeout(f"cannot open lock file {lock_path}: {exc}")
+                logging.warning("data_lock: cannot open %s (%s) — proceeding unlocked",
+                                lock_path, exc)
+                yield False
+                return
+            # Poll LOCK_NB rather than block on LOCK_EX: flock has no timeout of
+            # its own, and SIGALRM is not usable from a non-main thread (the TUI
+            # bridge and Textual workers are threads).
+            got = False
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_DATA_LOCK_POLL_SECONDS)
+            if not got:
+                fh.close()
+                if required:
+                    raise DataLockTimeout(
+                        f"data lock {lock_path} still held after {timeout}s"
+                    )
+                logging.warning("data_lock: %s busy after %ss — proceeding unlocked",
+                                lock_path, timeout)
+                yield False
+                return
+            _DATA_LOCK_STATE["fh"] = fh
+        _DATA_LOCK_STATE["depth"] += 1
+        try:
+            yield True
+        finally:
+            _DATA_LOCK_STATE["depth"] -= 1
+            if _DATA_LOCK_STATE["depth"] == 0 and _DATA_LOCK_STATE["fh"] is not None:
+                held = _DATA_LOCK_STATE["fh"]
+                _DATA_LOCK_STATE["fh"] = None
+                try:
+                    fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+                finally:
+                    held.close()
+    finally:
+        _DATA_LOCK_MUTEX.release()
+
+
+def _atomic_write_json(target: Path, data: dict):
+    """Serialize *data* to *target* so a reader can never see a partial file.
+
+    Temp file in the **same directory** as the resolved target (so ``os.replace``
+    is a same-filesystem rename and therefore atomic), ``flush`` + ``fsync``
+    before the rename so a crash can't leave a rename pointing at unwritten
+    bytes, then ``os.replace``.
+
+    ``target`` is resolved through symlinks first, and that matters: the live
+    ``~/.workload_tracker.json`` is a symlink chain into iCloud Drive, and
+    ``os.replace`` does **not** follow symlinks — replacing the link path
+    directly would swap the symlink for a regular file and quietly detach the
+    data from iCloud sync on both Macs.
+
+    The payload is ``json.dumps(data, indent=2)`` verbatim, byte for byte as
+    before: the file is diffed by hand and synced by iCloud, so reformatting it
+    would produce a spurious whole-file change.
+    """
+    target = Path(target)
+    try:
+        real = target.resolve()
+    except OSError:
+        real = target
+    payload = json.dumps(data, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=real.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # mkstemp is 0600; keep whatever mode the file already had instead.
+        try:
+            os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(tmp, real)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
 
 DEFAULT_ROLES = [
     {"id": "demokit",   "label": "Managing DemoKit",  "color": "blue"},
@@ -176,8 +384,25 @@ def load() -> dict:
     return data
 
 
-def save(data: dict):
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+def save(data: dict, path=None):
+    """Persist *data*, atomically and under the sidecar lock.
+
+    The single write path for every front end — the CLI, ``tracker.save_data()``
+    and ``mcp_server.save()`` all end up here, so there is exactly one place
+    that knows how the file is written.
+
+    Safe to call while already holding ``data_lock()`` (it re-enters), which is
+    how a daemon wraps a whole read-modify-write. Optional *path* overrides the
+    target for callers that keep their own ``DATA_FILE`` binding (mcp_server,
+    tracker); it defaults to this module's.
+
+    ``required=False``: a save must not raise just because some other writer is
+    slow — the write is atomic either way, so the worst case is the old
+    lost-update behaviour rather than a lost time entry or a wedged TUI.
+    """
+    target = Path(path) if path is not None else DATA_FILE
+    with data_lock(target, required=False):
+        _atomic_write_json(target, data)
 
 
 def get_roles(data: dict) -> dict:

@@ -89,9 +89,15 @@ from wt import (
     # matches `wt sync-sprints`. Underscore-prefixed but the supported way to
     # describe a reconcile result (see wt.cmd_sync_sprints).
     _reconcile_plan_lines, _reconcile_outcome_lines,
+    # Phase 0 of docs/plan-macos-app.md §3: one atomic, locked write path shared
+    # by the CLI, the TUI and the MCP server. Never write DATA_FILE directly.
+    _resolve_data_file, data_lock,
 )
 
-DATA_FILE = Path.home() / ".workload_tracker.json"
+# Same ``WT_DATA_FILE`` override wt.py and mcp_server.py use, so the TUI can be
+# exercised against a throwaway copy — and, more importantly, so tracker's
+# DATA_FILE can never drift from the one wt.save() writes.
+DATA_FILE = _resolve_data_file()
 NOTES_DIR = Path.home() / ".workload_tracker_notes"
 
 # Port for the in-process HTTP bridge (Stream Deck / Hammerspoon / curl).
@@ -160,7 +166,10 @@ def load_data() -> dict:
     mutated = _migrate_shadows_to_bindings(data) or mutated
     mutated = _migrate_recurrent_series_to_bindings(data) or mutated
     if mutated:
-        DATA_FILE.write_text(json.dumps(data, indent=2))
+        # Delegate to wt.save() for the atomic + locked write. Deliberately not
+        # save_data() — that re-reads roles from disk and would resurrect the
+        # very role fields the migration just stripped.
+        wt_save(data, path=DATA_FILE)
     return data
 
 
@@ -171,18 +180,24 @@ def save_data(data: dict):
     # about, but in-memory mutations win for keys the TUI did touch (otherwise
     # things like calendar_event_mappings saved via the calendar modal would be
     # silently thrown away).
-    if DATA_FILE.exists():
-        try:
-            disk_data = json.loads(DATA_FILE.read_text())
-            if "roles" in disk_data:
-                data["roles"] = disk_data["roles"]
-            if "config" in disk_data:
-                merged = dict(disk_data["config"])
-                merged.update(data.get("config", {}))
-                data["config"] = merged
-        except Exception:
-            pass  # If we can't read, just save what we have
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+    #
+    # The re-read and the write are one read-modify-write, so they happen under a
+    # single data_lock() — otherwise a CLI save landing between them is exactly
+    # the update this merge exists to preserve, and it would be lost. wt.save()
+    # re-enters the lock rather than deadlocking on it (see wt.data_lock).
+    with data_lock(DATA_FILE, required=False):
+        if DATA_FILE.exists():
+            try:
+                disk_data = json.loads(DATA_FILE.read_text())
+                if "roles" in disk_data:
+                    data["roles"] = disk_data["roles"]
+                if "config" in disk_data:
+                    merged = dict(disk_data["config"])
+                    merged.update(data.get("config", {}))
+                    data["config"] = merged
+            except Exception:
+                pass  # If we can't read, just save what we have
+        wt_save(data, path=DATA_FILE)
 
 
 def get_roles(data: dict) -> list:

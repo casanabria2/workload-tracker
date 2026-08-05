@@ -41,6 +41,9 @@ from wt import (task_current_issue, set_task_current_issue, clear_task_current_i
                 reconcile_task_sprints, close_task)
 from wt import _reconcile_outcome_lines, _reconcile_plan_lines, _sprints_for_cli
 from wt import _resolve_data_file, fmt_mins as wt_fmt_mins
+# Phase 0 of docs/plan-macos-app.md §3: one atomic, locked write path shared by
+# the CLI, the TUI and this server. Never write DATA_FILE directly.
+from wt import save as wt_save, data_lock  # noqa: F401  (data_lock re-exported)
 from datetime import timedelta
 
 # Same ``WT_DATA_FILE`` override wt.py uses (Phase 0), so a refactor can be
@@ -97,7 +100,12 @@ def load() -> dict:
 
 
 def save(data: dict):
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+    """Persist *data* via wt.save() — atomic replace under the sidecar lock.
+
+    Same name and signature as before, so no caller changes; the duplicated
+    ``write_text`` it replaced was a second, unlocked write path.
+    """
+    wt_save(data, path=DATA_FILE)
 
 
 def get_roles(data: dict) -> dict:
