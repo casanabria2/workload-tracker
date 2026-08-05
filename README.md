@@ -9,9 +9,34 @@ workload_tracker/
 ├── tracker.py          — Full TUI (Textual), keyboard-driven; also hosts the HTTP bridge
 ├── wt.py               — CLI for quick terminal commands
 ├── mcp_server.py       — MCP server for Claude integration
+├── browser_window.py   — Safari per-task tab windows (the supported browser integration)
+├── iterm_manager.py    — iTerm2/tmux per-task terminal sessions
+├── idle_detector.py    — macOS idle detection for presence-based auto-stop
+├── arc_browser.py      — DEPRECATED Arc browser integration (see below)
 ├── _wt                 — Zsh completion script
 └── requirements.txt
 ```
+
+### Arc browser integration is deprecated
+
+`arc_browser.py`, the `wt arc` command and the four Arc MCP tools
+(`setup_arc_space`, `get_arc_status`, `cleanup_task_tabs`, `sync_arc_folders`) are
+**deprecated and should not be used or extended.** Per-task browser tabs are handled
+by `browser_window.py`, which opens a dedicated **Safari** window per task
+(`wt tabs save|open|list|clear|close`).
+
+The Arc code still ships, but it is dormant: every entry point is gated on
+`config.arc_space_id`, which is empty. The one exception is
+`config.tab_cleanup_enabled` — while true, stopping a timer still runs the Arc tab
+classifier, which makes a Claude API call. Turn it off with:
+
+```bash
+wt config tab_cleanup_enabled false
+```
+
+Removing the module, the CLI command, the MCP tools and the `arc_folder_id` /
+`archived_tabs` / `arc_space_id` / `tab_cleanup_enabled` / `tab_confidence_threshold`
+fields is a future cleanup.
 
 Data is stored at `~/.workload_tracker.json` — all three tools share the same file.
 Task notes are stored in `~/.workload_tracker_notes/<task_id>.md`.
@@ -113,16 +138,13 @@ wt log "DemoKit PR" 30
 # Update status
 wt done "DemoKit PR"
 
-# Close recurrent tasks (that have a GitHub issue) from a prior sprint
-wt close-recurrent                 # previous sprint only (default)
-wt close-recurrent --all-previous  # every earlier sprint
-wt close-recurrent --dry-run       # preview without making changes
-
-# Recreate the prior sprint's recurring tasks (open and closed) in the current
-# sprint, each with its own GitHub issue (sprint-suffixed titles get re-suffixed)
-wt new-recurrent                   # previous sprint only (default)
-wt new-recurrent --all-previous    # source every earlier sprint
-wt new-recurrent --dry-run         # preview without creating anything
+# Sprint rollover for recurring work.
+#   `wt close-recurrent` and `wt new-recurrent` are RETIRED and now hard-refuse.
+#   Recurring work is one perpetual task with a GitHub issue per sprint, so there
+#   are no per-sprint copies to close or recreate. Use sync-sprints instead:
+wt sync-sprints --all --dry-run        # preview across every non-recurrent task
+wt sync-sprints --all                  # sync hours + close ended sprints
+wt sync-sprints --all --create-issues  # ...and mint the new sprint's issues
 
 # Task notes (opens in $EDITOR or GitHub issue)
 wt notes "Banco Galicia"
@@ -178,7 +200,8 @@ In Stream Deck software, use **"Open URL"** action with these URLs:
 The timer toggle will:
 - **Start**: timer on the most recently added in-progress task
 - **Stop**: commit elapsed time as a log entry (identical to the TUI `t`-key
-  stop — same `"Timer session"` log note, GitHub hours sync, and Arc cleanup)
+  stop — same `"Timer session"` log note, GitHub hours sync, and the deprecated
+  Arc tab cleanup)
 
 ### API contract
 
@@ -251,7 +274,7 @@ Allows Claude (via Claude Code or Claude Desktop) to interact directly with task
 | `stop_timer` | Stop the running timer |
 | `log_time` | Log time manually to a task |
 | `set_task_status` | Change task status (todo/inprogress/done) |
-| `close_previous_recurrent_tasks` | Close recurrent tasks (with a GitHub issue) from the previous sprint, or all earlier sprints with `all_previous=True` |
+| ~~`close_previous_recurrent_tasks`~~ | **RETIRED** — hard-refuses. Recurring work is one perpetual task with an issue per sprint; use `sync_task_sprints` instead |
 | `delete_task` | Delete a task |
 | `get_status` | Get time summary by role |
 | `get_notes_path` | Get notes location (GitHub issue or local file path) |
