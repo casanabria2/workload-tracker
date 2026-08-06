@@ -797,6 +797,63 @@ harness at the live file — `cp ~/.workload_tracker.json /tmp/wt-work.json` and
 
 ---
 
+## 13.5 Follow-ups — after the plan is finished
+
+Deferred deliberately. None of these block a phase; all of them are things a
+future session would otherwise rediscover.
+
+### 1. Retire `active_window_id` from the API surface
+
+Its only consumer was the monitor's Safari border overlay, **removed 2026-08-06**
+(`workload-macos-monitor` `f803fb1`). Nothing reads it now.
+
+> ⚠️ **Do not delete the task-level field.** `task["active_window_id"]` is still
+> live: `browser_window.py` stores the Safari window id there while a task's
+> dedicated tab window is open, and `wt tabs` / the timer start-stop path depend
+> on it. Only the **`/status` payload field and its consumers** are dead. A
+> future session that greps for the name and deletes every hit will break the
+> Safari task-window feature.
+
+What to remove, in order:
+- `wt_daemon.py` `legacy_status_payload()` — stop emitting it.
+- `tracker.py` `_bridge_status()` — same, so the two stay byte-compatible.
+- `tools/test_legacy_contract.py` — drop `"active_window_id": ("number", False)`
+  from the expectation table and the assertions around it. **The two must change
+  together**: that test asserts daemon/bridge parity, so removing it from one
+  side alone turns a green suite red for the right reason but the wrong cause.
+- `workload-macos-monitor` `Models.swift` — drop `ActiveTimer.activeWindowID` and
+  its `CodingKey`, plus the `DecodingTests` cases covering it.
+- `CLAUDE.md` (both repos) — the contract docs describing it.
+
+Kept deliberately until then: the monitor still *decodes* the field, because both
+servers still send it and decoding a field you ignore is free, while failing on a
+payload the server still emits is not.
+
+### 2. Collapse the daemon's `_guarded_load()`
+
+`wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
+`wt.py` fix in `9daf5a1`, which moved the same guard into `load()` itself, so
+there are now two guards for one hazard. Collapse to the `wt.py` one and keep the
+daemon's HTTP mapping (`data_unreadable` → 503). Verify `test_daemon.py`'s
+unreadable-file section still fails for the right reason afterwards.
+
+### 3. A committed old-vs-new differential harness
+
+Phase 1 ran a differential of `git show HEAD:mcp_server.py` against the refactored
+one — 94 read-only probes, byte-identical results — but it was a throwaway script
+and was never committed, so it cannot be re-run. It becomes more valuable, not
+less, now that `wt_api` has multiple consumers: it is the cheapest way to prove a
+refactor is behaviour-preserving without hand-writing per-tool assertions.
+
+### 4. Teach `tracker.py` to use the daemon
+
+The TUI still holds the whole dataset in memory and saves wholesale, so it can
+clobber daemon writes (risk #1). Phase 0's lock cannot fix that. Making the TUI a
+daemon client retires the risk entirely, and would let the daemon stop being
+"the thing that runs when the TUI isn't".
+
+---
+
 ## 14. Explicitly out of scope
 
 - Rewriting or retiring `tracker.py`. It keeps working, unchanged, on :7373. Once
