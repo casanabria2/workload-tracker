@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for wt_daemon.py — keeps the tracker's HTTP + SSE API up at login,
+  so the menu-bar monitor works with tracker.py closed.
+
+  Install (see launchd/README.md for the full story, including Full Disk Access):
+
+      sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+          launchd/com.carlossanabria.wtdaemon.plist \
+          > ~/Library/LaunchAgents/com.carlossanabria.wtdaemon.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.carlossanabria.wtdaemon.plist
+
+  __REPO__ and __HOME__ are substituted at install time rather than hardcoded,
+  so the second Mac can check the repo out anywhere. plists do not expand ~ or
+  environment variables in paths, which is why this needs the sed step.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.carlossanabria.wtdaemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/venv/bin/python</string>
+        <string>__REPO__/wt_daemon.py</string>
+        <string>--legacy-port</string>
+        <string>7375</string>
+        <string>--log-level</string>
+        <string>info</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Restart on a crash, but NOT on a clean exit. wt_daemon exits 0 when it
+      finds another daemon already answering on the port (plan §5.5: "a daemon
+      IS running" is the desired end state). With a bare KeepAlive=true that
+      clean exit would be respawned forever in a throttled loop.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!--
+      launchd hands a process a minimal PATH that does NOT include Homebrew, and
+      the daemon shells out to `gh` for every GitHub operation. Without this,
+      reads work and every issue/hours sync fails with "gh not found".
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/wt-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/wt-daemon.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
