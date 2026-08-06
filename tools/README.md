@@ -303,6 +303,34 @@ reader, and that `tracker.py`/`mcp_server.py` delegate to `wt.save()`. Takes
 `<source.json> <scratch-dir> <workers>`. This one is the control: if it fails,
 suspect the environment, not the change.
 
+### `test_load_safety.py` — `wt.load()` must not destroy the data file
+
+Takes `<data.json> <scratch-dir>` (two args, not four):
+
+```bash
+WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_load_safety.py \
+    /tmp/wt-test/work.json /tmp/wt-test/s-load
+```
+
+`load()` is a read-modify-**write** — four migrations plus a `save()` when any
+mutates — so its old `except Exception: data = {}` fallback *persisted* that
+emptiness. Phase 0 made it worse: `write_text()` needed permission on the file
+(so a mode-000 file raised and survived), while `os.replace()` needs permission
+on the *directory*, so it succeeded and turned 210 KB of history into a
+520-byte stub wearing the original mode.
+
+Covers: a healthy file still loads and isn't rewritten; an unreadable file
+raises `DataFileUnreadable` with every byte intact; a corrupt file keeps its
+bytes so it can be repaired by hand; a genuinely missing file is still a fresh
+install; `save()` raises `RefusingToEmptyDataFile` rather than writing 0 tasks
+over a populated file, while honouring `allow_empty=True` and first-write; an
+unwritable *directory* fails without half-writing; and the Phase 0 symlink
+invariant still holds.
+
+Does **not** cover real TCC/Full-Disk-Access denial — section 6 approximates it
+with directory permissions, which is the same syscall shape but not the same
+mechanism.
+
 ### Helpers, not tests
 
 * `baseline.py <data.json> <out.json>` — Phase-0 snapshot.

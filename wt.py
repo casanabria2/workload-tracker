@@ -353,13 +353,62 @@ def uid() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S") + "".join(random.choices(string.ascii_lowercase, k=4))
 
 
+class DataFileUnreadable(Exception):
+    """The data file exists but could not be read or parsed.
+
+    Raised instead of quietly returning an empty dataset. ``load()`` is a
+    read-modify-*write* (the migrations below call ``save()``), so "pretend it
+    was empty" meant **persisting** that emptiness over the real file. Since
+    Phase 0 the write is an ``os.replace()``, which needs permission on the
+    *directory* rather than the file, so even a mode-000 file was replaced —
+    210 KB of history became a 520-byte stub wearing the original mode.
+
+    The realistic trigger is the documented second-Mac case: the file is there
+    but this process cannot read it (Full Disk Access / TCC), or iCloud left a
+    dataless placeholder. That is precisely when the data must be left alone.
+    Callers that legitimately tolerate a missing dataset should catch this.
+    """
+
+    def __init__(self, path, reason: str):
+        self.path = path
+        self.reason = reason
+        super().__init__(
+            f"Cannot read {path}: {reason}. Refusing to continue, because "
+            f"treating it as empty would overwrite it. If this is the second "
+            f"Mac, grant Full Disk Access to the terminal app; if iCloud left "
+            f"a placeholder, run: brctl download {path}"
+        )
+
+
+class RefusingToEmptyDataFile(Exception):
+    """A save would have replaced a populated data file with an empty one.
+
+    Defence in depth behind :class:`DataFileUnreadable`: even if some other
+    path constructs a task-less document, it must not silently land on top of
+    real history. Pass ``allow_empty=True`` to mean it.
+    """
+
+
 def load() -> dict:
     if DATA_FILE.exists():
+        # Read and parse before touching anything. A failure here must abort:
+        # the migrations below write, so falling back to {} would persist it.
         try:
-            data = json.loads(DATA_FILE.read_text())
-        except Exception:
-            data = {}
+            raw = DATA_FILE.read_text()
+        except OSError as exc:
+            raise DataFileUnreadable(DATA_FILE, f"{type(exc).__name__}: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            # Keep the bytes: a truncated or conflicted file is often
+            # recoverable by hand, and it is the only evidence of what went
+            # wrong. Overwriting it with defaults destroys both.
+            raise DataFileUnreadable(DATA_FILE, f"invalid JSON ({exc})") from exc
+        if not isinstance(data, dict):
+            raise DataFileUnreadable(DATA_FILE, f"expected an object, got {type(data).__name__}")
     else:
+        # Genuinely absent — a fresh install. Defaults are correct here, and
+        # nothing is at risk of being overwritten.
         data = {}
     # Ensure required keys exist
     data.setdefault("tasks", [])
@@ -384,7 +433,7 @@ def load() -> dict:
     return data
 
 
-def save(data: dict, path=None):
+def save(data: dict, path=None, *, allow_empty: bool = False):
     """Persist *data*, atomically and under the sidecar lock.
 
     The single write path for every front end — the CLI, ``tracker.save_data()``
@@ -399,9 +448,32 @@ def save(data: dict, path=None):
     ``required=False``: a save must not raise just because some other writer is
     slow — the write is atomic either way, so the worst case is the old
     lost-update behaviour rather than a lost time entry or a wedged TUI.
+
+    Refuses to replace a **populated** file with a task-less document and
+    raises :class:`RefusingToEmptyDataFile`. That is never a legitimate
+    incremental edit, and it is the shape every known data-loss path converges
+    on. Pass ``allow_empty=True`` to mean it (deleting the last task, or a
+    genuinely fresh install). Creating a new file, or writing over one that is
+    already empty, is unaffected.
     """
     target = Path(path) if path is not None else DATA_FILE
     with data_lock(target, required=False):
+        if not allow_empty and not data.get("tasks") and target.exists():
+            # A target that does not exist yet cannot be destroyed — creating
+            # the file on a fresh install is the one legitimate empty write.
+            try:
+                existing = json.loads(target.read_text())
+                had_tasks = len(existing.get("tasks", []))
+            except (OSError, ValueError):
+                # Unreadable or corrupt: we cannot prove it was empty, so we
+                # must not assume it was. Treat it as populated and refuse.
+                had_tasks = -1
+            if had_tasks != 0:
+                raise RefusingToEmptyDataFile(
+                    f"Refusing to write 0 tasks over {target}, which currently has "
+                    f"{'an unreadable number of' if had_tasks < 0 else had_tasks} tasks. "
+                    f"Pass allow_empty=True if this is intended."
+                )
         _atomic_write_json(target, data)
 
 
@@ -7297,7 +7369,17 @@ def main():
         print(c(f"Unknown command: {cmd}", "red"))
         print("Commands: " + ", ".join(sorted(set(COMMANDS.keys()))))
         sys.exit(1)
-    COMMANDS[cmd](args[1:])
+    try:
+        COMMANDS[cmd](args[1:])
+    except DataFileUnreadable as exc:
+        # The one failure worth catching here: on the second Mac this is the
+        # Full Disk Access case, and a bare traceback buries the one line that
+        # says what to do about it.
+        print(c(f"\n  {exc}\n", "red"))
+        sys.exit(2)
+    except RefusingToEmptyDataFile as exc:
+        print(c(f"\n  {exc}\n", "red"))
+        sys.exit(2)
 
 
 if __name__ == "__main__":
