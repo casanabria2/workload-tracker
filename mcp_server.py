@@ -41,10 +41,29 @@ from wt import (task_current_issue, set_task_current_issue, clear_task_current_i
                 reconcile_task_sprints, close_task)
 from wt import _reconcile_outcome_lines, _reconcile_plan_lines, _sprints_for_cli
 from wt import _resolve_data_file, fmt_mins as wt_fmt_mins
+# Several of the names above are no longer called here — Phase 1 moved their
+# callers into wt_api — but they are deliberately still imported. Two reasons,
+# both load-bearing:
+#   * tools/test_mcp_phase3.py §1 asserts that the sprint-binding accessors are
+#     bound on this module (and that the pre-Phase-3 shims are not);
+#   * McpStubs monkeypatches mcp_server.get_all_sprints / get_current_sprint /
+#     delete_github_issue / sync_project_status by name to keep the harness
+#     offline. Dropping the import would silently un-stub them.
+# Do not "tidy" them away without updating that harness first.
 # Phase 0 of docs/plan-macos-app.md §3: one atomic, locked write path shared by
 # the CLI, the TUI and this server. Never write DATA_FILE directly.
 from wt import save as wt_save, data_lock  # noqa: F401  (data_lock re-exported)
 from datetime import timedelta
+# Phase 1 of docs/plan-macos-app.md §4: the dict-returning command layer. The
+# tools below *format* wt_api results instead of reimplementing the assembly and
+# validation; wt_api is the same layer Phase 2's daemon and the Swift client use.
+#
+# Only the tools tools/test_mcp_phase3.py actually exercises were moved onto it —
+# see the scope block at the top of wt_api.py for the exact split. Everything
+# else (Arc, iTerm, tabs, calendar, roles, logs, reporting) stays on its current
+# code path until it has regression coverage.
+import wt_api
+from wt_api import WtError
 
 # Same ``WT_DATA_FILE`` override wt.py uses (Phase 0), so a refactor can be
 # exercised against a throwaway copy instead of the live, iCloud-synced file.
@@ -187,6 +206,18 @@ def gh_issue_args(issue_ref: str) -> list[str]:
     return [issue_ref]
 
 
+# ── wt_api glue ────────────────────────────────────────────────────────────
+#
+# wt_api distinguishes "no such task" from "that substring matched several", but
+# every MCP tool has always collapsed both into one message (mcp_server's own
+# resolve_task returns None on an ambiguous match). Keep that contract.
+_NO_TASK = ("task_not_found", "ambiguous_task")
+
+
+def _no_task(task_query: str) -> str:
+    return f"No task found matching '{task_query}'"
+
+
 @mcp.tool()
 def add_task(
     title: str,
@@ -214,60 +245,22 @@ def add_task(
         type: Optional GitHub Project Type field value for this task.
     """
     data = load()
-    roles = get_roles(data)
+    try:
+        res = wt_api.create_task(
+            data, title=title, role=role, status=status, description=description,
+            github_issue=github_issue, sprint=sprint, github_repo=github_repo,
+            activity=activity, type=type)
+    except WtError as e:
+        if e.code == "sprint_not_found":
+            return (f"Error: Sprint '{sprint}' not found. "
+                    f"Use list_sprints() to see available sprints.")
+        return f"Error: {e.message}"
 
-    if role not in roles:
-        return f"Error: Invalid role '{role}'. Available: {', '.join(roles.keys())}"
-    if status not in STATUS_LABELS:
-        return f"Error: Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
-    if github_repo and ("/" not in github_repo or github_repo.count("/") != 1):
-        return "Error: github_repo must be in owner/repo format"
-    cached_options = get_cached_project_options(data)
-    if activity and cached_options.get("activity") and activity not in cached_options["activity"]:
-        return f"Error: Unknown activity '{activity}'. Available: {', '.join(cached_options['activity'])}"
-    if type and cached_options.get("type") and type not in cached_options["type"]:
-        return f"Error: Unknown type '{type}'. Available: {', '.join(cached_options['type'])}"
-
-    task = {
-        "id": uid(),
-        "title": title,
-        "description": description,
-        "role_id": role,
-        "status": status,
-        "logs": [],
-        "created_at": time.time(),
-    }
-    if github_repo:
-        task["github_repo"] = github_repo
-    if activity:
-        task["activity"] = activity
-    if type:
-        task["type"] = type
-
-    # Sprint assignment
-    if sprint and sprint.lower() != "none":
-        all_sprints = get_all_sprints(data)
-        match = _match_sprint(all_sprints, sprint)
-        if match:
-            task["sprint"] = match["title"]
-            task["sprint_id"] = match["id"]
-        else:
-            return f"Error: Sprint '{sprint}' not found. Use list_sprints() to see available sprints."
-    elif sprint.lower() != "none" if sprint else True:
-        current = get_current_sprint(data)
-        if current:
-            task["sprint"] = current["title"]
-            task["sprint_id"] = current["id"]
-
-    # Record the link as a binding as well (after the sprint assignment, so the
-    # binding lands on the right sprint). Also rewrites the legacy github_issue key.
-    if github_issue:
-        set_task_current_issue(task, github_issue, data)
-
-    data["tasks"].insert(0, task)
     save(data)
+    task = res["task"]
     sprint_info = f" [{task.get('sprint', 'no sprint')}]" if task.get("sprint") else ""
-    result = f"Created task '{title}' (id: {task['id']}) [{roles[role]}] [{STATUS_LABELS[status]}]{sprint_info}"
+    result = (f"Created task '{title}' (id: {task['id']}) [{res['role_label']}] "
+              f"[{res['status_label']}]{sprint_info}")
     if github_issue:
         result += f" [GitHub: {github_issue}]"
     return result
@@ -284,35 +277,23 @@ def list_tasks(role: str | None = None, status: str | None = None, include_done:
         status: Filter by status (todo, inprogress, recurrent, done)
         include_done: Include done tasks in the list (default: False)
     """
-    data = load()
-    tasks = data.get("tasks", [])
-    at = data.get("active_timer")
-    roles = get_roles(data)
-
     # No shadow-task filter any more: cross-sprint work lives in the task's own
     # ``sprint_issues`` bindings, so there is nothing hidden to exclude (plan
     # §1.1). ``load()`` strips any shadow an older wt.py might reintroduce.
-    if role:
-        tasks = [t for t in tasks if t.get("role_id") == role]
-    if status:
-        tasks = [t for t in tasks if t.get("status") == status]
-    elif not include_done:
-        # Hide done tasks by default unless explicitly filtering by status or include_done
-        tasks = [t for t in tasks if t.get("status") != "done"]
-
-    if not tasks:
+    data = load()
+    rows = wt_api.list_tasks(data, role=role, status=status,
+                             include_done=include_done)
+    if not rows:
         return "No tasks found."
 
     lines = []
-    for task in tasks:
-        running = at and at.get("task_id") == task["id"]
-        logged = task_logged_mins(task) + task_live_mins(task, at)
-        timer_icon = "▶ " if running else ""
-        sprint_str = f" | Sprint: {task['sprint']}" if task.get("sprint") else ""
+    for r in rows:
+        timer_icon = "▶ " if r["running"] else ""
+        sprint_str = f" | Sprint: {r['sprint']}" if r.get("sprint") else ""
         lines.append(
-            f"{timer_icon}{task['title']}\n"
-            f"  ID: {task['id']} | Role: {roles.get(task['role_id'], task['role_id'])} | "
-            f"Status: {STATUS_LABELS.get(task['status'], task['status'])} | Time: {fmt_mins(logged)}{sprint_str}"
+            f"{timer_icon}{r['title']}\n"
+            f"  ID: {r['id']} | Role: {r['role_label']} | "
+            f"Status: {r['status_label']} | Time: {fmt_mins(r['total_mins'])}{sprint_str}"
         )
 
     return "\n\n".join(lines)
@@ -331,44 +312,37 @@ def get_task(task_query: str) -> str:
         task_query: Task ID or partial title to search for
     """
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
-
-    at = data.get("active_timer")
-    roles = get_roles(data)
-    logged = task_logged_mins(task) + task_live_mins(task, at)
-    running = at and at.get("task_id") == task["id"]
-
     # Offline sprint list: get_task is a read-only lookup and must not depend on
-    # the network. Bindings carry their own sprint titles, so the cache is only
-    # needed to order them and to derive an unfrozen start sprint.
-    sprints = get_cached_sprints(data)
-    start = task_start_sprint(task, sprints)
-    start_label = task.get("start_sprint") or (start["title"] if start else None)
+    # the network. wt_api.task_detail defaults to config.sprints_cache; bindings
+    # carry their own sprint titles, so the cache is only needed to order them
+    # and to derive an unfrozen start sprint.
+    try:
+        d = wt_api.task_detail(data, task_query)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return f"Error: {e.message}"
 
     lines = [
-        f"Title: {task['title']}",
-        f"ID: {task['id']}",
-        f"Role: {roles.get(task['role_id'], task['role_id'])}",
-        f"Sprint: {task.get('sprint') or '(none)'}",
-        f"Start sprint: {start_label or '(unknown)'}",
-        f"Status: {STATUS_LABELS.get(task['status'], task['status'])}",
-        f"Time logged: {fmt_mins(logged)}",
-        f"Timer running: {'Yes' if running else 'No'}",
-        f"GitHub Issue: {task_current_issue(task, data) or '(none)'}",
-        f"GitHub Repo: {task.get('github_repo') or '(none)'}",
-        f"Activity: {task.get('activity') or '(none)'}",
-        f"Type: {task.get('type') or '(none)'}",
-        f"Description: {task.get('description') or '(none)'}",
+        f"Title: {d['title']}",
+        f"ID: {d['id']}",
+        f"Role: {d['role_label']}",
+        f"Sprint: {d['legacy_sprint'] or '(none)'}",
+        f"Start sprint: {d['start_sprint_label'] or '(unknown)'}",
+        f"Status: {d['status_label']}",
+        f"Time logged: {fmt_mins(d['logged_mins'] + d['live_mins'])}",
+        f"Timer running: {'Yes' if d['running'] else 'No'}",
+        f"GitHub Issue: {d['current_issue'] or '(none)'}",
+        f"GitHub Repo: {d['github_repo'] or '(none)'}",
+        f"Activity: {d['activity'] or '(none)'}",
+        f"Type: {d['type'] or '(none)'}",
+        f"Description: {d['description'] or '(none)'}",
     ]
 
-    bindings = task_sprint_bindings(task, sprints)
-    if bindings:
-        current = current_binding(task, data)
-        lines.append(f"\nSprint issues ({len(bindings)}):")
-        for b in bindings:
-            marker = " ← current" if current is not None and b is current else ""
+    if d["bindings"]:
+        lines.append(f"\nSprint issues ({len(d['bindings'])}):")
+        for b in d["bindings"]:
+            marker = " ← current" if b["current"] else ""
             hours = b.get("hours_synced")
             hours_str = f"{hours}h" if hours is not None else "hours not synced"
             lines.append(
@@ -377,16 +351,14 @@ def get_task(task_query: str) -> str:
                 f"{hours_str}]{marker}"
             )
 
-    if sprints:
-        per_sprint = task_sprints_with_time(task, sprints)
-        if per_sprint:
-            lines.append("\nLogged time by sprint:")
-            for e in per_sprint:
-                lines.append(f"  {e['sprint_title']:<12} {fmt_mins(e['total_mins'])}")
+    if d["sprints_with_time"]:
+        lines.append("\nLogged time by sprint:")
+        for e in d["sprints_with_time"]:
+            lines.append(f"  {e['sprint_title']:<12} {fmt_mins(e['total_mins'])}")
 
-    if task.get("logs"):
+    if d["logs"]:
         lines.append("\nTime logs:")
-        for log in reversed(task["logs"][-5:]):  # Last 5 logs
+        for log in reversed(d["logs"][-5:]):  # Last 5 logs
             dt = datetime.fromtimestamp(log.get("at", 0)).strftime("%Y-%m-%d %H:%M")
             lines.append(f"  {fmt_mins(log['minutes'])} - {log.get('note', '')} [{dt}]")
 
@@ -951,82 +923,66 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
     if status not in STATUS_LABELS:
         return f"Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
 
-    old_status = task.get("status", "todo")
+    try:
+        res = wt_api.set_status(data, task["id"], status,
+                                create_issue=create_issue, save_callback=save)
+    except WtError as e:
+        return f"Error: {e.message}"
 
-    # Special handling for closing tasks (transitioning to "done")
-    if status == "done" and old_status != "done":
-        return _close_task_mcp(task, data, create_issue)
+    # Transitioning to "done" runs the full close workflow.
+    if res["closed"]:
+        return _render_close(res, create_issue)
 
-    task["status"] = status
-    save(data)
-
-    # Sync status to GitHub project if task has a linked issue
-    result_msg = f"Changed '{task['title']}' from {STATUS_LABELS[old_status]} to {STATUS_LABELS[status]}"
-    issue_ref = task_current_issue(task, data)
-    if issue_ref:
-        if sync_project_status(issue_ref, status, data):
-            result_msg += f" (project synced)"
-
+    result_msg = (f"Changed '{task['title']}' from {res['old_status_label']} "
+                  f"to {res['status_label']}")
+    if res["project_synced"]:
+        result_msg += " (project synced)"
     return result_msg
 
 
-def _close_task_mcp(task: dict, data: dict, create_issue: bool) -> str:
-    """Close a task through the shared :func:`wt.close_task` workflow.
+def _render_close(result: dict, create_issue: bool) -> str:
+    """Render a :func:`wt_api.close` result.
 
-    Phase 3: this used to be a hand-rolled reimplementation that shelled out to
-    ``gh`` directly and reported ``round(total_minutes / 60)`` hours — the task's
-    *whole* total, which double-counts cross-sprint work whose earlier sprints are
-    already billed on their own issues. It now delegates to ``wt.close_task``, so
-    the MCP close does exactly what ``wt done`` and the TUI's ``D`` do:
+    The workflow itself lives in ``wt_api.close`` -> ``wt.close_task``, so the MCP
+    close does exactly what ``wt done`` and the TUI's ``D`` do: reconcile the
+    per-sprint bindings first (so each past sprint's hours land on that sprint's
+    own issue), report the *current binding's* sprint hours rather than the task
+    total, set Status/Activity/Type/Sprint on the project item, and close only
+    the current binding's issue.
 
-      * reconciles the task's per-sprint bindings first, so each past sprint's
-        hours land on that sprint's own issue (plan §2.3/§2.4 Option A);
-      * reports the *current binding's* sprint hours via
-        ``task_reportable_mins``, rounded to quarter hours;
-      * sets Status/Activity/Type/Sprint on the project item and closes only the
-        current binding's issue.
-
-    ``create_issue`` is wired to ``close_task``'s ``prompt_callback``: False makes
-    the workflow refuse rather than mint an issue (``close_task`` with no callback
-    creates one unconditionally, which is *not* what create_issue=False means).
+    ``create_issue`` only affects the wording of the refusal — ``wt_api.close``
+    has already wired it to ``close_task``'s ``prompt_callback``, where False
+    means "refuse" rather than "mint one anyway".
     """
-    repo = get_task_repo(task)
-
-    result = close_task(
-        task, data, save,
-        prompt_callback=lambda _msg: bool(create_issue),
-    )
+    title = result["title"]
 
     if not result["success"]:
         error = result.get("error") or "unknown error"
         if not create_issue and "must have GitHub issue" in error:
             return (
-                f"Error: Task '{task['title']}' has no GitHub issue linked.\n"
-                f"This task has a repo configured ({repo}), so closing requires an issue.\n"
+                f"Error: Task '{title}' has no GitHub issue linked.\n"
+                f"This task has a repo configured ({result.get('repo')}), so closing requires an issue.\n"
                 f"Either:\n"
-                f"  - Link an existing issue: link_github_issue('{task['title']}', 'owner/repo#123')\n"
-                f"  - Create one: set_task_status('{task['title']}', 'done', create_issue=True)"
+                f"  - Link an existing issue: link_github_issue('{title}', 'owner/repo#123')\n"
+                f"  - Create one: set_task_status('{title}', 'done', create_issue=True)"
             )
-        return f"Error closing '{task['title']}': {error}"
+        return f"Error closing '{title}': {error}"
 
     if result.get("skipped_github"):
-        return f"Closed '{task['title']}' (task has no repo — no GitHub integration)"
+        return f"Closed '{title}' (task has no repo — no GitHub integration)"
 
-    issue_ref = task_current_issue(task, data)
-    lines = [f"Closed '{task['title']}'"]
+    issue_ref = result["current_issue"]
+    lines = [f"Closed '{title}'"]
     if result.get("issue_created"):
         lines.append(f"  Created issue: {issue_ref}")
 
     # Per-sprint reconcile detail (issues minted/carried forward/closed for the
     # sprints this task spanned). Rendered by wt so the wording matches `wt done`.
-    rec = result.get("reconcile_result")
-    if rec:
-        for line in _reconcile_outcome_lines(rec):
-            lines.append(f"  {line}")
+    for line in result.get("outcome_lines") or []:
+        lines.append(f"  {line}")
 
     if result.get("project_updated"):
-        binding = current_binding(task, data)
-        hours = binding.get("hours_synced") if binding else None
+        hours = result.get("hours_synced")
         lines.append("  Added to project"
                      + (f" (Hours: {hours})" if hours is not None else ""))
     if result.get("issue_closed"):
@@ -1106,30 +1062,27 @@ def delete_task(task_query: str) -> str:
     Args:
         task_query: Task ID or partial title
     """
-    data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
-
-    issue_ref = task_current_issue(task, data)
     # Past-sprint bindings are separate, already-closed issues. Deleting them is
-    # not what delete_task ever did (they used to hang off shadow tasks), so name
-    # them instead of silently orphaning them.
-    other_issues = [r for r in task_issue_refs(task) if r != issue_ref]
-    data["tasks"] = [t for t in data["tasks"] if t["id"] != task["id"]]
-    if (data.get("active_timer") or {}).get("task_id") == task["id"]:
-        data["active_timer"] = None
-    save(data)
+    # not what delete_task ever did (they used to hang off shadow tasks), so
+    # wt_api names them instead of silently orphaning them.
+    data = load()
+    try:
+        res = wt_api.delete_task(data, task_query, save_callback=save)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return f"Error: {e.message}"
 
-    result = f"Deleted task '{task['title']}'"
-    if issue_ref:
-        if delete_github_issue(issue_ref):
-            result += f"\nDeleted GitHub issue: {issue_ref}"
+    result = f"Deleted task '{res['title']}'"
+    if res["issue"]:
+        if res["issue_deleted"]:
+            result += f"\nDeleted GitHub issue: {res['issue']}"
         else:
-            result += f"\nWarning: Failed to delete GitHub issue {issue_ref} (may need admin permissions)"
-    if other_issues:
-        result += (f"\nNote: {len(other_issues)} past-sprint issue(s) left in place: "
-                   + ", ".join(other_issues))
+            result += (f"\nWarning: Failed to delete GitHub issue {res['issue']} "
+                       f"(may need admin permissions)")
+    if res["other_issues"]:
+        result += (f"\nNote: {len(res['other_issues'])} past-sprint issue(s) "
+                   f"left in place: " + ", ".join(res["other_issues"]))
     return result
 
 
@@ -1141,32 +1094,24 @@ def rename_task(task_query: str, new_title: str) -> str:
         task_query: Task ID or partial title
         new_title: The new title for the task
     """
-    import subprocess
-
+    # wt_api.rename_task also retitles the *current* binding's GitHub issue.
+    # Past-sprint issues keep their " (Sprint N)" titles — renaming those is not
+    # this tool's job (and would need the suffix re-applied per binding).
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
+    try:
+        res = wt_api.rename_task(data, task_query, new_title, save_callback=save)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return f"Error: {e.message}"
 
-    old_title = task["title"]
-    task["title"] = new_title
-    save(data)
-
-    result_lines = [f"Renamed '{old_title}' → '{new_title}'"]
-
-    # Update the current binding's GitHub issue title if present. Past-sprint
-    # issues keep their " (Sprint N)" titles — renaming those is not this tool's
-    # job (and would need the suffix re-applied per binding).
-    issue_ref = task_current_issue(task, data)
-    if issue_ref:
-        gh_result = subprocess.run(
-            ["gh", "issue", "edit", *gh_issue_args(issue_ref), "--title", new_title],
-            capture_output=True, text=True
-        )
-        if gh_result.returncode == 0:
-            result_lines.append(f"Updated GitHub issue: {issue_ref}")
+    result_lines = [f"Renamed '{res['old_title']}' → '{res['new_title']}'"]
+    if res["issue"]:
+        if res["issue_updated"]:
+            result_lines.append(f"Updated GitHub issue: {res['issue']}")
         else:
-            result_lines.append(f"Warning: Failed to update GitHub issue title: {gh_result.stderr}")
+            result_lines.append("Warning: Failed to update GitHub issue title: "
+                                f"{res['issue_error']}")
 
     return "\n".join(result_lines)
 
@@ -1175,28 +1120,20 @@ def rename_task(task_query: str, new_title: str) -> str:
 def get_status() -> str:
     """Get an overview of time logged by role and any running timer."""
     data = load()
-    tasks = data.get("tasks", [])
-    at = data.get("active_timer")
-    roles = get_roles(data)
+    ov = wt_api.status_overview(data)
 
-    by_role: dict[str, float] = {role_id: 0.0 for role_id in roles}
-    for task in tasks:
-        rid = task.get("role_id", "other")
-        by_role[rid] = by_role.get(rid, 0) + task_logged_mins(task) + task_live_mins(task, at)
+    lines = [f"Workload Tracker — {ov['n_tasks']} tasks — "
+             f"{fmt_mins(ov['total_mins'])} total\n"]
 
-    total = sum(by_role.values())
-    lines = [f"Workload Tracker — {len(tasks)} tasks — {fmt_mins(total)} total\n"]
-
-    for role_id, label in roles.items():
-        mins = by_role.get(role_id, 0)
-        pct = round(mins / total * 100) if total else 0
+    for entry in ov["by_role"]:
+        pct = entry["pct"]
         bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-        lines.append(f"{label:<25} {bar} {pct:>3}%  {fmt_mins(mins)}")
+        lines.append(f"{entry['label']:<25} {bar} {pct:>3}%  {fmt_mins(entry['mins'])}")
 
-    if at:
-        task = next((t for t in tasks if t["id"] == at["task_id"]), None)
-        elapsed = (time.time() - at["started_at"]) / 60
-        lines.append(f"\n▶ Timer running: {task['title'] if task else '?'} ({fmt_mins(elapsed)})")
+    if ov["active"]:
+        active = ov["active"]
+        lines.append(f"\n▶ Timer running: {active['title'] or '?'} "
+                     f"({fmt_mins(active['elapsed_mins'])})")
 
     return "\n".join(lines)
 
@@ -1209,27 +1146,21 @@ def get_notes_path(task_query: str) -> str:
         task_query: Task ID or partial title
     """
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
+    try:
+        res = wt_api.notes_target(data, task_query, NOTES_DIR)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return f"Error: {e.message}"
 
-    # Check for GitHub issue first
-    gh_ref = task_current_issue(task, data)
-    if gh_ref:
+    title = res["task"]["title"]
+    if res["kind"] == "issue":
         return (
-            f"Task '{task['title']}' is linked to GitHub issue: {gh_ref}\n"
-            f"View: gh issue view {gh_ref}\n"
-            f"Comment: gh issue comment {gh_ref}"
+            f"Task '{title}' is linked to GitHub issue: {res['issue']}\n"
+            f"View: gh issue view {res['issue']}\n"
+            f"Comment: gh issue comment {res['issue']}"
         )
-
-    # Fall back to local notes
-    NOTES_DIR.mkdir(exist_ok=True)
-    notes_path = NOTES_DIR / f"{task['id']}.md"
-
-    if not notes_path.exists():
-        notes_path.write_text(f"# {task['title']}\n\n")
-
-    return f"Notes file for '{task['title']}':\n{notes_path}"
+    return f"Notes file for '{title}':\n{res['path']}"
 
 
 @mcp.tool()
@@ -1247,18 +1178,19 @@ def push_task_to_github(task_query: str) -> str:
         task_query: Task ID or partial title
     """
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"ERROR: no task matching '{task_query}'"
-    issue_ref = task_current_issue(task, data)
-    if not issue_ref:
-        return f"ERROR: task '{task['title']}' has no linked GitHub issue"
-    result = setup_issue_in_project(issue_ref, task, data)
+    try:
+        res = wt_api.push_to_github(data, task_query)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return f"ERROR: no task matching '{task_query}'"
+        if e.code == "not_linked":
+            return (f"ERROR: task '{e.details['title']}' has no linked "
+                    f"GitHub issue")
+        return f"ERROR: {e.message}"
     save(data)  # persist the mark_logs_uploaded side-effect
-    if result["success"]:
-        hours = mins_to_quarter_hours(task_reportable_mins(task, get_all_sprints(data)))
-        return f"Pushed '{task['title']}' to {issue_ref}: {hours}h"
-    return f"Push completed with errors: {', '.join(result['errors'])}"
+    if res["success"]:
+        return f"Pushed '{res['task']['title']}' to {res['issue']}: {res['hours']}h"
+    return f"Push completed with errors: {', '.join(res['errors'])}"
 
 
 @mcp.tool()
@@ -1269,38 +1201,21 @@ def link_github_issue(task_query: str, github_issue: str) -> str:
         task_query: Task ID or partial title
         github_issue: GitHub issue reference (owner/repo#123, URL, or bare number with default repo)
     """
-    import subprocess
-
+    # wt_api.link_issue normalizes the ref, validates it with `gh issue view`,
+    # stores it on the task's current sprint *binding* (mirroring the legacy flat
+    # key), and pins github_repo so the close workflow engages.
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
-
-    # Normalize issue reference
-    github_issue, err = normalize_issue_ref(github_issue, data)
-    if err:
-        return f"Error: {err}"
-
-    # Validate the issue exists
-    result = subprocess.run(
-        ["gh", "issue", "view", *gh_issue_args(github_issue), "--json", "number,title"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        return f"Error: Could not find GitHub issue: {github_issue}"
-
-    import json as json_mod
-    issue_info = json_mod.loads(result.stdout)
-
-    # Store the ref on the task's current sprint binding (and mirror the legacy
-    # github_issue key), rather than only writing the flat field.
-    set_task_current_issue(task, github_issue, data)
-    # Pin the task's repo from the issue ref (so the close workflow engages)
-    if not task.get("github_repo") and "#" in github_issue:
-        task["github_repo"] = github_issue.split("#", 1)[0]
+    try:
+        res = wt_api.link_issue(data, task_query, github_issue)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return f"Error: {e.message}"
     save(data)
 
-    return f"Linked '{task['title']}' to GitHub issue #{issue_info['number']}: {issue_info['title']}"
+    info = res["issue_info"]
+    return (f"Linked '{res['task']['title']}' to GitHub issue "
+            f"#{info['number']}: {info['title']}")
 
 
 @mcp.tool()
@@ -1311,20 +1226,20 @@ def unlink_github_issue(task_query: str) -> str:
         task_query: Task ID or partial title
     """
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
-
-    if not task_current_issue(task, data):
-        return f"Task '{task['title']}' is not linked to a GitHub issue."
-
-    old_issue = clear_task_current_issue(task, data)
+    try:
+        res = wt_api.unlink_issue(data, task_query)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        if e.code == "not_linked":
+            return e.message
+        return f"Error: {e.message}"
     save(data)
-    msg = f"Unlinked '{task['title']}' from {old_issue}"
-    remaining = task_issue_refs(task)
-    if remaining:
-        msg += (f"\nStill bound to {len(remaining)} past-sprint issue(s): "
-                + ", ".join(remaining))
+
+    msg = f"Unlinked '{res['task']['title']}' from {res['old_issue']}"
+    if res["remaining"]:
+        msg += (f"\nStill bound to {len(res['remaining'])} past-sprint issue(s): "
+                + ", ".join(res["remaining"]))
     return msg
 
 
@@ -1787,23 +1702,20 @@ def sync_arc_folders() -> str:
 @mcp.tool()
 def list_sprints() -> str:
     """List all available sprint iterations from the GitHub project."""
+    # wt_api.sprints_overview prefers the live fetch and falls back to
+    # config.sprints_cache so this still answers offline. It reads the
+    # start_date/end_date date objects both sources provide — the old code read
+    # the camelCase startDate/duration keys that only the live fetch emits, so a
+    # cache-backed dict raised KeyError.
     data = load()
-    # Prefer the live fetch, fall back to config.sprints_cache so this still
-    # answers offline. Read start_date/end_date (date objects), which both
-    # sources provide — the old code read the camelCase startDate/duration keys
-    # that only the live fetch emits, so a cache-backed dict raised KeyError.
-    sprints, from_cache = _sprints_for_cli(data)
-    if not sprints:
+    ov = wt_api.sprints_overview(data)
+    if not ov["sprints"]:
         return "No sprints found (project not configured or query failed)."
 
-    today = datetime.now().date()
-    current = next((s for s in sprints
-                    if s["start_date"] <= today < s["end_date"]), None)
-    current_id = current["id"] if current else None
-
-    lines = ["Available sprints:" + ("  (offline — persisted cache)" if from_cache else "")]
-    for s in sprints:
-        marker = " ← current" if s["id"] == current_id else ""
+    lines = ["Available sprints:"
+             + ("  (offline — persisted cache)" if ov["from_cache"] else "")]
+    for s in ov["sprints"]:
+        marker = " ← current" if s["id"] == ov["current_id"] else ""
         days = (s["end_date"] - s["start_date"]).days
         lines.append(f"  {s['title']} ({s['start_date']}, {days} days){marker}")
     return "\n".join(lines)
@@ -1813,20 +1725,15 @@ def list_sprints() -> str:
 def get_current_sprint_info() -> str:
     """Get information about the current sprint."""
     data = load()
-    sprints, from_cache = _sprints_for_cli(data)
-    today = datetime.now().date()
-    current = next((s for s in sprints
-                    if s["start_date"] <= today < s["end_date"]), None)
-    if not current:
+    info = wt_api.current_sprint_info(data)
+    if not info:
         return "No active sprint found."
-    days = (current["end_date"] - current["start_date"]).days
-    last_day = current["end_date"] - timedelta(days=1)
     return (
-        f"Current sprint: {current['title']}\n"
-        f"Start: {current['start_date']}\n"
-        f"End: {last_day}\n"
-        f"Duration: {days} days"
-        + ("\n(offline — persisted sprints cache)" if from_cache else "")
+        f"Current sprint: {info['title']}\n"
+        f"Start: {info['start_date']}\n"
+        f"End: {info['last_day']}\n"
+        f"Duration: {info['days']} days"
+        + ("\n(offline — persisted sprints cache)" if info["from_cache"] else "")
     )
 
 
@@ -1851,32 +1758,24 @@ def set_sprint(task_query: str, sprint_title: str) -> str:
             start sprint so it is re-derived from the task's earliest log.
     """
     data = load()
-    task = resolve_task(data, task_query)
-    if not task:
-        return f"No task found matching '{task_query}'"
-
-    if sprint_title.lower() == "none":
-        had = task.pop("start_sprint_id", None) is not None
-        had = (task.pop("start_sprint", None) is not None) or had
-        save(data)
-        if had:
-            return (f"Cleared the start sprint for '{task['title']}' — it will be "
-                    f"re-derived from the task's earliest log.")
-        return f"'{task['title']}' had no start sprint set."
-
-    all_sprints, _ = _sprints_for_cli(data)
-    if not all_sprints:
-        return "No sprints found."
-
-    match = _match_sprint(all_sprints, sprint_title)
-    if not match:
-        available = ", ".join(s["title"] for s in all_sprints[-5:])
-        return f"No sprint matching '{sprint_title}'. Recent: {available}"
-
-    task["start_sprint"] = match["title"]
-    task["start_sprint_id"] = match["id"]
+    try:
+        res = wt_api.set_start_sprint(data, task_query, sprint_title)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        if e.code == "sprint_not_found":
+            available = ", ".join(e.details.get("recent") or [])
+            return f"No sprint matching '{sprint_title}'. Recent: {available}"
+        return e.message  # no_sprints -> "No sprints found."
     save(data)
-    return (f"'{task['title']}' now starts in {match['title']} (start sprint only — "
+
+    title = res["task"]["title"]
+    if res["cleared"]:
+        if res["had"]:
+            return (f"Cleared the start sprint for '{title}' — it will be "
+                    f"re-derived from the task's earliest log.")
+        return f"'{title}' had no start sprint set."
+    return (f"'{title}' now starts in {res['sprint']['title']} (start sprint only — "
             f"hours follow the logs; run sync_task_sprints to re-derive bindings)")
 
 
@@ -1917,57 +1816,38 @@ def sync_task_sprints(
         return "Error: task_query is required unless all_tasks=True."
 
     data = load()
-    all_sprints, from_cache = _sprints_for_cli(data)
-    if not all_sprints:
-        return "No sprints found (project not configured or query failed)."
-
-    # Requirement (a): a blanket run must not mint issues by default.
-    if create_issues is None:
-        create_issues = not all_tasks
-
-    if all_tasks:
-        candidates = list(data.get("tasks", []))
-    else:
-        task = resolve_task(data, task_query)
-        if not task:
-            return f"No task found matching '{task_query}'"
-        candidates = [task]
-
-    # Phase 5 removed the recurrent exclusion: a recurring series is no longer a
-    # cloned task per sprint but one perpetual task with a binding per sprint, so
-    # reconcile is exactly what it needs — it closes the sprint that just ended and
-    # mints the new one, which is what close_previous_recurrent_tasks and
-    # wt new-recurrent used to do by hand.
-    targets, skipped_tasks = list(candidates), []
-
-    header = []
-    if from_cache:
-        header.append("(offline — using the persisted sprints cache)")
-    if skipped_tasks:
-        header.append(f"Skipped {len(skipped_tasks)} recurrent task(s) "
-                      f"(use close_previous_recurrent_tasks / wt new-recurrent):")
-        for t in skipped_tasks:
-            header.append(f"  - {t['title']} [{t.get('sprint', '?')}]")
-
     # Plan pass. dry_run=True is structurally read-only in reconcile_task_sprints
     # (it plans, then returns without executing), so this makes no GitHub calls.
-    plans = []
-    for t in targets:
-        res = reconcile_task_sprints(t, data, all_sprints,
-                                     create_issues=create_issues, dry_run=True)
-        if res.get("error") or res.get("planned") or any(
-            sk.get("needs_issue") for sk in res.get("skipped", [])
-        ):
-            plans.append((t, res))
+    #
+    # Phase 5 removed the recurrent exclusion: a recurring series is no longer a
+    # cloned task per sprint but one perpetual task with a binding per sprint, so
+    # reconcile is exactly what it needs — it closes the sprint that just ended
+    # and mints the new one, which is what close_previous_recurrent_tasks and
+    # wt new-recurrent used to do by hand.
+    #
+    # Requirement (a) — a blanket run must not mint issues by default — lives in
+    # wt_api.plan_reconcile, which defaults create_issues to `not all_tasks`.
+    try:
+        plan = wt_api.plan_reconcile(data, task_id=task_query, all_tasks=all_tasks,
+                                     create_issues=create_issues)
+    except WtError as e:
+        if e.code in _NO_TASK:
+            return _no_task(task_query)
+        return e.message
 
-    if not plans:
+    header = []
+    if plan["from_cache"]:
+        header.append("(offline — using the persisted sprints cache)")
+
+    if not plan["plans"]:
         return "\n".join(header + [
-            f"Nothing to do ({len(targets)} task(s) already in sync)."])
+            f"Nothing to do ({len(plan['targets'])} task(s) already in sync)."])
 
     lines = list(header)
-    n_create = n_repoint = n_hours = n_close = n_needs_issue = 0
-    lines.append(f"{'Plan' if dry_run else 'Reconciling'} for {len(plans)} task(s):")
-    for t, res in plans:
+    lines.append(f"{'Plan' if dry_run else 'Reconciling'} for "
+                 f"{len(plan['plans'])} task(s):")
+    for entry in plan["plans"]:
+        t, res = entry["task"], entry["result"]
         lines.append(f"\n  {t['title']}")
         if res.get("error"):
             lines.append(f"    ! {res['error']}")
@@ -1978,23 +1858,16 @@ def sync_task_sprints(
             lines.append(f"    logs by sprint: {breakdown}")
         for line in _reconcile_plan_lines(res):
             lines.append(f"    {line}")
-        for op in res.get("planned", []):
-            if op["op"] == "create":
-                n_create += 1 if op.get("create_issue") else 0
-            elif op["op"] == "repoint":
-                n_repoint += 1
-            elif op["op"] == "hours":
-                n_hours += 1
-            elif op["op"] == "close":
-                n_close += 1
-        n_needs_issue += sum(1 for sk in res.get("skipped", []) if sk.get("needs_issue"))
 
-    lines.append(f"\nTotals: {n_create} issue(s) to create, {n_repoint} to re-point, "
-                 f"{n_hours} hours update(s), {n_close} issue(s) to close.")
-    if n_needs_issue:
-        lines.append(f"{n_needs_issue} past sprint(s) with unbilled time were NOT bound "
-                     f"(create_issues is False).")
-    if all_tasks and not create_issues:
+    totals = plan["totals"]
+    lines.append(f"\nTotals: {totals['create']} issue(s) to create, "
+                 f"{totals['repoint']} to re-point, "
+                 f"{totals['hours']} hours update(s), "
+                 f"{totals['close']} issue(s) to close.")
+    if totals["needs_issue"]:
+        lines.append(f"{totals['needs_issue']} past sprint(s) with unbilled time "
+                     f"were NOT bound (create_issues is False).")
+    if all_tasks and not plan["create_issues"]:
         lines.append("all_tasks does not create GitHub issues; "
                      "pass create_issues=True to allow it.")
 
@@ -2004,16 +1877,14 @@ def sync_task_sprints(
 
     lines.append("\nResults:")
     failures = 0
-    for t, _plan in plans:
-        lines.append(f"\n  {t['title']}")
-        res = reconcile_task_sprints(t, data, all_sprints, create_issues=create_issues,
-                                     save_callback=save)
-        outcome = _reconcile_outcome_lines(res)
+    for entry in wt_api.apply_reconcile(data, plan, save_callback=save):
+        lines.append(f"\n  {entry['task']['title']}")
+        outcome = entry["outcome_lines"]
         for line in outcome:
             lines.append(f"    {line}")
         if not outcome:
             lines.append("    (nothing to do)")
-        if not res.get("success"):
+        if not entry["success"]:
             failures += 1
     save(data)
     lines.append(f"\n{'Done.' if not failures else f'{failures} task(s) had errors.'}")

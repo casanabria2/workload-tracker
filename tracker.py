@@ -93,6 +93,11 @@ from wt import (
     # by the CLI, the TUI and the MCP server. Never write DATA_FILE directly.
     _resolve_data_file, data_lock,
 )
+# Phase 1 of docs/plan-macos-app.md §4/§5.4: the dict-returning command layer.
+# ``task_last_logged_at`` used to live here, but the MCP server, Phase 2's daemon
+# (which serves this bridge's :7373 contract with the TUI closed) and the TUI all
+# need it, so it now has one home. Import it rather than keeping a second copy.
+from wt_api import task_last_logged_at
 
 # Same ``WT_DATA_FILE`` override wt.py and mcp_server.py use, so the TUI can be
 # exercised against a throwaway copy — and, more importantly, so tracker's
@@ -212,21 +217,6 @@ def get_role_map(data: dict) -> dict:
 
 def task_logged_mins(task: dict) -> float:
     return sum(l.get("minutes", 0) for l in task.get("logs", []))
-
-
-def task_last_logged_at(task: dict) -> Optional[float]:
-    """Epoch seconds of the task's most recent time-log entry, or None.
-
-    Uses each log's ``at`` timestamp (the canonical record time, always set on
-    timer sessions and manual logs); falls back to ``ended_at``/``started_at``
-    for any legacy entry missing ``at``. Returns None when the task has no logs.
-    """
-    stamps = [
-        ts
-        for l in task.get("logs", [])
-        if (ts := l.get("at") or l.get("ended_at") or l.get("started_at")) is not None
-    ]
-    return max(stamps) if stamps else None
 
 
 def task_live_mins(task: dict, active_timer: Optional[dict]) -> float:

@@ -41,14 +41,18 @@ WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_tracker_phase3.
     /tmp/wt-test/fx/pre.json /tmp/wt-test/fx/migrated.json \
     /tmp/wt-test/fx/baseline.json /tmp/wt-test/s-tracker
 
+WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_wt_api.py \
+    /tmp/wt-test/fx/pre.json /tmp/wt-test/fx/migrated.json \
+    /tmp/wt-test/fx/baseline.json /tmp/wt-test/s-wt-api
+
 # 3. Phase 0's concurrency harness takes a different shape.
 WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_atomic_save.py \
     /tmp/wt-test/work.json /tmp/wt-test/s-atomic 8
 ```
 
 `test_phase3.py` re-runs `test_reconcile.py`, and `test_mcp_phase3.py` re-runs
-both, so running the MCP one covers three of the four. `test_tracker_phase3.py`
-is independent (it redirects `HOME`).
+both, so running the MCP one covers three of the five. `test_tracker_phase3.py`
+and `test_wt_api.py` are independent (the former redirects `HOME`).
 
 Belt and braces: put a fake `gh` first on `PATH` that logs and exits non-zero,
 run everything, and confirm the log stays empty.
@@ -159,6 +163,14 @@ surface (Arc, iTerm, tabs, calendar) — of the 43 registered tools only the one
 listed above are exercised. Note `mcp_server.resolve_task` returns `None` on an
 ambiguous substring match, so tests address tasks by **id**.
 
+**Exactly which tools it drives** (this is the set macOS-app Phase 1 refactored
+onto `wt_api.py`; everything else stayed put precisely because it is not here):
+`add_task`, `list_tasks`, `get_task`, `set_task_status`, `sync_task_sprints`,
+`set_sprint`, `link_github_issue`, `unlink_github_issue`, `push_task_to_github`,
+`get_notes_path`, `rename_task`, `delete_task`, `list_sprints`,
+`get_current_sprint_info`, `get_status`, and the retired
+`close_previous_recurrent_tasks`.
+
 ### `test_tracker_phase3.py` — `tracker.py` (plan Phase 3)
 
 Drives the real Textual app headlessly (`App.run_test()` → `Pilot`) with `HOME`
@@ -174,6 +186,34 @@ socket is opened); Arc/iTerm/Safari integration (faked); visual layout.
 
 Its baseline argument is accepted and ignored — it computes its own before/after
 totals. It also accepts the older 3-argument form.
+
+### `test_wt_api.py` — `wt_api.py`, the command layer (macOS-app plan Phase 1)
+
+`snapshot()`'s shape and field completeness — every documented key present, and
+each derived field asserted *equal to the `wt` primitive it claims to come
+from* (`current_issue` vs `task_current_issue`, `reportable_mins` vs
+`task_reportable_mins`, `sprints_with_time` vs `task_sprints_with_time` with the
+bulky per-entry `logs` key stripped), plus JSON-serializability, purity, and
+zero `gh` calls. Then **every one of the 23 `WtError` codes**, each provoked
+through a real call, with `ERROR_CODES` cross-checked against the source in both
+directions so a new raise or a dead code is loud. Then the command functions the
+MCP server does *not* yet route through (timers, log add/edit/delete/split/merge,
+`create_task`/`update_task`/`set_task_*`, `ensure_issue`, `plan_close`, `close`,
+`plan_reconcile`/`apply_reconcile`/`reconcile`).
+
+Takes the same four arguments as the others; the pre-migration and baseline
+fixtures are accepted and unused. Set `WT_FAKE_GH_LOG` to a logging fake `gh`'s
+log file and section 10 asserts it stayed empty.
+
+**Does not cover:** the MCP formatting layer on top (that is
+`test_mcp_phase3.py`); the ~28 MCP tools still on their own code path (see the
+scope block at the top of `wt_api.py`); real GitHub semantics.
+
+Two deliberate fixture rebuilds, both announced in the output: the live data has
+**zero** Type options in `project_options_cache`, so the `unknown_type` path is
+unreachable until that facet is seeded on the scratch copy; and the `link_issue`
+subject's `github_repo` is cleared first, because almost every real task already
+has one and the repo-pinning branch would never be taken.
 
 ### `test_atomic_save.py` — `wt.save()` / `data_lock()` (Phase 0)
 
