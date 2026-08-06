@@ -1,0 +1,301 @@
+{
+  "_comment": [
+    "SYNTHETIC fixture. Every task title, issue ref, role and hour figure here is",
+    "invented. The real ~/.workload_tracker.json is the owner's private work",
+    "history and must never be committed to this repository.",
+    "",
+    "What each entry exercises:",
+    "  t-multi-sprint   a cross-sprint task with three sprint_issues bindings, one",
+    "                   of them unlinked (issue: null) and one still open",
+    "  t-no-logs        a task with no logs at all and no sprints_with_time (5 such",
+    "                   tasks exist in the real data; 3 are live To Do cards)",
+    "  t-minimal        every optional field ABSENT, not null - the graceful",
+    "                   degradation case, which is what let the monitor survive two",
+    "                   contract changes",
+    "  t-recurrent      a perpetual task: status recurrent, one binding per sprint,",
+    "                   must be excluded from the board columns",
+    "  t-running        the task the active_timer points at, with live_mins set",
+    "  t-done-nulls     optional fields present but explicitly null",
+    "  t-future-status  a status this client does not know, to prove the snapshot",
+    "                   still decodes",
+    "",
+    "Roles: 6, of which 3 are colour 'white' (the value `wt roles add` seeds) and",
+    "two share 'blue' - both collision cases RolePalette has to handle. role-empty",
+    "owns no tasks.",
+    "",
+    "config.github_project_number is a STRING here because that is what the live",
+    "data file actually stores."
+  ],
+
+  "generated_at": 1786022400.5,
+
+  "roles": [
+    {"id": "demokit", "label": "Managing WidgetKit", "color": "blue"},
+    {"id": "demos", "label": "Demos & Workshops", "color": "green"},
+    {"id": "other", "label": "Other", "color": "white"},
+    {"id": "testing", "label": "Testing", "color": "white"},
+    {"id": "spare parts", "label": "spare", "color": "white"},
+    {"id": "second-blue", "label": "Second Blue", "color": "blue"},
+    {"id": "role-empty", "label": "Unused Role", "color": "magenta"}
+  ],
+
+  "sprints": [
+    {"id": "sp-100", "title": "Sprint 100", "start_date": "2026-03-16",
+     "end_date": "2026-03-30", "field_id": "PVTIF_fixture"},
+    {"id": "sp-101", "title": "Sprint 101", "start_date": "2026-03-30",
+     "end_date": "2026-04-13", "field_id": "PVTIF_fixture"},
+    {"id": "sp-102", "title": "Sprint 102", "start_date": "2026-04-13",
+     "end_date": "2026-04-27", "field_id": "PVTIF_fixture"}
+  ],
+
+  "current_sprint": {
+    "id": "sp-102", "title": "Sprint 102", "start_date": "2026-04-13",
+    "end_date": "2026-04-27", "field_id": "PVTIF_fixture"
+  },
+
+  "active_timer": {"task_id": "t-running", "started_at": 1786020000.0},
+
+  "project_options": {
+    "activity": ["Widget Maintenance", "Workshop Delivery", "Internal Enablement"],
+    "type": []
+  },
+
+  "config": {
+    "github_project_owner": "example-org",
+    "github_project_number": "565",
+    "github_repo": "example-org/example-repo"
+  },
+
+  "data_file": {
+    "path": "/tmp/fixture/.workload_tracker.json",
+    "readable": true,
+    "reason": "ok",
+    "mtime": 1786022000.0,
+    "size": 4096,
+    "tasks": 7,
+    "detail": null
+  },
+
+  "tasks": [
+    {
+      "id": "t-multi-sprint",
+      "title": "Rebuild the widget pipeline",
+      "description": "Spans three sprints; one binding was never linked.",
+      "status": "inprogress",
+      "status_label": "In Progress",
+      "role_id": "demokit",
+      "created_at": 1774000000.0,
+      "activity": "Widget Maintenance",
+      "github_repo": "example-org/example-repo",
+      "type": null,
+      "sprints_with_time": [
+        {"sprint_id": "sp-100", "sprint_title": "Sprint 100",
+         "field_id": "PVTIF_fixture", "start_date": "2026-03-16", "total_mins": 375.0},
+        {"sprint_id": "sp-101", "sprint_title": "Sprint 101",
+         "field_id": "PVTIF_fixture", "start_date": "2026-03-30", "total_mins": 210.0},
+        {"sprint_id": "sp-102", "sprint_title": "Sprint 102",
+         "field_id": "PVTIF_fixture", "start_date": "2026-04-13", "total_mins": 105.0}
+      ],
+      "start_sprint": "Sprint 100",
+      "start_sprint_id": "sp-100",
+      "sprint_issues": [
+        {"sprint_id": "sp-100", "sprint": "Sprint 100",
+         "issue": "example-org/example-repo#101", "state": "closed",
+         "hours_synced": 6.25, "synced_at": 1774500000.0, "created_at": 1774000000.0},
+        {"sprint_id": "sp-101", "sprint": "Sprint 101",
+         "issue": null, "state": "open",
+         "hours_synced": null, "synced_at": null, "created_at": 1775500000.0},
+        {"sprint_id": "sp-102", "sprint": "Sprint 102",
+         "issue": "example-org/other-repo#7", "state": "open",
+         "hours_synced": 1.75, "synced_at": 1776500000.0, "created_at": 1776000000.0}
+      ],
+      "current_issue": "example-org/other-repo#7",
+      "logged_mins": 690.0,
+      "live_mins": 0,
+      "reportable_mins": 105.0,
+      "last_logged_at": 1776400000.0,
+      "logs": [
+        {"id": "20260316090000aaaa", "minutes": 375, "note": "Kickoff",
+         "at": 1774254000.0, "started_at": 1774231800.0, "ended_at": 1774254300.0},
+        {"id": "20260401101500bbbb", "minutes": 210.0, "note": "Middle stretch",
+         "at": 1775468100.0, "started_at": 1775455500.0, "ended_at": 1775468100.0,
+         "uploaded_at": 1775470000.0},
+        {"id": "20260415084500cccc", "minutes": 105.0, "note": "Timer session",
+         "at": 1776400000.0}
+      ],
+      "local_folder": "/tmp/fixture/widget",
+      "tabs": ["https://example.invalid/a", "https://example.invalid/b"],
+      "active_window_id": null
+    },
+
+    {
+      "id": "t-no-logs",
+      "title": "Draft the Q3 enablement outline",
+      "description": "",
+      "status": "todo",
+      "status_label": "To Do",
+      "role_id": "demos",
+      "created_at": 1776300000.0,
+      "activity": null,
+      "github_repo": "",
+      "type": null,
+      "sprints_with_time": [],
+      "start_sprint": null,
+      "start_sprint_id": null,
+      "sprint_issues": [],
+      "current_issue": null,
+      "logged_mins": 0,
+      "live_mins": 0,
+      "reportable_mins": 0,
+      "last_logged_at": null,
+      "logs": [],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+
+    {
+      "id": "t-minimal",
+      "title": "Task with only the required keys",
+      "status": "todo"
+    },
+
+    {
+      "id": "t-recurrent",
+      "title": "Stand-up calls",
+      "description": "Perpetual. One issue per sprint, never carried forward.",
+      "status": "recurrent",
+      "status_label": "Recurrent",
+      "role_id": "other",
+      "created_at": 1770000000.0,
+      "activity": "Internal Enablement",
+      "github_repo": "example-org/example-repo",
+      "type": null,
+      "sprints_with_time": [
+        {"sprint_id": "sp-100", "sprint_title": "Sprint 100",
+         "field_id": "PVTIF_fixture", "start_date": "2026-03-16", "total_mins": 90.0},
+        {"sprint_id": "sp-101", "sprint_title": "Sprint 101",
+         "field_id": "PVTIF_fixture", "start_date": "2026-03-30", "total_mins": 120.0},
+        {"sprint_id": "sp-102", "sprint_title": "Sprint 102",
+         "field_id": "PVTIF_fixture", "start_date": "2026-04-13", "total_mins": 60.0}
+      ],
+      "start_sprint": "Sprint 100",
+      "start_sprint_id": "sp-100",
+      "sprint_issues": [
+        {"sprint_id": "sp-100", "sprint": "Sprint 100",
+         "issue": "example-org/example-repo#200", "state": "closed",
+         "hours_synced": 1.5, "synced_at": 1774900000.0, "created_at": 1774000000.0},
+        {"sprint_id": "sp-101", "sprint": "Sprint 101",
+         "issue": "example-org/example-repo#201", "state": "closed",
+         "hours_synced": 2.0, "synced_at": 1775900000.0, "created_at": 1775000000.0},
+        {"sprint_id": "sp-102", "sprint": "Sprint 102",
+         "issue": "example-org/example-repo#202", "state": "open",
+         "hours_synced": 1.0, "synced_at": 1776900000.0, "created_at": 1776000000.0}
+      ],
+      "current_issue": "example-org/example-repo#202",
+      "logged_mins": 270.0,
+      "live_mins": 0,
+      "reportable_mins": 60.0,
+      "last_logged_at": 1776500000.0,
+      "logs": [
+        {"id": "20260317090000dddd", "minutes": 90, "note": "Timer session",
+         "at": 1774342800.0, "started_at": 1774337400.0, "ended_at": 1774342800.0},
+        {"id": "20260401090000eeee", "minutes": 120, "note": "Timer session",
+         "at": 1775552400.0, "started_at": 1775545200.0, "ended_at": 1775552400.0},
+        {"id": "20260416090000ffff", "minutes": 60, "note": "Calendar: Stand-up",
+         "at": 1776500000.0, "started_at": 1776496400.0, "ended_at": 1776500000.0,
+         "calendar_event_uid": "fixture-event-uid-1"}
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+
+    {
+      "id": "t-running",
+      "title": "Investigate the flaky import",
+      "description": "The active timer points here.",
+      "status": "inprogress",
+      "status_label": "In Progress",
+      "role_id": "testing",
+      "created_at": 1776100000.0,
+      "activity": "Widget Maintenance",
+      "github_repo": "example-org/example-repo",
+      "type": "Feature",
+      "sprints_with_time": [
+        {"sprint_id": "sp-102", "sprint_title": "Sprint 102",
+         "field_id": "PVTIF_fixture", "start_date": "2026-04-13", "total_mins": 45.0}
+      ],
+      "start_sprint": "Sprint 102",
+      "start_sprint_id": "sp-102",
+      "sprint_issues": [
+        {"sprint_id": "sp-102", "sprint": "Sprint 102",
+         "issue": "example-org/example-repo#310", "state": "open",
+         "hours_synced": 0.75, "synced_at": 1776450000.0, "created_at": 1776400000.0}
+      ],
+      "current_issue": "example-org/example-repo#310",
+      "logged_mins": 45.0,
+      "live_mins": 33.5,
+      "reportable_mins": 45.0,
+      "last_logged_at": 1776450000.0,
+      "logs": [
+        {"id": "20260417110000gggg", "minutes": 45, "note": "Timer session",
+         "at": 1776450000.0, "started_at": 1776447300.0, "ended_at": 1776450000.0}
+      ],
+      "local_folder": null,
+      "tabs": ["https://example.invalid/ci"],
+      "active_window_id": 6083
+    },
+
+    {
+      "id": "t-done-nulls",
+      "title": "Ship the March newsletter",
+      "description": "",
+      "status": "done",
+      "status_label": "Done",
+      "role_id": "second-blue",
+      "created_at": 1773000000.0,
+      "activity": null,
+      "github_repo": null,
+      "type": null,
+      "sprints_with_time": [
+        {"sprint_id": "sp-100", "sprint_title": "Sprint 100",
+         "field_id": null, "start_date": "2026-03-16", "total_mins": 30.0}
+      ],
+      "start_sprint": "Sprint 100",
+      "start_sprint_id": "sp-100",
+      "sprint_issues": [],
+      "current_issue": null,
+      "logged_mins": 30.0,
+      "live_mins": 0,
+      "reportable_mins": 0,
+      "last_logged_at": 1774300000.0,
+      "logs": [
+        {"id": "20260318140000hhhh", "minutes": 30, "note": "",
+         "at": 1774300000.0, "started_at": null, "ended_at": null}
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+
+    {
+      "id": "t-future-status",
+      "title": "A status this client has never heard of",
+      "description": "Proves an added Python-side status does not fail the decode.",
+      "status": "blocked",
+      "status_label": "Blocked",
+      "role_id": "spare parts",
+      "created_at": 1776200000.0,
+      "sprints_with_time": [],
+      "sprint_issues": [],
+      "current_issue": null,
+      "logged_mins": 0,
+      "live_mins": 0,
+      "reportable_mins": 0,
+      "last_logged_at": null,
+      "logs": [],
+      "tabs": []
+    }
+  ]
+}

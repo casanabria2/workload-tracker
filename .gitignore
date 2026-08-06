@@ -4,3 +4,7 @@ venv/
 !.claude/skills/
 *.pyc
 .DS_Store
+
+# SwiftPM build products and per-user IDE state for the macOS client.
+macos-client/.build/
+macos-client/.swiftpm/
