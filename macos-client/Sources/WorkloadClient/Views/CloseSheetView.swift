@@ -136,9 +136,13 @@ struct CloseSheetView: View {
     private var warning: some View {
         if case .ready(let plan) = sheet.phase, plan.issuesToCreate > 0 {
             Label {
+                // Concatenated `Text`, not markdown in a string: `Text`'s
+                // markdown parsing only applies to *literals*, so an
+                // interpolated "**…**" renders the asterisks. Caught by
+                // rendering the sheet with `ImageRenderer`.
                 Text("\(plan.issuesToCreate) GitHub issue"
-                     + "\(plan.issuesToCreate == 1 ? " will be" : "s will be") created. "
-                     + "**This cannot be undone.**")
+                     + "\(plan.issuesToCreate == 1 ? " will be" : "s will be") created. ")
+                + Text("This cannot be undone.").bold()
             } icon: {
                 Image(systemName: "exclamationmark.triangle.fill")
             }
@@ -194,7 +198,11 @@ struct CloseSheetView: View {
 /// The per-sprint table. One row per sprint the close must account for, so a
 /// sprint whose hours are *not* touched still gets a line — the sheet's job is
 /// to leave nothing invisible.
-private struct PlanPreview: View {
+///
+/// Internal rather than private so a row can be rendered on its own with
+/// `ImageRenderer`; the sheet's `ScrollView` is AppKit-backed and renders
+/// blank, which is how this table was reviewed without Screen Recording.
+struct PlanPreview: View {
     let plan: ClosePlanResponse
     @State private var showsRawLines = false
 
@@ -251,7 +259,7 @@ private struct PlanPreview: View {
     }
 }
 
-private struct PlanRowView: View {
+struct PlanRowView: View {
     let row: ClosePlanRow
 
     var body: some View {
@@ -267,7 +275,7 @@ private struct PlanRowView: View {
             Text(row.issue ?? "(no issue)")
                 .font(.callout.monospaced())
                 .foregroundStyle(row.issue == nil ? .secondary : .primary)
-                .frame(width: 190, alignment: .leading)
+                .frame(width: 240, alignment: .leading)
                 .lineLimit(1).truncationMode(.head)
             VStack(alignment: .leading, spacing: 2) {
                 if row.isNoOp {

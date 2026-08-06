@@ -84,6 +84,48 @@ final class CloseSheetTests: XCTestCase {
                        "one from the reconcile plan plus the task's first issue")
         XCTAssertTrue(unlinked.createIssueOnConfirm,
                       "confirming must authorise exactly what the preview announced")
+
+        // …and the table has to say so too. A warning over a table reading
+        // "no change" is the mismatch the preview exists to prevent, and it is
+        // reachable on the owner's real data: a task with a repo, an unlinked
+        // binding and an empty reconcile plan.
+        let creating = unlinked.rows.filter(\.createsIssue)
+        XCTAssertEqual(creating.count, 2, "the plan's create, plus the first issue")
+        XCTAssertTrue(unlinked.rows.contains {
+            $0.actions.contains { $0.hasPrefix("CREATE the task’s first issue") }
+        }, unlinked.rows.map(\.actions).description)
+    }
+
+    /// The shape a real scratch-daemon plan produced: a task with a repo, one
+    /// sprint bound to no issue, and **no planned operations at all**. The
+    /// close still mints an issue, so the sheet must show one.
+    func testFirstIssueRowWhenThePlanItselfIsEmpty() throws {
+        let decoded = try JSONDecoder().decode(
+            ClosePlanResponse.self,
+            from: try planData { raw in
+                raw["needs_issue"] = true
+                raw["current_issue"] = NSNull()
+                raw["will_create_issues"] = 0
+                var plan = raw["plan"] as! [String: Any]
+                plan["planned"] = []
+                plan["target"] = [["sprint_id": "sp-100", "sprint": "Sprint 100",
+                                   "minutes": 59.13, "hours": 1.0]]
+                plan["bindings"] = [["sprint_id": "sp-100", "sprint": "Sprint 100",
+                                     "issue": NSNull(), "state": "closed"]]
+                plan["skipped"] = [["sprint": "Sprint 100", "sprint_id": "sp-100",
+                                    "issue": NSNull(), "minutes": 59.13, "hours": 1.0,
+                                    "reason": "binding has no issue"]]
+                plan["unbillable"] = [["sprint": "Sprint 100", "sprint_id": "sp-100",
+                                       "minutes": 59.13]]
+                raw["plan"] = plan
+            })
+
+        XCTAssertEqual(decoded.issuesToCreate, 1)
+        XCTAssertEqual(decoded.rows.count, 1)
+        let row = try XCTUnwrap(decoded.rows.first)
+        XCTAssertTrue(row.createsIssue)
+        XCTAssertFalse(row.isNoOp, "an empty action list here would contradict the warning")
+        XCTAssertTrue(row.actions[0].hasPrefix("CREATE the task’s first issue"), row.actions[0])
     }
 
     func testPlanRowsMatchTheSpecLayout() throws {

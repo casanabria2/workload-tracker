@@ -426,6 +426,52 @@ final class Store {
         }
     }
 
+    /// **The single entry point for "move this card to that column."**
+    ///
+    /// Drag-and-drop and `⌘←`/`⌘→` both come through here, so the two can never
+    /// diverge on what is allowed — and neither can bypass the rule table.
+    /// Nothing irreversible happens in this method: the `.confirmClose` branch
+    /// opens the sheet, which only sends the write-free dry run.
+    func perform(drop payload: TaskDragPayload, on column: TaskStatus) async {
+        switch BoardDropRules.decide(payload, to: column) {
+        case .rejected(let why):
+            // A same-column drop is a shrug, not an error; the other two are
+            // worth explaining.
+            show(BoardFeedback(message: why.message,
+                               isError: why != .sameColumn,
+                               hint: why.hint))
+        case .optimisticStatus(let status):
+            guard let task = tasks.first(where: { $0.id == payload.taskId }) else { return }
+            await moveTask(task, to: status)
+        case .confirmClose:
+            guard let task = tasks.first(where: { $0.id == payload.taskId }) else { return }
+            await beginClose(task)
+        }
+    }
+
+    /// The board column immediately left or right of `status`, or `nil` at the
+    /// ends. Drives `⌘←` / `⌘→`.
+    func neighbourColumn(of status: TaskStatus, offset: Int) -> TaskStatus? {
+        guard let index = TaskStatus.boardColumns.firstIndex(of: status) else { return nil }
+        let target = index + offset
+        guard TaskStatus.boardColumns.indices.contains(target) else { return nil }
+        return TaskStatus.boardColumns[target]
+    }
+
+    /// Where a card will land in `column` once it moves there.
+    ///
+    /// Uses the column's own sort, not the pointer's position: the board does
+    /// not persist card order (it is derived from `last_logged_at`), so an
+    /// indicator that followed the cursor would promise a placement the data
+    /// model cannot keep.
+    func landingIndex(of taskId: String, movedTo column: TaskStatus) -> Int {
+        guard let moved = tasks.first(where: { $0.id == taskId }) else { return 0 }
+        var destination = boardTasks(column).filter { $0.id != taskId }
+        destination.append(moved)
+        destination.sort(by: Self.boardOrder)
+        return destination.firstIndex { $0.id == taskId } ?? destination.count - 1
+    }
+
     // MARK: - The close workflow (never optimistic, never silent)
 
     /// Opens the §7.1 sheet and fetches the plan.

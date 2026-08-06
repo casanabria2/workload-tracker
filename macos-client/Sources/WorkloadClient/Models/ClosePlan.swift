@@ -311,7 +311,7 @@ extension ClosePlanResponse {
         let bindingsBySprint = Dictionary(
             plan.bindings.map { ($0.sprintId ?? "—", $0) }, uniquingKeysWith: { first, _ in first })
 
-        return order.map { key in
+        let built: [ClosePlanRow] = order.map { key in
             let target = plan.target.first { ($0.sprintId ?? "—") == key }
             let ops = plan.planned.filter { ($0.sprintId ?? "—") == key }
             let skips = plan.skipped.filter { ($0.sprintId ?? "—") == key }
@@ -386,6 +386,38 @@ extension ClosePlanResponse {
                 hoursWithheld: withheld != nil,
                 actions: actions)
         }
+        return withFirstIssueRow(built)
+    }
+
+    /// Attaches the task's **first** issue creation to a row.
+    ///
+    /// `close_task` mints that issue itself, before the reconcile and outside
+    /// `planned[]`, so nothing in the plan mentions it — a real task on the
+    /// owner's data planned *no* operations at all yet would still have an
+    /// issue created on close. Without this the sheet would warn "1 issue will
+    /// be created" over a table that says "no change", which is exactly the
+    /// kind of quiet mismatch the preview exists to prevent.
+    ///
+    /// It lands on the current binding, so: the last sprint whose binding has
+    /// no issue, else the last row, else a row of its own.
+    private func withFirstIssueRow(_ rows: [ClosePlanRow]) -> [ClosePlanRow] {
+        guard needsIssue else { return rows }
+        let action = "CREATE the task’s first issue in \(repo ?? "its repo")"
+        guard !rows.isEmpty else {
+            return [ClosePlanRow(sprintId: nil, sprintTitle: plan.currentSprint ?? "—",
+                                 minutes: nil, issue: nil, createsIssue: true,
+                                 closesIssue: false, hoursWithheld: false,
+                                 actions: [action])]
+        }
+        let index = rows.lastIndex { $0.issue == nil && !$0.createsIssue } ?? rows.count - 1
+        var rows = rows
+        let row = rows[index]
+        rows[index] = ClosePlanRow(sprintId: row.sprintId, sprintTitle: row.sprintTitle,
+                                   minutes: row.minutes, issue: row.issue,
+                                   createsIssue: true, closesIssue: row.closesIssue,
+                                   hoursWithheld: row.hoursWithheld,
+                                   actions: [action] + row.actions)
+        return rows
     }
 
     /// `21.0` → `"21h"`, `12.5` → `"12.5h"`, `12.25` → `"12.25h"`.

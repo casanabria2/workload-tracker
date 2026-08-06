@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// One board card. **Read-only in Phase 3** — no `.draggable`, no context menu,
-/// no mutation. Phase 4 adds the `Transferable` payload and drop targets.
+/// One board card. Draggable and selectable from Phase 4; the drag payload and
+/// the drop rules live in `BoardDrop.swift`, not here.
 struct TaskCardView: View {
     let task: TrackerTask
     let roleLabel: String
@@ -11,6 +11,12 @@ struct TaskCardView: View {
     let elapsed: TimeInterval?
     /// The sprint the board is currently reading hours for, for the badge.
     let currentSprint: Sprint?
+    /// The keyboard selection, which `⌘←`/`⌘→` act on.
+    var isSelected: Bool = false
+    /// An optimistic status change is in flight for this card. Drawn dimmed so
+    /// "moved" and "moved and confirmed" are not the same picture — a rollback
+    /// has to look like something reverting, not like a card teleporting.
+    var isPending: Bool = false
 
     private var isRunning: Bool { elapsed != nil }
 
@@ -35,11 +41,30 @@ struct TaskCardView: View {
         .background(.background.secondary, in: .rect(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(isRunning ? Color.accentColor : Color.primary.opacity(0.08),
-                              lineWidth: isRunning ? 2 : 1)
+                .strokeBorder(borderColor, lineWidth: isRunning || isSelected ? 2 : 1)
         }
+        // Bottom-trailing, not top: the top-right corner is where a running
+        // timer's m:ss label lives, and the two collided.
+        .overlay(alignment: .bottomTrailing) {
+            if isPending {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(6)
+                    .accessibilityLabel("Move in progress")
+            }
+        }
+        .opacity(isPending ? 0.6 : 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityDescription)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+
+    /// Running beats selected: a live timer is a fact about the data, selection
+    /// is a fact about the cursor.
+    private var borderColor: Color {
+        if isRunning { return .accentColor }
+        if isSelected { return .secondary }
+        return .primary.opacity(0.08)
     }
 
     private var header: some View {
