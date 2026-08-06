@@ -6,10 +6,10 @@ import Foundation
 /// token is cached state and every call is `async`, so isolation is free and the
 /// UI layer stays `@MainActor`.
 ///
-/// **Phase 3 is read-only.** The only endpoints exposed here are `GET`s. Writes
-/// arrive in Phase 4 with the Kanban board, and they must not be added
-/// speculatively — every `POST` against the live daemon touches the owner's real
-/// work history.
+/// The `GET`s live here; the Phase 4 write surface is in
+/// `DaemonClientWrites.swift`, deliberately in its own file with the rules that
+/// keep a `done` status change from reaching the daemon without going through
+/// the close-confirmation sheet.
 actor DaemonClient {
 
     /// Where to reach the daemon and how to authenticate.
@@ -128,13 +128,22 @@ actor DaemonClient {
 
     // MARK: - Transport
 
-    private func get<T: Decodable>(_ path: String, as type: T.Type) async throws -> T {
+    func get<T: Decodable>(_ path: String, as type: T.Type) async throws -> T {
         var request = URLRequest(url: configuration.baseURL.appending(path: path),
                                  timeoutInterval: configuration.timeout)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Bearer \(try token())", forHTTPHeaderField: "Authorization")
+        return try await authorized(request, as: type)
+    }
 
+    /// Signs *request*, performs it, and retries once on a 401.
+    ///
+    /// Shared by the `GET`s above and the write surface in
+    /// `DaemonClientWrites.swift`, so token handling and error mapping exist in
+    /// exactly one place — including for the endpoints that touch GitHub.
+    func authorized<T: Decodable>(_ request: URLRequest, as type: T.Type) async throws -> T {
+        var request = request
+        request.setValue("Bearer \(try token())", forHTTPHeaderField: "Authorization")
         do {
             return try await perform(request, as: type)
         } catch DaemonClientError.api(.unauthorized, let message, let status, let details) {

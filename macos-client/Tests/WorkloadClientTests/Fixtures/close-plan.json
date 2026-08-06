@@ -1,0 +1,109 @@
+{
+  "_comment": [
+    "SYNTHETIC. A `POST /v1/tasks/{id}/close/plan` response for the fixture's",
+    "`t-multi-sprint` task, in the exact shape wt_api.plan_close returns.",
+    "No real task title, repository or issue number appears anywhere in this",
+    "repo's fixtures — the owner's work history is not test data.",
+    "",
+    "Shaped to exercise every branch of the §7.1 preview at once:",
+    "  Sprint 100 — bound issue, hours already synced, sprint ended -> close",
+    "  Sprint 101 — no binding at all -> CREATE an issue, set hours, close",
+    "  Sprint 102 — bound issue, hours change 6h -> 12.5h, sprint still open"
+  ],
+  "title": "Rebuild the widget pipeline",
+  "repo": "example-org/example-repo",
+  "needs_issue": false,
+  "current_issue": "example-org/example-repo#402",
+  "will_create_issues": 1,
+  "plan_lines": [
+    "create  Sprint 101  new issue \"Rebuild the widget pipeline (Sprint 101)\" in example-org/example-repo — 3h 30m → 3.5h  (then close)",
+    "hours   Sprint 102  example-org/example-repo#402: 6.0h → 12.5h (12h 19m)",
+    "close   Sprint 100  example-org/example-repo#377 — sprint has ended"
+  ],
+  "plan": {
+    "success": true,
+    "error": null,
+    "dry_run": true,
+    "task": "Rebuild the widget pipeline",
+    "task_id": "t-multi-sprint",
+    "current_sprint": "Sprint 102",
+    "target": [
+      {"sprint_id": "sp-100", "sprint": "Sprint 100", "minutes": 375.0, "hours": 6.25},
+      {"sprint_id": "sp-101", "sprint": "Sprint 101", "minutes": 210.0, "hours": 3.5},
+      {"sprint_id": "sp-102", "sprint": "Sprint 102", "minutes": 739.27, "hours": 12.5}
+    ],
+    "planned": [
+      {
+        "op": "create",
+        "sprint_id": "sp-101",
+        "sprint": "Sprint 101",
+        "minutes": 210.0,
+        "hours": 3.5,
+        "issue": null,
+        "create_issue": true,
+        "issue_title": "Rebuild the widget pipeline (Sprint 101)",
+        "repo": "example-org/example-repo",
+        "will_close": true,
+        "main_issue": "example-org/example-repo#402",
+        "reason": "sprint has logged time"
+      },
+      {
+        "op": "hours",
+        "sprint": "Sprint 102",
+        "sprint_id": "sp-102",
+        "issue": "example-org/example-repo#402",
+        "minutes": 739.27,
+        "hours": 12.5,
+        "from_hours": 6.0,
+        "reason": "hours changed 6.0 -> 12.5"
+      },
+      {
+        "op": "close",
+        "sprint_id": "sp-100",
+        "sprint": "Sprint 100",
+        "issue": "example-org/example-repo#377",
+        "reason": "sprint has ended"
+      }
+    ],
+    "created": [],
+    "repointed": [],
+    "hours_updated": [],
+    "closed": [],
+    "relabeled": null,
+    "skipped": [
+      {
+        "sprint": "Sprint 100",
+        "sprint_id": "sp-100",
+        "issue": "example-org/example-repo#377",
+        "minutes": 375.0,
+        "hours": 6.25,
+        "from_hours": 6.25,
+        "reason": "hours already synced"
+      }
+    ],
+    "errors": [],
+    "unassigned_minutes": 0,
+    "unbillable": [],
+    "superseded": [],
+    "bindings": [
+      {
+        "sprint_id": "sp-100",
+        "sprint": "Sprint 100",
+        "issue": "example-org/example-repo#377",
+        "state": "open",
+        "hours_synced": 6.25,
+        "synced_at": 1784677095.365668,
+        "created_at": 1784677095.365669
+      },
+      {
+        "sprint_id": "sp-102",
+        "sprint": "Sprint 102",
+        "issue": "example-org/example-repo#402",
+        "state": "open",
+        "hours_synced": 6.0,
+        "synced_at": 1785544370.9585369,
+        "created_at": 1781737791.563575
+      }
+    ]
+  }
+}

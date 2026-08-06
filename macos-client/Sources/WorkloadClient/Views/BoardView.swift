@@ -45,6 +45,10 @@ struct BoardView: View {
                     .frame(minHeight: 120, idealHeight: 200)
             }
         }
+        .sheet(item: Binding(get: { store.closeSheet },
+                             set: { if $0 == nil { store.dismissCloseSheet() } })) { sheet in
+            CloseSheetView(sheet: sheet).environment(store)
+        }
         .toolbar {
             ToolbarItem(placement: .status) {
                 BoardStatusLabel(taskCount: visibleTasks.count, roleFilter: roleFilter)

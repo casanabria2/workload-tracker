@@ -99,7 +99,7 @@ enum DaemonErrorCode: RawRepresentable, Sendable, Hashable {
 }
 
 /// The `{"error": {...}}` envelope, decoded.
-struct DaemonErrorBody: Decodable, Sendable {
+struct DaemonErrorBody: Decodable, Sendable, Equatable {
     let code: DaemonErrorCode
     let message: String
     /// Free-form extra context (`available`, `task_id`, …). Kept as a string
@@ -141,6 +141,14 @@ enum DaemonClientError: Error, Sendable {
     case decoding(underlying: any Error)
     /// The configured base URL string was not a valid URL.
     case invalidBaseURL(String)
+    /// **The client refused to send the request.** No socket was opened.
+    ///
+    /// The only user of this is `setStatus(taskId:status:)` rejecting `.done`:
+    /// the daemon's status endpoint routes `done` into the irreversible GitHub
+    /// close workflow, so it must go through the §7.1 confirmation sheet
+    /// instead. Modelled as an error rather than a `precondition` so the rule is
+    /// testable without crashing the test runner.
+    case refusedLocally(reason: String)
 
     /// Whether this represents "the daemon is not there", as opposed to "the
     /// daemon said no".
@@ -171,6 +179,8 @@ extension DaemonClientError: LocalizedError {
             "The daemon's response could not be decoded."
         case .invalidBaseURL(let string):
             "“\(string)” is not a valid daemon URL."
+        case .refusedLocally(let reason):
+            reason
         }
     }
 
