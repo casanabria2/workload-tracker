@@ -45,14 +45,24 @@ WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_wt_api.py \
     /tmp/wt-test/fx/pre.json /tmp/wt-test/fx/migrated.json \
     /tmp/wt-test/fx/baseline.json /tmp/wt-test/s-wt-api
 
+WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_daemon.py \
+    /tmp/wt-test/fx/pre.json /tmp/wt-test/fx/migrated.json \
+    /tmp/wt-test/fx/baseline.json /tmp/wt-test/s-daemon
+
+WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_legacy_contract.py \
+    /tmp/wt-test/fx/pre.json /tmp/wt-test/fx/migrated.json \
+    /tmp/wt-test/fx/baseline.json /tmp/wt-test/s-legacy
+
 # 3. Phase 0's concurrency harness takes a different shape.
 WT_DATA_FILE=/tmp/wt-test/unused.json venv/bin/python tools/test_atomic_save.py \
     /tmp/wt-test/work.json /tmp/wt-test/s-atomic 8
 ```
 
 `test_phase3.py` re-runs `test_reconcile.py`, and `test_mcp_phase3.py` re-runs
-both, so running the MCP one covers three of the five. `test_tracker_phase3.py`
-and `test_wt_api.py` are independent (the former redirects `HOME`).
+both, so running the MCP one covers three of the seven. `test_tracker_phase3.py`,
+`test_wt_api.py`, `test_daemon.py` and `test_legacy_contract.py` are independent
+(the tracker one redirects `HOME`; the legacy one imports helpers from
+`test_daemon.py`, so keep the two together).
 
 Belt and braces: put a fake `gh` first on `PATH` that logs and exits non-zero,
 run everything, and confirm the log stays empty.
@@ -214,6 +224,77 @@ Two deliberate fixture rebuilds, both announced in the output: the live data has
 unreachable until that facet is seeded on the scratch copy; and the `link_issue`
 subject's `github_repo` is cleared first, because almost every real task already
 has one and the repo-pinning branch would never be taken.
+
+### `test_daemon.py` — `wt_daemon.py`, the HTTP + SSE API (macOS-app plan Phase 2)
+
+Boots the daemon **in this process** on **ephemeral** ports (never 7373/7374/
+7375) and drives it over a real socket. In-process is deliberate: a subprocess
+daemon would not see the `gh` stubs, so every `close`/`reconcile` test would
+have to either skip the GitHub paths or let a real `gh` run. This way the
+socket, routing, auth, threading and SSE framing are genuinely exercised while
+the `gh` boundary stays stubbed. `browser_window` and `iterm_manager` are
+replaced in `sys.modules` with fakes, so no AppleScript, Safari or tmux.
+
+Covers: the `WtError` → HTTP status map (both directions, plus every code
+round-tripping through `error_response`); the `0600` token file; every
+`probe_data_file` reason; auth on every route; `snapshot`; task/log/timer CRUD
+with `check_invariants.py` after **each** mutation; GitHub link/unlink/open/push;
+the Safari-tab and iTerm endpoints; `close/plan`, `reconcile` (dry + real) and
+`close` as `202` + `operation_id` + SSE; transport errors (404/405/400);
+**the risk-#9 refusal**; **the lock-timeout 503**; SSE `changed` for both daemon
+and external writes, heartbeat, fan-out and unsubscribe; and the lifecycle
+(attach-don't-double-bind, refusing 7373, `--print-token`).
+
+> **§10 found a live, destructive bug and now guards it.** `wt.load()` is a
+> read-modify-**write** — it runs four migrations and `save()`s when any mutated
+> — so on a missing, zero-byte, corrupt or EPERM-under-TCC file it materialises
+> a `{}`-default document *over the real one*. Measured: one `wt.load()` against
+> a chmod-000 copy of the live-shaped fixture turned 210 KB of history into a
+> 520-byte empty file, mode preserved so it still *looked* unreadable. That is
+> risk #9 arriving through a plain `GET`, with no write endpoint involved.
+> `wt_daemon` therefore gates **reads** as well as writes (`_guarded_load`), and
+> §10 asserts the file is byte-identical after a refused write *and* four reads,
+> on the authenticated and the unauthenticated port alike.
+
+**Does not cover:** the daemon as a real subprocess (only `main()`'s
+already-running and `--print-token` paths); real GitHub semantics; TLS/remote
+access (there is none by design — loopback only).
+
+### `test_legacy_contract.py` — the `:7373` contract on the daemon (plan §5.4)
+
+Parity between `wt_daemon`'s legacy port and `tracker.py`'s `_BridgeHandler`,
+so `workload-macos-monitor` keeps working with the TUI closed and with **no
+Swift change**.
+
+**It derives its expectations from `tracker.py` at runtime** — it calls
+`WorkloadTracker._bridge_status` / `._bridge_list_tasks` / `._bridge_start_timer`
+/ `._bridge_stop_timer` as unbound methods against a minimal stand-in holding
+the same `_data` (borrowing the real `_commit_active_timer`), then compares key
+sets and value *types* against the daemon's HTTP responses. Hardcoding the keys
+is exactly how the four harnesses rotted before Phase 0.5.
+
+It additionally pins the **monitor's own** `Codable` requirements from
+`Models.swift`: `role` and `started_at` are non-optional there, so a null is a
+decode failure and a dead menu bar, not graceful degradation.
+
+Also covers: `active_window_id` end to end (a start really opens the faked
+Safari window and persists the id; a stop snapshots, closes and clears it); the
+`"Timer session"` log entry and its `logged_minutes` echo; the no-op success on
+a start for the already-running task; the flat `{"error": ...}` error shape and
+verbatim messages; the port being unauthenticated **and** opt-in; the v1 and
+legacy surfaces not leaking into each other; the Stream Deck extras
+(`/timer/toggle`, `/log/<m>`, `/filter/<role>`, and `/push` deliberately `501`);
+and an AST-level assertion that the daemon never imports Arc.
+
+> **One behavioural delta is asserted rather than hidden.**
+> `tracker._commit_active_timer` logs a session only when elapsed > 0.1 min
+> (6 s); `wt_api._commit_timer` — which `wt.cmd_stop` matches — uses > 0.05 min
+> (3 s). So a **3–6 second** session is logged by the daemon and the CLI and
+> discarded by the TUI. The harness pins all three cases (2 s / 4 s / 10 s), so
+> if either threshold moves it goes red.
+
+**Does not cover:** the monitor's Swift code itself (its expectations are
+transcribed from `Models.swift`, not compiled); Arc (deliberately unwired).
 
 ### `test_atomic_save.py` — `wt.save()` / `data_lock()` (Phase 0)
 
