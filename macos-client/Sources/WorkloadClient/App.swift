@@ -27,6 +27,12 @@ struct WorkloadClientApp: App {
                     _Concurrency.Task { await store.refresh() }
                 }
                 .keyboardShortcut("r", modifiers: .command)
+
+                // Plan §8.4. Owned by the menu bar rather than by the funnel
+                // menu's own row, so the shortcut is registered exactly once.
+                Button("Clear All Filters") { store.clearFilters() }
+                    .keyboardShortcut("k", modifiers: [.shift, .command])
+                    .disabled(!store.isFiltering)
             }
         }
 

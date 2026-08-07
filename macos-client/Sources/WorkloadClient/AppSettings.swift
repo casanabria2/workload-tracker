@@ -13,6 +13,7 @@ enum AppSettings {
     private static let tokenPathKey = "daemonTokenPath"
     private static let repositoryPathKey = "trackerRepositoryPath"
     private static let autoStartKey = "autoStartDaemon"
+    private static let lastFilterKey = "lastFilterState"
 
     // MARK: - Defaults
 
@@ -71,6 +72,28 @@ enum AppSettings {
     static var autoStartDaemon: Bool {
         get { UserDefaults.standard.bool(forKey: autoStartKey) }
         set { UserDefaults.standard.set(newValue, forKey: autoStartKey) }
+    }
+
+    /// The last `FilterState`, JSON-encoded — the **fallback** behind
+    /// `@SceneStorage("filterState")` (plan §8.1).
+    ///
+    /// `@SceneStorage` is the right home for a per-window filter, but it rides
+    /// on AppKit state restoration, which a bare SwiftPM executable with no
+    /// bundle and no bundle identifier does not get. Measured: after a filter
+    /// was set and the app relaunched, `defaults read WorkloadClient` held the
+    /// window frame and **no** `filterState` key, and the board came back on the
+    /// default filter. So the scene value is mirrored here, where it survives.
+    ///
+    /// When the app is packaged as a real `.app` (plan §12 / Phase 9) the scene
+    /// value starts working and takes precedence; this stays as the seed for a
+    /// brand-new window. Same failure shape as the Phase 4 `UTType` bug: a
+    /// mechanism that compiles, runs, and silently does nothing.
+    ///
+    /// `""` means "never written", which must stay distinguishable from an
+    /// explicitly cleared filter — see `FilterStateCodec`.
+    static var lastFilterState: String {
+        get { UserDefaults.standard.string(forKey: lastFilterKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: lastFilterKey) }
     }
 
     private static func nonBlank(_ key: String) -> String? {

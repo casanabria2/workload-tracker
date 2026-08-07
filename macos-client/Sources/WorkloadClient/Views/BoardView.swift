@@ -11,8 +11,6 @@ import UniformTypeIdentifiers
 /// times.
 struct BoardView: View {
     @Environment(Store.self) private var store
-    /// Non-nil when the sidebar selected a single role, which scopes the board.
-    let roleFilter: String?
 
     /// The card currently being dragged.
     ///
@@ -26,22 +24,33 @@ struct BoardView: View {
     @State private var selection: String?
     @FocusState private var boardFocused: Bool
 
-    private var visibleTasks: [TrackerTask] {
-        guard let roleFilter else { return store.tasks }
-        return store.tasks.filter { $0.roleId == roleFilter }
-    }
-
-    /// What the column shows, after the current scope.
+    /// What the column shows, after the shared `FilterState` (plan §8).
     private func column(_ status: TaskStatus) -> [TrackerTask] {
-        let scoped = store.boardTasks(status)
-        guard let roleFilter else { return scoped }
-        return scoped.filter { $0.roleId == roleFilter }
+        store.filteredBoardTasks(status)
     }
 
-    private var recurrent: [TrackerTask] {
-        guard let roleFilter else { return store.recurrentTasks }
-        return store.recurrentTasks.filter { $0.roleId == roleFilter }
+    private var recurrent: [TrackerTask] { store.filteredRecurrentTasks }
+
+    /// True when every board column is empty *because of* the filter — as
+    /// opposed to a genuinely empty tracker, which is a different message.
+    private var isFilteredToNothing: Bool {
+        store.isFiltering
+            && !store.tasks.isEmpty
+            && TaskStatus.boardColumns.allSatisfy { column($0).isEmpty }
     }
+
+    /// The keyboard cursor, built from **the same arrays the columns render**.
+    ///
+    /// `static` and internal so a test can construct it from a `Store` exactly
+    /// the way the view does; that is what makes "a filtered-out card is not
+    /// reachable by keyboard" an assertable fact rather than a claim.
+    static func cursor(for store: Store) -> BoardCursor {
+        BoardCursor(columns: TaskStatus.boardColumns.map {
+            store.filteredBoardTasks($0).map(\.id)
+        })
+    }
+
+    private var cursor: BoardCursor { Self.cursor(for: store) }
 
     var body: some View {
         @Bindable var store = store
@@ -72,15 +81,21 @@ struct BoardView: View {
         .focused($boardFocused)
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { press in handle(press) }
-        .onAppear { if selection == nil { selection = firstSelectableID() } }
+        .onAppear { selection = cursor.revalidated(selection) }
+        // A filter change can pull the selected card out from under the cursor.
+        // Revalidating here is what stops `⌘→` acting on an invisible card.
+        .onChange(of: store.filter) { _, _ in selection = cursor.revalidated(selection) }
         .sheet(item: Binding(get: { store.closeSheet },
                              set: { if $0 == nil { store.dismissCloseSheet() } })) { sheet in
             CloseSheetView(sheet: sheet).environment(store)
         }
+        .filterSearchField(store)
         .toolbar {
             ToolbarItem(placement: .status) {
-                BoardStatusLabel(taskCount: visibleTasks.count, roleFilter: roleFilter)
+                BoardStatusLabel(taskCount: store.filteredTasks.count,
+                                 totalCount: store.tasks.count)
             }
+            ToolbarItem { FilterMenu() }
             ToolbarItem {
                 Toggle(isOn: $store.showsRecurrentShelf) {
                     Label("Recurrent Shelf", systemImage: "tray.2")
@@ -91,16 +106,23 @@ struct BoardView: View {
         }
     }
 
+    @ViewBuilder
     private var columns: some View {
-        HStack(alignment: .top, spacing: 0) {
-            ForEach(Array(TaskStatus.boardColumns.enumerated()), id: \.offset) { index, status in
-                BoardColumn(status: status,
-                            tasks: column(status),
-                            unfilteredTasks: store.boardTasks(status),
-                            dragging: $dragging,
-                            selection: $selection)
-                if index < TaskStatus.boardColumns.count - 1 {
-                    Divider()
+        if isFilteredToNothing {
+            FilteredEmptyView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            HStack(alignment: .top, spacing: 0) {
+                ForEach(Array(TaskStatus.boardColumns.enumerated()),
+                        id: \.offset) { index, status in
+                    BoardColumn(status: status,
+                                tasks: column(status),
+                                unfilteredTasks: store.boardTasks(status),
+                                dragging: $dragging,
+                                selection: $selection)
+                    if index < TaskStatus.boardColumns.count - 1 {
+                        Divider()
+                    }
                 }
             }
         }
@@ -128,52 +150,25 @@ struct BoardView: View {
         }
     }
 
-    private func location(of id: String?) -> (column: Int, row: Int)? {
-        guard let id else { return nil }
-        for (index, status) in TaskStatus.boardColumns.enumerated() {
-            if let row = column(status).firstIndex(where: { $0.id == id }) {
-                return (index, row)
-            }
-        }
-        return nil
-    }
-
-    private func firstSelectableID() -> String? {
-        TaskStatus.boardColumns.lazy.compactMap { column($0).first?.id }.first
-    }
-
     private func moveSelection(byColumn offset: Int) -> KeyPress.Result {
-        guard let here = location(of: selection) else {
-            selection = firstSelectableID()
-            return selection == nil ? .ignored : .handled
-        }
-        var index = here.column + offset
-        while TaskStatus.boardColumns.indices.contains(index) {
-            let tasks = column(TaskStatus.boardColumns[index])
-            if !tasks.isEmpty {
-                selection = tasks[min(here.row, tasks.count - 1)].id
-                return .handled
-            }
-            index += offset
-        }
-        return .handled
+        let cursor = cursor
+        selection = cursor.move(from: selection, byColumn: offset)
+        return selection == nil ? .ignored : .handled
     }
 
     private func moveSelection(byRow offset: Int) -> KeyPress.Result {
-        guard let here = location(of: selection) else {
-            selection = firstSelectableID()
-            return selection == nil ? .ignored : .handled
-        }
-        let tasks = column(TaskStatus.boardColumns[here.column])
-        let row = max(0, min(tasks.count - 1, here.row + offset))
-        selection = tasks[row].id
-        return .handled
+        let cursor = cursor
+        selection = cursor.move(from: selection, byRow: offset)
+        return selection == nil ? .ignored : .handled
     }
 
+    /// `⌘←`/`⌘→`. Refuses outright when the selection is not on a **visible**
+    /// card: `cursor.location` is built from the filtered columns, so a card the
+    /// filter is hiding has no location and therefore cannot be moved.
     private func moveSelectedCard(by offset: Int) -> KeyPress.Result {
         guard let id = selection,
               let task = store.tasks.first(where: { $0.id == id }),
-              let here = location(of: id) else { return .ignored }
+              let here = cursor.location(of: id) else { return .ignored }
         let source = TaskStatus.boardColumns[here.column]
         guard let target = store.neighbourColumn(of: source, offset: offset) else {
             store.show(.info("\(source.displayName) is the "
@@ -229,7 +224,7 @@ private struct FeedbackBar: View {
 private struct BoardStatusLabel: View {
     @Environment(Store.self) private var store
     let taskCount: Int
-    let roleFilter: String?
+    let totalCount: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -242,12 +237,11 @@ private struct BoardStatusLabel: View {
     }
 
     private var scopeText: String {
-        let role = roleFilter.flatMap { id in
-            store.roles.first { $0.id == id }?.displayName
-        }
         let sprint = store.currentSprint?.displayName ?? "no current sprint"
-        if let role { return "\(role) · \(taskCount) tasks · \(sprint)" }
-        return "\(taskCount) tasks · \(sprint)"
+        let counts = taskCount == totalCount
+            ? "\(taskCount) tasks"
+            : "\(taskCount) of \(totalCount) tasks"
+        return "\(counts) · \(sprint)"
     }
 }
 
@@ -360,8 +354,21 @@ struct BoardColumn: View {
     private func body(for tasks: [TrackerTask]) -> some View {
         if tasks.isEmpty {
             ZStack {
-                ContentUnavailableView("Nothing in \(status.displayName)",
-                                       systemImage: "tray")
+                // A column emptied by the filter says so, and offers the way
+                // out — the board-wide `FilteredEmptyView` only appears when
+                // *all three* columns are empty.
+                if unfilteredTasks.isEmpty {
+                    ContentUnavailableView("Nothing in \(status.displayName)",
+                                           systemImage: "tray")
+                } else {
+                    ContentUnavailableView {
+                        Label("Nothing in \(status.displayName)", systemImage: "tray")
+                    } description: {
+                        Text("\(unfilteredTasks.count) hidden by the filter.")
+                    } actions: {
+                        Button("Clear Filters") { store.clearFilters() }
+                    }
+                }
                 if insertionRow != nil { InsertionIndicator() .padding(.horizontal, 12) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)

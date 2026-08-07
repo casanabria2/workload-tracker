@@ -5,6 +5,11 @@ import SwiftUI
 struct RootView: View {
     @Environment(Store.self) private var store
     @SceneStorage("sidebarSelection") private var storedSelection: String = "board"
+    /// The whole `FilterState` as JSON (plan §8.1: "persists in `@SceneStorage`
+    /// across launches"). `@SceneStorage` only stores primitives, so it
+    /// round-trips through `FilterStateCodec` — the same shape the sidebar
+    /// selection already uses.
+    @SceneStorage("filterState") private var storedFilter: String = ""
     @State private var selection: SidebarSelection? = .board
 
     var body: some View {
@@ -20,10 +25,27 @@ struct RootView: View {
         .navigationTitle(navigationTitle)
         .navigationSubtitle(store.currentSprint?.displayName ?? "")
         .task { store.start() }
-        .onAppear { selection = Self.decode(storedSelection) }
+        .onAppear {
+            selection = Self.decode(storedSelection)
+            // Restoring *before* the first snapshot lands is what cancels the
+            // current-sprint default, so a filter the user cleared stays clear.
+            //
+            // The scene value wins when there is one; `AppSettings` is the
+            // fallback that actually survives a relaunch of this un-bundled
+            // executable (see `AppSettings.lastFilterState`).
+            if let restored = FilterStateCodec.decode(storedFilter)
+                ?? FilterStateCodec.decode(AppSettings.lastFilterState) {
+                store.restoreFilter(restored)
+            }
+        }
         .onChange(of: selection) { _, new in
             storedSelection = Self.encode(new ?? .board)
             if let new { store.selection = new }
+        }
+        .onChange(of: store.filter) { _, new in
+            let encoded = FilterStateCodec.encode(new)
+            storedFilter = encoded
+            AppSettings.lastFilterState = encoded
         }
     }
 
@@ -54,9 +76,7 @@ struct RootView: View {
     private var content: some View {
         switch selection ?? .board {
         case .board:
-            BoardView(roleFilter: nil)
-        case .role(let id):
-            BoardView(roleFilter: id)
+            BoardView()
         case .timeline:
             PhasePlaceholderView(
                 title: "Timeline",
@@ -81,8 +101,6 @@ struct RootView: View {
         case .board: "Board"
         case .timeline: "Timeline"
         case .overview: "Overview"
-        case .role(let id):
-            store.roles.first { $0.id == id }?.displayName ?? id
         }
     }
 
@@ -95,16 +113,40 @@ struct RootView: View {
         case .board: "board"
         case .timeline: "timeline"
         case .overview: "overview"
-        case .role(let id): "role:\(id)"
         }
     }
 
     private static func decode(_ raw: String) -> SidebarSelection {
-        if raw.hasPrefix("role:") { return .role(String(raw.dropFirst(5))) }
+        // `role:…` was Phase 3's per-role board scope. Roles are a filter facet
+        // now, so a scene saved by that build lands on the board.
+        if raw.hasPrefix("role:") { return .board }
         switch raw {
         case "timeline": return .timeline
         case "overview": return .overview
         default: return .board
         }
+    }
+}
+
+/// `FilterState` ⇄ the single `String` `@SceneStorage` can hold.
+///
+/// Its own type rather than a pair of `RootView` methods so the round trip is
+/// unit-testable — a codec that silently fails to decode would quietly retire
+/// filter persistence with nothing going red.
+enum FilterStateCodec {
+    /// An **empty** filter still encodes to JSON, not to `""`. "The user cleared
+    /// everything" and "nothing has ever been stored" must stay distinguishable,
+    /// or clearing the Sprint facet would be undone by the default seed on the
+    /// next launch.
+    static func encode(_ state: FilterState) -> String {
+        guard let data = try? JSONEncoder().encode(state) else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// `nil` for "nothing stored", which is different from "an empty filter was
+    /// stored" — only the latter should cancel the current-sprint default.
+    static func decode(_ raw: String) -> FilterState? {
+        guard !raw.isEmpty else { return nil }
+        return try? JSONDecoder().decode(FilterState.self, from: Data(raw.utf8))
     }
 }

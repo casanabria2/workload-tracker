@@ -63,6 +63,27 @@ final class Store {
     /// Whether the recurrent shelf is expanded.
     var showsRecurrentShelf: Bool = true
 
+    // MARK: - Phase 5 filter state
+
+    /// **The** filter (plan §8.1). One instance, written by the sidebar's Roles
+    /// rows, by the toolbar's facet menu and by the search field alike, and read
+    /// by every view of the snapshot. Persisted by `RootView` via
+    /// `@SceneStorage`.
+    var filter = FilterState()
+
+    /// The options each facet offers, recomputed whenever the snapshot changes.
+    ///
+    /// Cached rather than computed on access: building it probes every task
+    /// against every candidate value, and a SwiftUI body can read it many times
+    /// per frame.
+    private(set) var facets: FacetCatalog = .empty
+
+    /// Guards the one-shot default. The Sprint facet defaults to the current
+    /// sprint (§8.2), but only until either a snapshot has seeded it or a
+    /// persisted filter has been restored — otherwise deliberately clearing the
+    /// sprint filter would be undone by the next refresh.
+    private var didSeedDefaultSprint = false
+
     // MARK: - Phase 4 write state
 
     /// The close-confirmation sheet, or `nil` when none is open. Nothing
@@ -110,6 +131,7 @@ final class Store {
         self.connection = .live
         self.lastUpdated = now
         self.now = now
+        self.adoptSnapshotForFiltering()
     }
 
     /// A store with a snapshot **and** a client, but with `start()` never
@@ -124,6 +146,7 @@ final class Store {
         self.connection = snapshot == nil ? .connecting : .live
         self.lastUpdated = snapshot == nil ? nil : now
         self.now = now
+        self.adoptSnapshotForFiltering()
     }
 
     // MARK: - Lifecycle
@@ -240,6 +263,7 @@ final class Store {
             let fetched = try await client.snapshot()
             self.snapshot = fetched
             self.prunePendingStatus(against: fetched)
+            self.adoptSnapshotForFiltering()
             // Health is supplementary (TUI-running warning, daemon version); a
             // failure there must not blank a snapshot that arrived fine.
             self.health = try? await client.health()
@@ -376,6 +400,101 @@ final class Store {
         return tasks.reduce(0) { $0 + $1.minutes(inSprint: sprintID) }
     }
 
+    // MARK: - Filtering (plan §8)
+
+    /// Rebuilds the facet catalog for a freshly arrived snapshot and, exactly
+    /// once, seeds the Sprint facet with the current sprint.
+    private func adoptSnapshotForFiltering() {
+        facets = FacetCatalog.build(from: snapshot)
+        guard !didSeedDefaultSprint else { return }
+        guard let id = currentSprint?.id else { return }
+        didSeedDefaultSprint = true
+        filter.sprints = [id]
+    }
+
+    /// Installs a filter restored from `@SceneStorage` and cancels the
+    /// current-sprint default, so a filter the user deliberately left empty
+    /// stays empty across a relaunch.
+    func restoreFilter(_ state: FilterState) {
+        didSeedDefaultSprint = true
+        filter = state
+    }
+
+    /// Everything the filter admits, recurrent included.
+    var filteredTasks: [TrackerTask] {
+        TaskFilter.apply(filter, to: tasks, currentSprintID: currentSprint?.id)
+    }
+
+    /// **The board's columns.** The one accessor the view renders from *and*
+    /// the keyboard cursor is built from, so a card hidden by a filter cannot be
+    /// reached by `⌘←`/`⌘→`.
+    ///
+    /// Composes with the optimistic overlay rather than replacing it:
+    /// `boardTasks` already reads through `pendingStatus`.
+    func filteredBoardTasks(_ status: TaskStatus) -> [TrackerTask] {
+        TaskFilter.apply(filter, to: boardTasks(status), currentSprintID: currentSprint?.id)
+    }
+
+    var filteredRecurrentTasks: [TrackerTask] {
+        TaskFilter.apply(filter, to: recurrentTasks, currentSprintID: currentSprint?.id)
+    }
+
+    var isFiltering: Bool { !filter.isEmpty }
+
+    /// Turns one facet value on or off. The sidebar's Roles rows and the
+    /// toolbar's facet menu both come through here — plan §8.4's "one state, two
+    /// views of it" is enforced by there being no other mutator.
+    func toggle(_ value: String, in facet: Facet) {
+        filter.toggle(value, in: facet)
+    }
+
+    func isSelected(_ value: String, in facet: Facet) -> Bool {
+        filter[facet].contains(value)
+    }
+
+    func clearFilters() {
+        filter = FilterState()
+    }
+
+    func clear(_ facet: Facet) {
+        filter[facet] = []
+    }
+
+    /// The active facet values as search-field tokens (§8.4).
+    var filterTokens: [FilterToken] {
+        Facet.allCases.flatMap { facet in
+            // Sorted by the catalog's own order so tokens do not shuffle as the
+            // underlying `Set` rehashes.
+            facets.options(for: facet)
+                .filter { filter[facet].contains($0.value) }
+                .map { FilterToken(facet: facet, value: $0.value, label: $0.label) }
+            + filter[facet].subtracting(facets.options(for: facet).map(\.value)).sorted()
+                .map { FilterToken(facet: facet, value: $0,
+                                   label: facets.label(for: $0, in: facet)) }
+        }
+    }
+
+    /// Replaces the facet selections with exactly the tokens that survive.
+    ///
+    /// This is how removing a token in the search field unchecks the matching
+    /// sidebar row and menu item: there is one state, and the token list is a
+    /// projection of it that can be written back.
+    func applyTokens(_ tokens: [FilterToken]) {
+        for facet in Facet.allCases {
+            filter[facet] = Set(tokens.filter { $0.facet == facet }.map(\.value))
+        }
+    }
+
+    /// Which facets to name in the empty state, and offer a one-click clear for.
+    var blockingFacets: [Facet] {
+        TaskFilter.blockingFacets(filter, tasks: tasks, currentSprintID: currentSprint?.id)
+    }
+
+    /// Whether the free-text term alone is what emptied the result.
+    var textIsBlocking: Bool {
+        TaskFilter.textIsBlocking(filter, tasks: tasks, currentSprintID: currentSprint?.id)
+    }
+
     // MARK: - Optimistic status
 
     /// The status the board should draw this task in: the pending one if a
@@ -464,9 +583,13 @@ final class Store {
     /// not persist card order (it is derived from `last_logged_at`), so an
     /// indicator that followed the cursor would promise a placement the data
     /// model cannot keep.
+    ///
+    /// Counts against the **filtered** column, because that is what is drawn. A
+    /// status change never alters a task's role, activity, repo or logged time,
+    /// so a card that was visible before the move is still visible after it.
     func landingIndex(of taskId: String, movedTo column: TaskStatus) -> Int {
         guard let moved = tasks.first(where: { $0.id == taskId }) else { return 0 }
-        var destination = boardTasks(column).filter { $0.id != taskId }
+        var destination = filteredBoardTasks(column).filter { $0.id != taskId }
         destination.append(moved)
         destination.sort(by: Self.boardOrder)
         return destination.firstIndex { $0.id == taskId } ?? destination.count - 1
@@ -692,12 +815,39 @@ struct RoleSummary: Identifiable, Equatable {
     var id: String { role.id }
 }
 
-/// What the sidebar can select. The Roles section is navigation-shaped in Phase
-/// 3 (it scopes the board to one role); Phase 5 turns it into a multi-select
-/// filter writing shared `FilterState`.
+/// One active facet value, rendered as a removable chip in the search field.
+///
+/// `.searchable(text:tokens:)` owns the array, so removing a chip hands back a
+/// shorter one; `Store.applyTokens` writes that difference into the single
+/// `FilterState`.
+struct FilterToken: Identifiable, Hashable, Sendable {
+    let facet: Facet
+    let value: String
+    let label: String
+
+    /// Facet-qualified: two facets can legitimately offer the same string (a
+    /// role id and an activity name have collided before in this data).
+    var id: String { "\(facet.rawValue)\u{1}\(value)" }
+
+    /// `Activity Type: Workshop` — the facet has to be in the chip, or two
+    /// chips reading `Workshop` and `Sprint 105` look like one list.
+    ///
+    /// Except when the label already opens with the facet's name, which every
+    /// sprint's does: `Sprint: Sprint 105` is a stutter, and it is what the
+    /// first render of this actually showed.
+    var display: String {
+        label.hasPrefix(facet.displayName) ? label : "\(facet.displayName): \(label)"
+    }
+}
+
+/// What the sidebar can select.
+///
+/// The Roles section **is no longer navigation**: Phase 5 made those rows
+/// multi-select toggles over the shared `FilterState.roles` (§8.4), so there is
+/// no `.role` case any more and `RootView.decode` folds a persisted `role:…`
+/// from an earlier build back to `.board`.
 enum SidebarSelection: Hashable, Codable {
     case board
     case timeline
     case overview
-    case role(String)
 }

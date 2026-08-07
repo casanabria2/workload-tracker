@@ -4,10 +4,14 @@ import SwiftUI
 /// **Roles** section listing each role with its logged time — the Calendar.app
 /// pattern (plan §11).
 ///
-/// In Phase 3 selecting a role scopes the board to that role. Phase 5 replaces
-/// that with multi-select toggles writing the shared `FilterState`, at which
-/// point the Roles rows stop being navigation and become a second view of the
-/// filter. The section is laid out now so that change is additive.
+/// Phase 5 made the Roles rows **multi-select filter toggles, not navigation**
+/// (§8.4). Each row writes `Store.filter.roles` through `Store.toggle`, which is
+/// the very same call the toolbar's Filter menu makes — one state, two views of
+/// it. Checking a role here makes its token appear in the search field;
+/// deleting that token unchecks the row.
+///
+/// Role gets this privileged always-visible position because it is the facet
+/// with per-role time totals worth seeing even when you are not filtering.
 struct SidebarView: View {
     @Environment(Store.self) private var store
     @Binding var selection: SidebarSelection?
@@ -23,10 +27,23 @@ struct SidebarView: View {
                     .tag(SidebarSelection.overview)
             }
 
-            Section("Roles") {
+            Section {
                 ForEach(store.roleSummaries) { summary in
-                    RoleRow(summary: summary)
-                        .tag(SidebarSelection.role(summary.role.id))
+                    RoleRow(summary: summary,
+                            isOn: store.isSelected(summary.role.id, in: .role)) {
+                        store.toggle(summary.role.id, in: .role)
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Roles")
+                    Spacer()
+                    if !store.filter.roles.isEmpty {
+                        Button("Clear") { store.clear(.role) }
+                            .buttonStyle(.plain)
+                            .font(.caption)
+                            .foregroundStyle(Color.accentColor)
+                    }
                 }
             }
         }
@@ -38,28 +55,38 @@ struct SidebarView: View {
     }
 }
 
-/// One Roles row: color chip, name, task count, logged time.
+/// One Roles row: a checkbox over color chip, name, task count and logged time.
+///
+/// A role with no tasks stays listed — the sidebar is a directory of what exists
+/// — but is not togglable, because selecting it could only ever produce an empty
+/// board. Same reasoning as the facet self-hide rule in §8.3.
 private struct RoleRow: View {
     let summary: RoleSummary
+    let isOn: Bool
+    let toggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(summary.color)
-                .frame(width: 9, height: 9)
-                .overlay(Circle().strokeBorder(.primary.opacity(0.15), lineWidth: 0.5))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(summary.role.displayName)
-                    .lineLimit(1)
-                Text("\(summary.taskCount) task\(summary.taskCount == 1 ? "" : "s")")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+        Toggle(isOn: Binding(get: { isOn }, set: { _ in toggle() })) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(summary.color)
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().strokeBorder(.primary.opacity(0.15), lineWidth: 0.5))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(summary.role.displayName)
+                        .lineLimit(1)
+                    Text("\(summary.taskCount) task\(summary.taskCount == 1 ? "" : "s")")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 8)
+                Text(Duration.format(minutes: summary.loggedMins))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 8)
-            Text(Duration.format(minutes: summary.loggedMins))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
         }
+        .toggleStyle(.checkbox)
+        .disabled(summary.taskCount == 0)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             "\(summary.role.displayName), \(summary.taskCount) tasks, "
