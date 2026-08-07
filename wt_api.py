@@ -712,7 +712,7 @@ def status_overview(data: dict) -> dict:
 
 # ----------------------------------------------------------------- timers -----
 
-def start_timer(data: dict, task_id: str, *, browser: bool = True) -> dict:
+def start_timer(data: dict, task_id: str, *, browser: bool = False) -> dict:
     """Start the timer on a task, committing any running one first.
 
     A sub-3-second session is discarded rather than logged, matching every other
@@ -722,6 +722,14 @@ def start_timer(data: dict, task_id: str, *, browser: bool = True) -> dict:
     window never aborts the timer flow). Arc space focus is deliberately **not**
     performed here: per CLAUDE.md a remote start must not reshuffle the Arc
     workspace, and Arc is deprecated.
+
+    **``browser`` defaults to False**: opening a Safari window is a visible side
+    effect on the user's desktop, so a caller has to ask for it rather than
+    inherit it. Both production callers pass the flag explicitly — the daemon's
+    v1 endpoint from its request body, and the legacy ``:7375`` endpoint as a
+    hard ``True`` to stay byte-compatible with ``tracker.py``'s bridge — so this
+    default governs only new callers and tests. That is the point: a test that
+    forgets the flag should do nothing to the desktop.
     """
     task = require_task(data, task_id)
     prev, stopped = None, None
@@ -740,7 +748,7 @@ def start_timer(data: dict, task_id: str, *, browser: bool = True) -> dict:
             "stopped": stopped}
 
 
-def stop_timer(data: dict, *, browser: bool = True) -> dict:
+def stop_timer(data: dict, *, browser: bool = False) -> dict:
     """Stop the running timer and log the elapsed session.
 
     Raises ``no_active_timer`` when nothing is running, so a caller can tell
