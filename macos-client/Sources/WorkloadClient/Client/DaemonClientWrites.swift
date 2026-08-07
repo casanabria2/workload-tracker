@@ -100,10 +100,11 @@ extension DaemonClient {
 
     /// `POST /v1/timer/start`.
     ///
-    /// - Parameter browser: opens the task's dedicated Safari window, matching
-    ///   what the TUI's `t` key and the Stream Deck bridge do. **Always passed
-    ///   explicitly**: the daemon endpoint defaults it to `true`, so omitting it
-    ///   would silently open real windows — including from a test.
+    /// - Parameter browser: opens the task's dedicated Safari window.
+    ///   **Always passed explicitly.** The daemon's default flipped from `true`
+    ///   to `false` in `0fdf2d7`; a client that relies on a server default
+    ///   changes behaviour when the server does, silently. `AppSettings`
+    ///   supplies it, defaulting off.
     func startTimer(taskId: String, browser: Bool) async throws -> TimerStart {
         try await post("/v1/timer/start",
                        body: ["task_id": .string(taskId), "browser": .bool(browser)],

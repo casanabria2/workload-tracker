@@ -75,26 +75,22 @@ enum AppSettings {
         set { UserDefaults.standard.set(newValue, forKey: autoStartKey) }
     }
 
-    /// Whether starting a timer opens the task's dedicated Safari window.
+    /// Whether starting or stopping a timer opens/snapshots the task's
+    /// dedicated Safari window.
     ///
-    /// Defaults to **on**, matching what the TUI's `t` key and the Stream Deck
-    /// bridge already do (`_browser_on_task_started`), so the app behaves like
-    /// the thing it replaces.
+    /// Defaults to **off**, matching `wt_daemon`'s own default since `0fdf2d7`:
+    /// *"a v1 client starting a timer should not reach out and rearrange the
+    /// user's desktop"*. The plan's §13.5 now lists the Safari integration as a
+    /// removal target rather than a deprecation, so this must not be the thing
+    /// that keeps it alive.
     ///
-    /// It is a setting at all — rather than just passing `true` — because the
-    /// daemon's `POST /v1/timer/start` defaults `browser` to `true` on its own,
-    /// so the flag has to be sent explicitly to ever be `false`. Without a way
-    /// to turn it off, every timer start from this app opens real Safari windows
-    /// on the owner's desktop, including from a test run.
-    ///
-    /// `registerDefaults` seeds `true`, because `UserDefaults.bool` returns
-    /// `false` for an absent key and the safe-looking default is the wrong one
-    /// here.
+    /// The flag is still **sent explicitly** on every call rather than omitted.
+    /// The daemon's default has flipped once already; a client that relies on it
+    /// changes behaviour when the server does, silently. Sending it also keeps
+    /// the capability reachable — the daemon still opens the window for a client
+    /// that asks — without making it the default.
     static var opensTaskWindow: Bool {
-        get {
-            UserDefaults.standard.register(defaults: [opensTaskWindowKey: true])
-            return UserDefaults.standard.bool(forKey: opensTaskWindowKey)
-        }
+        get { UserDefaults.standard.bool(forKey: opensTaskWindowKey) }
         set { UserDefaults.standard.set(newValue, forKey: opensTaskWindowKey) }
     }
 

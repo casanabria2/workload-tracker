@@ -391,22 +391,48 @@ final class RecurrentShelfTests: XCTestCase {
 
     // MARK: - The benign actions
 
-    /// The timer flag is always sent, because the daemon defaults it to `true`.
+    /// The timer flag is **always sent**, never omitted.
+    ///
+    /// The daemon's `browser` default flipped from `true` to `false` in
+    /// `0fdf2d7`. A client that leaned on the server default would have changed
+    /// behaviour that day without a line of its own changing, so the flag is
+    /// explicit and this asserts it reaches the wire.
     func testStartTimerAlwaysSendsTheBrowserFlag() async throws {
         let transport = StubTransport()
-        transport.respond { _ in
-            .json(["task_id": "r-live", "title": "Ad-hoc questions",
-                   "started_at": 1776600000.0, "stopped": NSNull()])
+        // Only the timer path answers. The post-write `refresh()` gets a 404,
+        // which leaves the existing snapshot in place — answering it with this
+        // body would decode as a snapshot with no tasks and lose the fixture.
+        transport.respond { request in
+            request.path == "/v1/timer/start"
+                ? .json(["task_id": "r-live", "title": "Ad-hoc questions",
+                         "started_at": 1776600000.0, "stopped": NSNull()])
+                : .failure(code: "not_found", message: "unstubbed", status: 404)
         }
         let store = try makeStore(transport)
+        let restore = AppSettings.opensTaskWindow
+        defer { AppSettings.opensTaskWindow = restore }
+
         AppSettings.opensTaskWindow = false
-        defer { AppSettings.opensTaskWindow = true }
-
         await store.perform(.startTimer, on: try task("r-live", in: store))
-
-        let start = try XCTUnwrap(transport.requests.first { $0.path == "/v1/timer/start" })
+        var start = try XCTUnwrap(transport.requests.first { $0.path == "/v1/timer/start" })
         XCTAssertEqual(start.body["browser"], "false")
         XCTAssertEqual(start.body["task_id"], "r-live")
+
+        // And the capability is still reachable when the setting asks for it.
+        transport.reset()
+        AppSettings.opensTaskWindow = true
+        await store.perform(.startTimer, on: try task("r-quiet", in: store))
+        start = try XCTUnwrap(transport.requests.first { $0.path == "/v1/timer/start" })
+        XCTAssertEqual(start.body["browser"], "true")
+    }
+
+    /// The shipped default must be **off**, matching the daemon and the plan's
+    /// decision that the Safari integration is a removal target.
+    func testTaskWindowDefaultsOff() {
+        let restore = AppSettings.opensTaskWindow
+        defer { AppSettings.opensTaskWindow = restore }
+        UserDefaults.standard.removeObject(forKey: "opensTaskWindow")
+        XCTAssertFalse(AppSettings.opensTaskWindow)
     }
 
     /// Start Timer is a no-op on the task the timer is already running on, and

@@ -814,10 +814,10 @@ final class Store {
 
     /// Starts the timer on a shelf row.
     ///
-    /// `browser` is passed explicitly and comes from Settings. The daemon's
-    /// endpoint defaults it to `true`, so leaving it out would open the task's
-    /// dedicated Safari window on every start — which is the TUI's behaviour and
-    /// a reasonable default, but not one to inherit silently.
+    /// `browser` is passed explicitly and comes from Settings, which defaults it
+    /// off — matching the daemon since `0fdf2d7`, and the plan's decision that
+    /// the Safari integration is a removal target. Sent rather than omitted so a
+    /// future change to the server default cannot move this client silently.
     func startTimer(on task: TrackerTask) async {
         do {
             let started = try await client.startTimer(taskId: task.id,
