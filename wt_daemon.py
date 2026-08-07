@@ -976,7 +976,13 @@ class ApiHandler(_BaseHandler):
         task_id = body.get("task_id")
         if not task_id:
             raise DaemonError("bad_request", "'task_id' is required")
-        browser = _flag(body.get("browser"), True)
+        # Defaults to **False**: a v1 client starting a timer should not reach
+        # out and rearrange the user's desktop. The per-task Safari window is
+        # still a feature — the TUI and `wt start` open it, and the legacy
+        # :7375 endpoints below hard-code True to stay byte-compatible with
+        # tracker.py's bridge — but the app has to ask for it, by sending
+        # `{"browser": true}`, rather than get it by omission.
+        browser = _flag(body.get("browser"), False)
         result = self.daemon.write(
             lambda data: wt_api.start_timer(data, task_id, browser=browser),
             reason="timer_started", task_id=task_id)
@@ -988,7 +994,10 @@ class ApiHandler(_BaseHandler):
     @route("POST", rf"^{API_PREFIX}/timer/stop$")
     def h_timer_stop(self):
         body = self.read_json()
-        browser = _flag(body.get("browser"), True)
+        # False for the same reason as start, and for a sharper one: with start
+        # no longer opening a window, a stop that defaulted to True would
+        # snapshot and close a Safari window the *user* opened by hand.
+        browser = _flag(body.get("browser"), False)
         result = self.daemon.write(
             lambda data: wt_api.stop_timer(data, browser=browser),
             reason="timer_stopped")

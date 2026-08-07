@@ -746,15 +746,31 @@ def test_task_and_log_endpoints(wt, wt_api, wt_daemon, migrated, baseline,
               str(FakeSafariWindowManager.calls))
         invariants(work, "POST /v1/timer/start")
 
-        # Now give it tabs and restart: the Safari window must open, and Arc
-        # must still not be touched.
+        # Now give it tabs. The v1 endpoint defaults to **browser=false**: a v1
+        # client must not rearrange the user's desktop by omission. The Safari
+        # window is still a feature — it opens when the client asks for it, and
+        # the legacy :7375 start hard-codes True to match tracker.py's bridge —
+        # so both halves are asserted here rather than just the new default.
         h.post("/v1/timer/stop")
         h.post(f"/v1/tasks/{task_id}/tabs/save")   # the fake writes two URLs
         FakeSafariWindowManager.calls.clear()
         status, body, _ = h.post("/v1/timer/start", {"task_id": task_id})
+        check(status == 200 and not [c for c in FakeSafariWindowManager.calls
+                                     if c[0] == "open"],
+              "…a start WITH saved tabs still opens no window by default",
+              f"{status} {FakeSafariWindowManager.calls}")
+        check(next(t for t in wt.load()["tasks"]
+                   if t["id"] == task_id).get("active_window_id") is None,
+              "…and no active_window_id is recorded")
+
+        # …but the capability is intact when asked for explicitly.
+        h.post("/v1/timer/stop")
+        FakeSafariWindowManager.calls.clear()
+        status, body, _ = h.post("/v1/timer/start",
+                                 {"task_id": task_id, "browser": True})
         check(status == 200 and ("open", task_id) in
               FakeSafariWindowManager.calls,
-              "…while a start on a task WITH saved tabs opens its Safari window",
+              "…while browser=true opens its Safari window",
               f"{status} {FakeSafariWindowManager.calls}")
         check(next(t for t in wt.load()["tasks"]
                    if t["id"] == task_id).get("active_window_id")
