@@ -811,7 +811,47 @@ harness at the live file — `cp ~/.workload_tracker.json /tmp/wt-work.json` and
 Deferred deliberately. None of these block a phase; all of them are things a
 future session would otherwise rediscover.
 
-### 1. Retire `active_window_id` from the API surface
+### 1. Remove the Safari task-window integration entirely
+
+**Owner's decision (2026-08-07): "an old idea that never worked — I would rather
+remove all Safari integration at some point."** So this is a removal, not a
+deprecation-in-place like Arc. It **subsumes** the `active_window_id` follow-up
+that used to be item 1 here: that field exists only to let the monitor draw a
+border round the Safari window, and the border is already gone
+(`workload-macos-monitor` `f803fb1`).
+
+Barely used in the live data: **1 task has `tabs`, 0 have `active_window_id`.**
+
+The surface, roughly in dependency order:
+
+| Where | What |
+|---|---|
+| `browser_window.py` | the whole module, 215 lines (`SafariWindowManager`) |
+| `wt.py` | `_browser_switch`, its calls in `cmd_start` / `cmd_stop`, `cmd_tabs` (`wt tabs save\|open\|list\|clear\|close`), and the `_wt` completion entries |
+| `wt_api.py` | the `browser=` parameter on `start_timer` / `stop_timer` (already defaulting to `False`, `4457ba9`) |
+| `wt_daemon.py` | the four `/v1/tasks/{id}/tabs/*` routes, the `browser` flag on the v1 timer endpoints (`0fdf2d7`), and the hard `browser=True` on the two legacy endpoints |
+| `tracker.py` | `_browser_on_task_started` / `_browser_on_task_stopped`, the `w` "Save tabs" keybinding, and the bridge's `active_window_id` |
+| `mcp_server.py` | `save_task_tabs`, `open_task_window`, `list_task_tabs`, `clear_task_tabs` |
+| data model | the per-task `tabs` and `active_window_id` fields |
+| docs | the "Task Browser Windows (Safari)" section of `CLAUDE.md`, and this plan |
+
+Two constraints that make this less trivial than the line count suggests:
+
+- **`tracker.py`'s bridge and `wt_daemon.py`'s legacy endpoints must change
+  together.** `tools/test_legacy_contract.py` asserts the two produce identical
+  payloads, `active_window_id` included; changing one side alone turns the suite
+  red for the right reason but the wrong cause.
+- **Three harnesses reference the integration** — `test_daemon.py` (21 sites),
+  `test_legacy_contract.py` (11), `test_tracker_phase3.py` (2), plus the
+  `FakeSafariWindowManager` they share. Deleting the feature means deleting real
+  coverage, so do it as its own change with the harnesses updated in the same
+  commit, not folded into a phase.
+
+Sequencing note: cheapest **after** Phase 9 packages the app, since that phase
+touches the same legacy-contract surface — but it is independent of the phases
+and can be done whenever.
+
+### 1b. (subsumed) Retire `active_window_id` from the API surface
 
 Its only consumer was the monitor's Safari border overlay, **removed 2026-08-06**
 (`workload-macos-monitor` `f803fb1`). Nothing reads it now.
