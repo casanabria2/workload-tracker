@@ -55,8 +55,17 @@ struct BoardView: View {
             .frame(minHeight: 260)
 
             if store.showsRecurrentShelf {
+                // Sized to its rows rather than to a fixed guess — see
+                // `RecurrentShelfView.naturalHeight`. `maxHeight` is what stops
+                // `VSplitView` handing the shelf half the window and leaving a
+                // band of empty table under the last row.
+                let shelfHeight = recurrent.isEmpty
+                    ? RecurrentShelfView.emptyHeight
+                    : RecurrentShelfView.naturalHeight(rows: recurrent.count)
                 RecurrentShelfView(tasks: recurrent)
-                    .frame(minHeight: 120, idealHeight: 200)
+                    .frame(minHeight: min(shelfHeight, 120),
+                           idealHeight: shelfHeight,
+                           maxHeight: shelfHeight)
             }
         }
         .focusable()

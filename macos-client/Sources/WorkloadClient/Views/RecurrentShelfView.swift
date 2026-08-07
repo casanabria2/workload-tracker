@@ -10,6 +10,34 @@ struct RecurrentShelfView: View {
     let tasks: [TrackerTask]
     @Environment(Store.self) private var store
 
+    // MARK: - Sizing
+
+    /// The height this shelf actually needs, so the split view gives it that and
+    /// no more.
+    ///
+    /// The pane used to take a fixed `idealHeight: 200` regardless of content,
+    /// which left a large band of empty table under seven rows. These are the
+    /// measured metrics of the parts above and inside the `Table`; a `Table`
+    /// will not size itself to its rows, so the height has to be computed.
+    ///
+    /// Capped, because the shelf is the *secondary* pane: a long series list
+    /// scrolls internally rather than crowding out the board.
+    static func naturalHeight(rows: Int) -> CGFloat {
+        let titleBar: CGFloat = 30      // icon + "Recurrent" + count, 6pt padding
+        let divider: CGFloat = 1
+        let tableHeader: CGFloat = 28
+        let row: CGFloat = 28           // a row carries a RoleChip, so not the 24pt default
+        let bottomInset: CGFloat = 8
+        let content = CGFloat(max(rows, 1)) * row
+        return min(titleBar + divider + tableHeader + content + bottomInset, maximumHeight)
+    }
+
+    /// Beyond this the shelf scrolls instead of growing.
+    static let maximumHeight: CGFloat = 420
+
+    /// What an empty shelf needs for its `ContentUnavailableView`.
+    static let emptyHeight: CGFloat = 140
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
