@@ -878,6 +878,34 @@ Kept deliberately until then: the monitor still *decodes* the field, because bot
 servers still send it and decoding a field you ignore is free, while failing on a
 payload the server still emits is not.
 
+### 1c. `reconcile_task_sprints` can report success having written nothing
+
+Found in Phase 6. `sync_project_hours()` swallows a `gh` failure and returns
+`False` without raising, so a reconcile whose only operation was an hours update
+returns `success: true` while nothing reached GitHub. `hours_synced` is left
+unmoved, so a re-run does retry — the data is not corrupted — but **no client can
+tell the difference between "synced" and "silently didn't"**, and the app's sync
+sheet will say it succeeded.
+
+The same shape as the `load()` bug: a failure that returns a value instead of
+raising. Fix in `wt.py`/`wt_api.py` so the outcome carries per-operation success,
+and have the daemon surface it; the Swift sheets already decode and report the
+flags the daemon *does* send, so most of the client side exists.
+
+### 1d. `task_view()` does not emit `recurrent_series`
+
+The shelf's Series column is built and renders "—" for every row because the
+snapshot carries no canonical series name. Phase 6 deliberately did **not**
+reimplement `RECURRENT_SERIES_ALIASES` in Swift — that would be a second source
+of truth for something the Python side owns — so the column lights up with zero
+Swift changes once `wt_api.task_view()` emits it via
+`recurrent_series_for_title()`.
+
+Worth knowing before doing it: **2 of the 7 recurrent tasks are not in the alias
+table at all** (`1:1 with TomD`, `Alex KC 1:1 calls - casanabria`), so even a
+correct implementation resolves five of seven. The aliases need extending, which
+is a data question for the owner rather than a code one.
+
 ### 2. Collapse the daemon's `_guarded_load()`
 
 `wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
