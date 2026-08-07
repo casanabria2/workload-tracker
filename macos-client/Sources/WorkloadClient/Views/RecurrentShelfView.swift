@@ -4,8 +4,18 @@ import SwiftUI
 /// shown in their own bottom pane (plan §9).
 ///
 /// A native `Table` rather than cards, because these are a stable list you scan
-/// rather than move. **Read-only in Phase 3** — no row actions, and in
-/// particular no way to close a series, which is irreversible on GitHub.
+/// rather than move.
+///
+/// **Phase 6 adds row actions, via a context menu and the Task menu — not via
+/// inline controls.** That is a deliberate constraint as much as a style
+/// choice: `naturalHeight(rows:)` computes the pane's height from a fixed
+/// per-row figure, and a row that grew a button row would silently break the
+/// sizing the previous phase established. A context menu occupies no space.
+///
+/// Three of the five actions write, and two of them (`Sync Sprints`,
+/// `End Series`) can call `gh` irreversibly. Neither is reachable from this
+/// view without passing through `Store.perform(_:on:)` and the sheet it opens —
+/// the rules live in `ShelfAction`, not here.
 struct RecurrentShelfView: View {
     let tasks: [TrackerTask]
     @Environment(Store.self) private var store
@@ -19,6 +29,9 @@ struct RecurrentShelfView: View {
     /// which left a large band of empty table under seven rows. These are the
     /// measured metrics of the parts above and inside the `Table`; a `Table`
     /// will not size itself to its rows, so the height has to be computed.
+    ///
+    /// Still valid in Phase 6: row actions live in a context menu, so a row's
+    /// content is unchanged and `row` is still 28pt.
     ///
     /// Capped, because the shelf is the *secondary* pane: a long series list
     /// scrolls internally rather than crowding out the board.
@@ -39,26 +52,16 @@ struct RecurrentShelfView: View {
     static let emptyHeight: CGFloat = 140
 
     var body: some View {
+        @Bindable var store = store
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
-                    .symbolRenderingMode(.hierarchical)
-                Text("Recurrent").font(.headline)
-                Text("\(tasks.count)")
-                    .font(.caption.monospacedDigit())
-                    .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(.quaternary, in: .capsule)
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            titleBar
             Divider()
 
             if tasks.isEmpty {
                 ContentUnavailableView("No recurrent tasks", systemImage: "tray.2")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(tasks) {
+                Table(tasks, selection: $store.shelfSelection) {
                     TableColumn("Title") { task in
                         Text(task.title).lineLimit(1)
                     }
@@ -67,11 +70,11 @@ struct RecurrentShelfView: View {
                         RoleChip(label: roleLabel(task), color: color, compact: true)
                     }
                     .width(min: 90, ideal: 130)
-                    TableColumn("This sprint") { task in
+                    TableColumn(sprintColumnTitle) { task in
                         Text(Duration.formatZeroed(minutes: thisSprint(task)))
                             .font(.body.monospacedDigit())
                     }
-                    .width(min: 80, ideal: 95)
+                    .width(min: 80, ideal: 105)
                     TableColumn("Total") { task in
                         Text(Duration.formatZeroed(minutes: task.loggedMins))
                             .font(.body.monospacedDigit())
@@ -89,10 +92,69 @@ struct RecurrentShelfView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
-                    .width(min: 140, ideal: 240)
+                    .width(min: 140, ideal: 220)
+                    TableColumn("Series") { task in
+                        Text(RecurrentSeries.displayName(for: task))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .help(seriesHelp)
+                    }
+                    .width(min: 80, ideal: 150)
+                }
+                .contextMenu(forSelectionType: TrackerTask.ID.self) { ids in
+                    // `forSelectionType:` gives the right-clicked row even when
+                    // it is not the selected one, which a plain `.contextMenu`
+                    // on a `Table` does not.
+                    if let id = ids.first, let task = tasks.first(where: { $0.id == id }) {
+                        ShelfActionMenu(task: task)
+                    }
                 }
             }
         }
+    }
+
+    // MARK: - Chrome
+
+    private var titleBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+                .symbolRenderingMode(.hierarchical)
+            Text("Recurrent").font(.headline)
+            Text("\(tasks.count)")
+                .font(.caption.monospacedDigit())
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(.quaternary, in: .capsule)
+            if store.isFiltering {
+                // The shelf's row set ignores the Sprint facet (plan §9), so the
+                // count here can exceed what the board is showing. Saying so
+                // beats letting the two look inconsistent.
+                Text(sprintExemptionNote)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// The "This sprint" header names the sprint it is actually totalling, which
+    /// is the selected one when the user picked exactly one.
+    private var sprintColumnTitle: String {
+        guard let sprint = store.shelfSprint else { return "This sprint" }
+        return sprint.id == store.currentSprint?.id ? "This sprint" : sprint.displayName
+    }
+
+    private var sprintExemptionNote: String {
+        store.filter.sprints.isEmpty
+            ? "filtered"
+            : "sprint filter not applied to the shelf"
+    }
+
+    private var seriesHelp: String {
+        RecurrentSeries.unsupportedReason(for: tasks)
+            ?? "The canonical recurring-series name."
     }
 
     private func roleLabel(_ task: TrackerTask) -> String {
@@ -100,10 +162,57 @@ struct RecurrentShelfView: View {
         return store.roles.first { $0.id == id }?.displayName ?? id
     }
 
-    /// Minutes this perpetual task logged in the current sprint, from the
+    /// Minutes this perpetual task logged in the shelf's sprint, from the
     /// timestamp-bucketed `sprints_with_time` — never a field lookup.
     private func thisSprint(_ task: TrackerTask) -> Double {
-        guard let sprintID = store.currentSprint?.id else { return 0 }
+        guard let sprintID = store.shelfSprint?.id else { return 0 }
         return task.minutes(inSprint: sprintID)
+    }
+}
+
+// MARK: - The row action menu
+
+/// The shelf's five row actions, in `ShelfAction.menu` order.
+///
+/// One view, used by both the context menu and the Task menu, so the two cannot
+/// present different items or a different order. In particular **`End Series`
+/// is last, separated, destructive-styled, and carries no keyboard shortcut** —
+/// all four properties are asserted in `ShelfActionTests`.
+struct ShelfActionMenu: View {
+    let task: TrackerTask
+    @Environment(Store.self) private var store
+
+    var body: some View {
+        ForEach(ShelfAction.menu) { action in
+            if action.isSeparatedInMenu { Divider() }
+            item(action)
+        }
+    }
+
+    @ViewBuilder
+    private func item(_ action: ShelfAction) -> some View {
+        let availability = action.availability(
+            for: task, isTimerRunning: store.isTimerRunning(on: task))
+        Button(role: action == .endSeries ? .destructive : nil) {
+            _Concurrency.Task { await store.perform(action, on: task) }
+        } label: {
+            Label(action.title, systemImage: action.systemImage)
+        }
+        .disabled(!availability.isAvailable)
+        .help(availability.reason ?? helpText(action))
+    }
+
+    private func helpText(_ action: ShelfAction) -> String {
+        switch action {
+        case .startTimer: "Start the timer on this task"
+        case .logTime: "Add a time entry to this task"
+        case .openIssue: "Open \(task.currentIssue ?? "the issue") in your browser"
+        case .syncSprints:
+            "Preview reconciling this task's per-sprint issues. "
+            + "Shows a dry run before anything is sent."
+        case .endSeries:
+            "Ends the recurrence and closes the live GitHub issue. "
+            + "Asks you to type the series name first."
+        }
     }
 }

@@ -162,6 +162,39 @@ enum TaskFilter {
         return tasks.filter { matches($0, state, currentSprintID: currentSprintID) }
     }
 
+    /// The shelf's filter: **every facet except Sprint** (plan §9).
+    ///
+    /// A perpetual task accrues time in every sprint it runs through, so a
+    /// logged-time Sprint facet applied here would either match all of them —
+    /// making the facet pointless on the shelf — or hide the ones that happened
+    /// to be quiet, and those are precisely the tasks meant to stay visible on
+    /// launch.
+    ///
+    /// Phase 5 did **not** do this: `Store.filteredRecurrentTasks` ran the full
+    /// `apply(...)`. It looked correct because §8.2's open-work exemption
+    /// rescues a `recurrent` task whenever the *current* sprint is selected, and
+    /// the current sprint is the default. Select a past sprint on its own —
+    /// Sprint 100, say — and the shelf emptied: measured on the owner's data,
+    /// 7 of 7 rows disappeared, because the exemption requires
+    /// `selected.contains(currentSprintID)`. Ignoring the facet outright is what
+    /// §9 specifies and is not the same rule.
+    ///
+    /// The "This sprint" *column* still respects the selection, so the facet
+    /// changes what you read on the shelf — just not which rows exist.
+    static func applyToShelf(_ state: FilterState,
+                             to tasks: [TrackerTask],
+                             currentSprintID: String?) -> [TrackerTask] {
+        apply(ignoringSprints(state), to: tasks, currentSprintID: currentSprintID)
+    }
+
+    /// `state` with the Sprint facet cleared. Exposed so a test can assert the
+    /// shelf and the board are given genuinely different filters.
+    static func ignoringSprints(_ state: FilterState) -> FilterState {
+        var relaxed = state
+        relaxed.sprints = []
+        return relaxed
+    }
+
     static func matches(_ task: TrackerTask,
                         _ state: FilterState,
                         currentSprintID: String?) -> Bool {

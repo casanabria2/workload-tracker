@@ -68,11 +68,20 @@ struct BoardView: View {
                 // `RecurrentShelfView.naturalHeight`. `maxHeight` is what stops
                 // `VSplitView` handing the shelf half the window and leaving a
                 // band of empty table under the last row.
+                //
+                // `minHeight` must be the **same** value, not `min(height, 120)`
+                // as it was through Phase 5. `VSplitView` resolves a subview to
+                // its minimum whenever the other pane wants more room than is
+                // available, and the board's Done column always does — 37 done
+                // tasks against a finite window. Measured before this change:
+                // seven rows needing 263pt were drawn 120pt tall, showing two of
+                // them, in both an 800pt and an 1150pt window. Growing the window
+                // did not help, which is what gave the minimum away.
                 let shelfHeight = recurrent.isEmpty
                     ? RecurrentShelfView.emptyHeight
                     : RecurrentShelfView.naturalHeight(rows: recurrent.count)
                 RecurrentShelfView(tasks: recurrent)
-                    .frame(minHeight: min(shelfHeight, 120),
+                    .frame(minHeight: shelfHeight,
                            idealHeight: shelfHeight,
                            maxHeight: shelfHeight)
             }
@@ -89,6 +98,20 @@ struct BoardView: View {
                              set: { if $0 == nil { store.dismissCloseSheet() } })) { sheet in
             CloseSheetView(sheet: sheet).environment(store)
         }
+        // Phase 6's two shelf sheets. Attached here rather than inside
+        // `RecurrentShelfView` so they survive the shelf being collapsed
+        // mid-operation — a running reconcile must not lose its progress view
+        // because ⌥⌘R was pressed.
+        .sheet(item: Binding(get: { store.syncSheet },
+                             set: { if $0 == nil { store.dismissSyncSheet() } })) { sheet in
+            SyncSprintsSheetView(sheet: sheet).environment(store)
+        }
+        .sheet(item: Binding(get: { store.logSheet },
+                             set: { if $0 == nil { store.dismissLogSheet() } })) { sheet in
+            LogTimeSheetView(sheet: sheet).environment(store)
+        }
+        // The Task menu acts on the shelf row the menu bar can see.
+        .focusedSceneValue(\.shelfTask, store.selectedShelfTask)
         .filterSearchField(store)
         .toolbar {
             ToolbarItem(placement: .status) {

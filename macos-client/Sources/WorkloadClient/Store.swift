@@ -220,7 +220,10 @@ final class Store {
         case "progress":
             let payload = event.payload(ProgressPayload.self)
             lastProgress = payload
-            if let payload { applyCloseProgress(payload) }
+            if let payload {
+                applyCloseProgress(payload)
+                applySyncProgress(payload)
+            }
         case "error":
             guard let payload = event.payload(StreamErrorPayload.self),
                   let error = payload.error else { break }
@@ -229,6 +232,8 @@ final class Store {
             // Before Phase 4 every `error` frame blanked the board.
             if let id = payload.operationId, id == activeCloseOperation {
                 applyCloseFailure(code: error.code, message: error.message)
+            } else if let id = payload.operationId, id == activeSyncOperation {
+                applySyncFailure(message: error.message, code: error.code.rawValue)
             } else if payload.op != nil {
                 show(.error("\(payload.op ?? "operation") failed: \(error.message)"))
             } else {
@@ -435,8 +440,25 @@ final class Store {
         TaskFilter.apply(filter, to: boardTasks(status), currentSprintID: currentSprint?.id)
     }
 
+    /// The shelf's rows. **The Sprint facet is ignored here** (plan §9) — see
+    /// `TaskFilter.applyToShelf`. The shelf's "This sprint" column still reads
+    /// the selected sprint, so the facet changes what you read, not which rows
+    /// exist.
     var filteredRecurrentTasks: [TrackerTask] {
-        TaskFilter.apply(filter, to: recurrentTasks, currentSprintID: currentSprint?.id)
+        TaskFilter.applyToShelf(filter, to: recurrentTasks, currentSprintID: currentSprint?.id)
+    }
+
+    /// The sprint the shelf's "This sprint" column totals.
+    ///
+    /// The single selected sprint when the user picked exactly one, otherwise
+    /// today's. With several selected there is no one column to show, so it
+    /// falls back rather than silently summing a subset.
+    var shelfSprint: Sprint? {
+        if filter.sprints.count == 1, let id = filter.sprints.first,
+           let picked = snapshot?.sprints.first(where: { $0.id == id }) {
+            return picked
+        }
+        return currentSprint
     }
 
     var isFiltering: Bool { !filter.isEmpty }
@@ -603,12 +625,31 @@ final class Store {
     /// `reconcile_task_sprints(dry_run=True)` — write-free by construction on
     /// the Python side, so nothing is mutated and no `gh` command runs. The
     /// irreversible call happens in `confirmClose()` and nowhere else.
-    func beginClose(_ task: TrackerTask) async {
+    /// Opens the close sheet with the **End Series** gate attached (plan §9).
+    ///
+    /// The only route from the shelf to `close_task`. It funnels into
+    /// `beginClose` rather than duplicating it, so the dry-run-then-confirm
+    /// shape is shared and there is still exactly one `POST /close` call site.
+    func beginEndSeries(_ task: TrackerTask) async {
+        await beginClose(task, endSeries: EndSeriesConfirmation(
+            task: task, seriesName: RecurrentSeries.canonicalName(for: task)))
+    }
+
+    /// The typed confirmation, as the sheet's text field writes it.
+    func updateEndSeriesConfirmation(_ typed: String) {
+        closeSheet?.endSeries?.typed = typed
+    }
+
+    func beginClose(_ task: TrackerTask,
+                    endSeries: EndSeriesConfirmation? = nil) async {
         guard closeSheet == nil else { return }
-        closeSheet = CloseSheetState(taskId: task.id, title: task.title, phase: .planning)
+        closeSheet = CloseSheetState(taskId: task.id, title: task.title,
+                                     phase: .planning, endSeries: endSeries,
+                                     expectsIssueClose: task.currentIssue != nil)
         do {
             let plan = try await client.planClose(taskId: task.id)
             guard closeSheet?.taskId == task.id else { return }
+            closeSheet?.expectsIssueClose = plan.currentIssue != nil || plan.needsIssue
             closeSheet?.phase = .ready(plan)
         } catch {
             guard closeSheet?.taskId == task.id else { return }
@@ -624,6 +665,11 @@ final class Store {
     /// never authorise an issue creation the preview did not mention.
     func confirmClose() async {
         guard let sheet = closeSheet, case .ready(let plan) = sheet.phase else { return }
+        // **The gate, enforced in the model.** The End Series sheet also
+        // disables its button, but a disabled button is a view detail; this is
+        // the check that makes "no typed name, no `gh issue close`" a property
+        // of the store, assertable at the transport with no UI involved.
+        guard sheet.allowsConfirmation(plan) else { return }
         closeSheet?.phase = .closing(operationId: nil, plan: plan, lines: [])
         do {
             let record = try await client.closeTask(taskId: sheet.taskId,
@@ -666,7 +712,7 @@ final class Store {
         if payload.state == "completed" {
             activeCloseOperation = nil
             closePollTask?.cancel()
-            closeSheet?.phase = .succeeded(lines: lines)
+            closeSheet?.phase = .succeeded(lines: lines, outcome: payload.result)
             _Concurrency.Task { [weak self] in await self?.refresh() }
         } else {
             closeSheet?.phase = .closing(operationId: operationId, plan: plan, lines: lines)
@@ -709,11 +755,252 @@ final class Store {
                                             code: record.error?.code.rawValue,
                                             lines: record.progress)
             } else {
-                closeSheet?.phase = .succeeded(lines: record.progress)
+                closeSheet?.phase = .succeeded(lines: record.progress,
+                                               outcome: record.result)
             }
             await refresh()
             return
         }
+    }
+
+    // MARK: - The recurrent shelf (plan §9)
+
+    /// The Sync Sprints sheet, or `nil` when none is open.
+    private(set) var syncSheet: SyncSheetState?
+    /// The Log Time sheet, or `nil` when none is open.
+    private(set) var logSheet: LogSheetState?
+    /// The shelf row the Task menu acts on.
+    var shelfSelection: String?
+
+    /// The operation id of a running reconcile, so SSE `progress` and `error`
+    /// events route to the sync sheet instead of the connection state.
+    private var activeSyncOperation: String?
+    private var syncPollTask: _Concurrency.Task<Void, Never>?
+
+    /// The selected shelf row, resolved against the current snapshot.
+    var selectedShelfTask: TrackerTask? {
+        guard let id = shelfSelection else { return nil }
+        return recurrentTasks.first { $0.id == id }
+    }
+
+    /// Dispatches a row action. **The single entry point** for the shelf, the
+    /// Task menu and the context menu alike, so the three cannot diverge on what
+    /// an action does or on what gates it.
+    ///
+    /// Nothing irreversible happens in this method: the two GitHub-touching
+    /// cases open a sheet whose only request is a write-free dry run.
+    func perform(_ action: ShelfAction, on task: TrackerTask) async {
+        guard action.availability(for: task, isTimerRunning: isTimerRunning(on: task))
+            .isAvailable else { return }
+        switch action {
+        case .startTimer:
+            await startTimer(on: task)
+        case .logTime:
+            logSheet = LogSheetState(taskId: task.id, title: task.title)
+        case .openIssue:
+            await openIssue(of: task)
+        case .syncSprints:
+            await beginSyncSprints(task)
+        case .endSeries:
+            await beginEndSeries(task)
+        }
+    }
+
+    func isTimerRunning(on task: TrackerTask) -> Bool {
+        snapshot?.activeTimer?.taskId == task.id
+    }
+
+    // MARK: Start timer
+
+    /// Starts the timer on a shelf row.
+    ///
+    /// `browser` is passed explicitly and comes from Settings. The daemon's
+    /// endpoint defaults it to `true`, so leaving it out would open the task's
+    /// dedicated Safari window on every start — which is the TUI's behaviour and
+    /// a reasonable default, but not one to inherit silently.
+    func startTimer(on task: TrackerTask) async {
+        do {
+            let started = try await client.startTimer(taskId: task.id,
+                                                      browser: AppSettings.opensTaskWindow)
+            if let displaced = started.stopped {
+                show(.info("Started “\(task.title)”. The timer on \(displaced) was logged."))
+            } else {
+                show(.info("Timer started on “\(task.title)”."))
+            }
+            await refresh()
+        } catch {
+            show(.error("Could not start the timer on “\(task.title)”: \(describe(error))"))
+        }
+    }
+
+    /// Stops whatever is running. Used by the Task menu's Start/Stop toggle.
+    func stopTimer() async {
+        do {
+            let stopped = try await client.stopTimer(browser: AppSettings.opensTaskWindow)
+            let minutes = stopped.minutes ?? 0
+            show(.info(stopped.logged
+                       ? "Logged \(Duration.format(minutes: minutes)) to "
+                         + "“\(stopped.title ?? "the task")”."
+                       : "Timer stopped; the session was too short to log."))
+            await refresh()
+        } catch {
+            show(.error("Could not stop the timer: \(describe(error))"))
+        }
+    }
+
+    // MARK: Open issue
+
+    func openIssue(of task: TrackerTask) async {
+        do {
+            let opened = try await client.openIssue(taskId: task.id)
+            if !opened.opened {
+                show(.error("Could not open \(opened.issue ?? "the issue") in a browser.",
+                            hint: opened.url))
+            }
+        } catch {
+            show(.error("Could not open the issue for “\(task.title)”: \(describe(error))"))
+        }
+    }
+
+    // MARK: Log time
+
+    func dismissLogSheet() { logSheet = nil }
+
+    /// Commits the Log Time sheet. Local only — no GitHub call.
+    func confirmLogTime(minutes: Double, note: String) async {
+        guard let sheet = logSheet, minutes > 0 else { return }
+        logSheet?.isSubmitting = true
+        do {
+            _ = try await client.addLog(taskId: sheet.taskId, minutes: minutes,
+                                        note: note.isEmpty ? "Manual entry" : note)
+            logSheet = nil
+            show(.info("Logged \(Duration.format(minutes: minutes)) to “\(sheet.title)”."))
+            await refresh()
+        } catch {
+            logSheet?.isSubmitting = false
+            logSheet?.error = describe(error)
+        }
+    }
+
+    // MARK: Sync sprints (never optimistic, never automatic)
+
+    /// Opens the Sync Sprints sheet and fetches the plan.
+    ///
+    /// The **only** request this makes is the `dry_run: true` reconcile, which
+    /// the daemon serves through its read path. The irreversible call happens in
+    /// `confirmSyncSprints()` and nowhere else.
+    func beginSyncSprints(_ task: TrackerTask) async {
+        guard syncSheet == nil else { return }
+        syncSheet = SyncSheetState(taskId: task.id, title: task.title, phase: .planning)
+        await reloadSyncPlan()
+    }
+
+    /// Re-runs the dry run — used on open and whenever the user toggles
+    /// "create missing issues", because that flag changes the plan.
+    func reloadSyncPlan() async {
+        guard let sheet = syncSheet else { return }
+        syncSheet?.phase = .planning
+        do {
+            let plan = try await client.planReconcile(taskId: sheet.taskId,
+                                                      createIssues: sheet.createIssues)
+            guard syncSheet?.taskId == sheet.taskId else { return }
+            syncSheet?.phase = .ready(plan)
+        } catch {
+            guard syncSheet?.taskId == sheet.taskId else { return }
+            syncSheet?.phase = .planFailed(describe(error))
+        }
+    }
+
+    /// Toggles issue creation and re-plans, so the preview never describes a
+    /// different run from the one the button will start.
+    func setSyncCreatesIssues(_ value: Bool) async {
+        guard syncSheet?.createIssues != value else { return }
+        syncSheet?.createIssues = value
+        await reloadSyncPlan()
+    }
+
+    /// Sends the real reconcile. Only reachable from an explicit confirmation on
+    /// a sheet already showing the plan.
+    func confirmSyncSprints() async {
+        guard let sheet = syncSheet, case .ready(let plan) = sheet.phase,
+              plan.isActionable else { return }
+        syncSheet?.phase = .running(operationId: nil, plan: plan, lines: [])
+        do {
+            let record = try await client.runReconcile(taskId: sheet.taskId,
+                                                       createIssues: sheet.createIssues)
+            guard syncSheet?.taskId == sheet.taskId else { return }
+            activeSyncOperation = record.operationId
+            syncSheet?.phase = .running(operationId: record.operationId,
+                                        plan: plan, lines: record.progress)
+            syncPollTask?.cancel()
+            syncPollTask = _Concurrency.Task { [weak self] in
+                await self?.pollSyncOperation(record.operationId)
+            }
+        } catch {
+            applySyncFailure(message: describe(error),
+                             code: (error as? DaemonClientError)?.code?.rawValue)
+        }
+    }
+
+    func dismissSyncSheet() {
+        syncSheet = nil
+        activeSyncOperation = nil
+        syncPollTask?.cancel()
+        syncPollTask = nil
+    }
+
+    private func applySyncProgress(_ payload: ProgressPayload) {
+        guard let id = payload.operationId, id == activeSyncOperation,
+              let sheet = syncSheet,
+              case .running(let operationId, let plan, var lines) = sheet.phase else { return }
+        if let message = payload.message, !message.isEmpty { lines.append(message) }
+        if payload.state == "completed" {
+            activeSyncOperation = nil
+            syncPollTask?.cancel()
+            syncSheet?.phase = .succeeded(
+                lines: lines,
+                outcome: payload.result(as: ReconcileResponse.self))
+            _Concurrency.Task { [weak self] in await self?.refresh() }
+        } else {
+            syncSheet?.phase = .running(operationId: operationId, plan: plan, lines: lines)
+        }
+    }
+
+    private func applySyncFailure(message: String, code: String?) {
+        activeSyncOperation = nil
+        syncPollTask?.cancel()
+        let lines: [String]
+        if case .running(_, _, let existing) = syncSheet?.phase { lines = existing }
+        else { lines = [] }
+        syncSheet?.phase = .failed(message: message, code: code, lines: lines)
+        _Concurrency.Task { [weak self] in await self?.refresh() }
+    }
+
+    /// Belt and braces to the SSE stream, mirroring `pollCloseOperation`.
+    private func pollSyncOperation(_ id: String) async {
+        for _ in 0..<600 {
+            guard activeSyncOperation == id, !_Concurrency.Task.isCancelled else { return }
+            try? await _Concurrency.Task.sleep(for: .seconds(1))
+            guard activeSyncOperation == id, !_Concurrency.Task.isCancelled,
+                  let record = try? await client.operation(id: id) else { continue }
+            guard record.isTerminal else { continue }
+            activeSyncOperation = nil
+            if record.didFail {
+                syncSheet?.phase = .failed(message: record.error?.message
+                                           ?? "The reconcile failed.",
+                                           code: record.error?.code.rawValue,
+                                           lines: record.progress)
+            } else {
+                syncSheet?.phase = .succeeded(lines: record.progress,
+                                              outcome: record.reconcileResult)
+            }
+            await refresh()
+            return
+        }
+    }
+
+    private func describe(_ error: any Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     // MARK: - Feedback
@@ -778,8 +1065,27 @@ struct CloseSheetState: Identifiable, Equatable {
     let taskId: String
     let title: String
     var phase: Phase
+    /// The extra gate in front of ending a recurrent series (plan §9), or `nil`
+    /// for an ordinary board close.
+    ///
+    /// Sharing one sheet and one `confirmClose()` between the two is deliberate:
+    /// there is exactly one route from this app to `close_task`, so a second
+    /// route cannot be added by accident. The recurrent case tightens that route
+    /// rather than going around it.
+    var endSeries: EndSeriesConfirmation?
 
     var id: String { taskId }
+
+    /// Whether the confirm button may be enabled at all.
+    ///
+    /// For a board close this is just "the plan is actionable". For a series it
+    /// additionally requires the typed name — and that gate is evaluated *here*,
+    /// in the state, not in the view, so a refactored button cannot lose it.
+    func allowsConfirmation(_ plan: ClosePlanResponse) -> Bool {
+        guard plan.isActionable else { return false }
+        guard let endSeries else { return true }
+        return endSeries.isSatisfied
+    }
 
     enum Phase: Equatable {
         /// `POST /close/plan` in flight.
@@ -793,7 +1099,10 @@ struct CloseSheetState: Identifiable, Equatable {
         /// The close failed. **The task stays open** — a failed reconcile aborts
         /// the close so hours cannot be mis-reported.
         case failed(message: String, code: String?, lines: [String])
-        case succeeded(lines: [String])
+        /// The operation completed. `outcome` is what it actually achieved —
+        /// **"completed" does not mean GitHub took it** (see `OperationOutcome`),
+        /// so the success message is derived from this rather than assumed.
+        case succeeded(lines: [String], outcome: OperationOutcome?)
     }
 
     /// Whether the sheet is at a point where dismissing loses nothing.
@@ -803,6 +1112,64 @@ struct CloseSheetState: Identifiable, Equatable {
         default: true
         }
     }
+
+    /// Whether this close was *meant* to close a GitHub issue.
+    ///
+    /// Stored rather than derived from `phase`, because it has to survive the
+    /// transition *out* of `.ready` — it is read in `.succeeded`, by which point
+    /// the plan is gone. Seeded from the task and refined when the plan lands.
+    /// Lets "the issue was not closed" be told apart from a task that
+    /// legitimately has no repo, where closing nothing is correct.
+    var expectsIssueClose: Bool = false
+}
+
+/// The Sync Sprints sheet's state machine (plan §9).
+///
+/// `ready` is the important one: the dry run is on screen and **nothing has been
+/// sent but that dry run**. The only transition out of it that touches GitHub is
+/// the user pressing the confirm button.
+struct SyncSheetState: Identifiable, Equatable {
+    let taskId: String
+    let title: String
+    var phase: Phase
+    /// Whether the run may mint issues for past sprints that have time but none.
+    ///
+    /// Defaults to **false**, matching `wt sync-sprints --all`'s safety rule: a
+    /// blanket run over a long history can want to mint a couple of dozen
+    /// issues, so creation is opted into rather than out of. Toggling it
+    /// re-plans, so the preview always describes the run the button will start.
+    var createIssues: Bool = false
+
+    var id: String { taskId }
+
+    enum Phase: Equatable {
+        case planning
+        /// The dry run is rendered. No irreversible call has been made.
+        case ready(ReconcileResponse)
+        case planFailed(String)
+        case running(operationId: String?, plan: ReconcileResponse, lines: [String])
+        case failed(message: String, code: String?, lines: [String])
+        /// Completed. `outcome` is the reconcile's own report — a completed
+        /// operation is not automatically a successful one.
+        case succeeded(lines: [String], outcome: ReconcileResponse?)
+    }
+
+    var isDismissable: Bool {
+        if case .running = phase { return false }
+        return true
+    }
+}
+
+/// The Log Time sheet's state. Local-only, so it has no dry run — but it still
+/// gets a sheet, because it appends to the owner's irreplaceable work history
+/// and the amount should be typed and read rather than guessed.
+struct LogSheetState: Identifiable, Equatable {
+    let taskId: String
+    let title: String
+    var isSubmitting: Bool = false
+    var error: String?
+
+    var id: String { taskId }
 }
 
 /// One sidebar Roles row.

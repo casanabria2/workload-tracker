@@ -61,11 +61,171 @@ struct ProgressPayload: Decodable, Sendable, Equatable {
     let state: String?
     let message: String?
     let at: TimeInterval?
+    /// The operation's return value, present only on the terminal
+    /// `state == "completed"` frame. Kept as raw JSON because its **shape
+    /// depends on `op`**: a `close` returns `wt_api.close()`'s flags, a
+    /// `reconcile` returns `wt_api.reconcile()`'s envelope. Decode with
+    /// `result(as:)`.
+    let rawResult: RawJSON?
+
+    /// The close outcome. Carries the **non-fatal** GitHub failure — see
+    /// `OperationOutcome`, and the reason it must not be ignored.
+    var result: OperationOutcome? { rawResult?.decode(OperationOutcome.self) }
 
     enum CodingKeys: String, CodingKey {
-        case op, state, message, at
+        case op, state, message, at, result
         case operationId = "operation_id"
         case taskId = "task_id"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        operationId = try c.decodeIfPresent(String.self, forKey: .operationId)
+        op = try c.decodeIfPresent(String.self, forKey: .op)
+        taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        state = try c.decodeIfPresent(String.self, forKey: .state)
+        message = try c.decodeIfPresent(String.self, forKey: .message)
+        at = try c.decodeIfPresent(TimeInterval.self, forKey: .at)
+        rawResult = try? c.decodeIfPresent(RawJSON.self, forKey: .result)
+    }
+
+    /// Decodes the operation's result as `T`, or `nil` when it is absent or a
+    /// different shape.
+    func result<T: Decodable>(as type: T.Type) -> T? { rawResult?.decode(type) }
+}
+
+/// A JSON value captured verbatim so it can be re-decoded as a concrete type
+/// later.
+///
+/// Needed because one wire field (`result`) carries different shapes depending
+/// on which operation produced it, and `Decodable` has to commit to a type at
+/// decode time.
+struct RawJSON: Decodable, Sendable, Equatable {
+    let data: Data
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        // Round-trips through `JSONSerialization` rather than `AnyCodable`
+        // gymnastics: the payload is small and this keeps the type tiny.
+        let value = try container.decode(RawJSONValue.self)
+        data = (try? JSONSerialization.data(withJSONObject: value.anyValue)) ?? Data()
+    }
+
+    func decode<T: Decodable>(_ type: T.Type) -> T? {
+        guard !data.isEmpty else { return nil }
+        return try? JSONDecoder().decode(type, from: data)
+    }
+}
+
+/// A minimal JSON tree, used only to re-serialize an arbitrary payload.
+private enum RawJSONValue: Decodable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([RawJSONValue])
+    case object([String: RawJSONValue])
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let v = try? c.decode(Bool.self) { self = .bool(v) }
+        else if let v = try? c.decode(Double.self) { self = .number(v) }
+        else if let v = try? c.decode(String.self) { self = .string(v) }
+        else if let v = try? c.decode([RawJSONValue].self) { self = .array(v) }
+        else if let v = try? c.decode([String: RawJSONValue].self) { self = .object(v) }
+        else { self = .null }
+    }
+
+    var anyValue: Any {
+        switch self {
+        case .null: NSNull()
+        case .bool(let v): v
+        case .number(let v): v
+        case .string(let v): v
+        case .array(let v): v.map(\.anyValue)
+        case .object(let v): v.mapValues(\.anyValue)
+        }
+    }
+}
+
+/// The non-fatal outcome of a completed `close` / `reconcile` operation.
+///
+/// **A completed operation is not the same as a successful one.** `wt.close_task`
+/// deliberately marks the task done even when the GitHub half fails — CLAUDE.md:
+/// *"a `gh issue close` failure … emits a warning but never leaves the local task
+/// in a half-closed state"* — and `wt_api.close()` passes that through as a
+/// non-fatal `error` alongside `success: true`. The daemon then reports the
+/// operation as `completed`.
+///
+/// Measured: ending a series while `gh issue close` failed produced a
+/// `completed` operation, the task set to `done`, the binding still
+/// `state: "open"`, and a sheet that said *"The task is closed and its issues
+/// are up to date."* That sentence was false, and this type is what makes it
+/// checkable. Only the flags are decoded; the payload also contains the whole
+/// task and the reconcile result, which the sheet does not need.
+struct OperationOutcome: Decodable, Sendable, Equatable {
+    let success: Bool
+    let issueCreated: Bool
+    let issueClosed: Bool
+    let projectUpdated: Bool
+    let skippedGitHub: Bool
+    /// A non-fatal failure message. Non-`nil` with `success == true` is exactly
+    /// the "done locally, GitHub did not take" case.
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case success, error
+        case issueCreated = "issue_created"
+        case issueClosed = "issue_closed"
+        case projectUpdated = "project_updated"
+        case skippedGitHub = "skipped_github"
+    }
+
+    /// A default outcome for a daemon that sent no `result` — assume the local
+    /// close applied and say nothing about GitHub either way.
+    init(success: Bool = true, issueCreated: Bool = false, issueClosed: Bool = true,
+         projectUpdated: Bool = false, skippedGitHub: Bool = false,
+         error: String? = nil) {
+        self.success = success
+        self.issueCreated = issueCreated
+        self.issueClosed = issueClosed
+        self.projectUpdated = projectUpdated
+        self.skippedGitHub = skippedGitHub
+        self.error = error
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        success = try c.decodeIfPresent(Bool.self, forKey: .success) ?? true
+        issueCreated = try c.decodeIfPresent(Bool.self, forKey: .issueCreated) ?? false
+        issueClosed = try c.decodeIfPresent(Bool.self, forKey: .issueClosed) ?? false
+        projectUpdated = try c.decodeIfPresent(Bool.self, forKey: .projectUpdated) ?? false
+        skippedGitHub = try c.decodeIfPresent(Bool.self, forKey: .skippedGitHub) ?? false
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+    }
+
+    /// True when the local close applied but GitHub did not fully take.
+    var hasGitHubShortfall: Bool { error != nil }
+
+    /// What to tell the user, given what a close was *meant* to do.
+    ///
+    /// `expectedIssueClose` is false for a task with no repo, where not closing
+    /// an issue is correct rather than a shortfall.
+    func summary(expectedIssueClose: Bool) -> (message: String, isWarning: Bool) {
+        if let error {
+            return ("The task is closed locally, but GitHub did not take: \(error)",
+                    true)
+        }
+        if skippedGitHub {
+            return ("The task is closed. It has no GitHub repository, so nothing "
+                    + "was sent.", false)
+        }
+        if expectedIssueClose && !issueClosed {
+            return ("The task is closed locally, but its GitHub issue was not "
+                    + "closed.", true)
+        }
+        return ("The task is closed and its issues are up to date.", false)
     }
 }
 

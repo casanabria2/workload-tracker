@@ -13,6 +13,7 @@ enum AppSettings {
     private static let tokenPathKey = "daemonTokenPath"
     private static let repositoryPathKey = "trackerRepositoryPath"
     private static let autoStartKey = "autoStartDaemon"
+    private static let opensTaskWindowKey = "opensTaskWindow"
     private static let lastFilterKey = "lastFilterState"
 
     // MARK: - Defaults
@@ -72,6 +73,29 @@ enum AppSettings {
     static var autoStartDaemon: Bool {
         get { UserDefaults.standard.bool(forKey: autoStartKey) }
         set { UserDefaults.standard.set(newValue, forKey: autoStartKey) }
+    }
+
+    /// Whether starting a timer opens the task's dedicated Safari window.
+    ///
+    /// Defaults to **on**, matching what the TUI's `t` key and the Stream Deck
+    /// bridge already do (`_browser_on_task_started`), so the app behaves like
+    /// the thing it replaces.
+    ///
+    /// It is a setting at all — rather than just passing `true` — because the
+    /// daemon's `POST /v1/timer/start` defaults `browser` to `true` on its own,
+    /// so the flag has to be sent explicitly to ever be `false`. Without a way
+    /// to turn it off, every timer start from this app opens real Safari windows
+    /// on the owner's desktop, including from a test run.
+    ///
+    /// `registerDefaults` seeds `true`, because `UserDefaults.bool` returns
+    /// `false` for an absent key and the safe-looking default is the wrong one
+    /// here.
+    static var opensTaskWindow: Bool {
+        get {
+            UserDefaults.standard.register(defaults: [opensTaskWindowKey: true])
+            return UserDefaults.standard.bool(forKey: opensTaskWindowKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: opensTaskWindowKey) }
     }
 
     /// The last `FilterState`, JSON-encoded — the **fallback** behind

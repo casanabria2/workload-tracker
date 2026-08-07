@@ -161,6 +161,17 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
     /// Safari window id while the task's window is open.
     let activeWindowId: Int?
 
+    /// The canonical recurring-series name, from
+    /// `wt.recurrent_series_for_title()`.
+    ///
+    /// **The daemon does not send this yet** — `wt_api.task_view()` emits no
+    /// such key as of `e11f45d`, so it decodes `nil` on every task today. It is
+    /// declared anyway because the alias table must not be duplicated in Swift
+    /// (CLAUDE.md), so the only correct source is the daemon; see
+    /// `RecurrentSeries`. When `task_view()` grows the key, the shelf's Series
+    /// column populates with no Swift change.
+    let recurrentSeries: String?
+
     enum CodingKeys: String, CodingKey {
         case id, title, description, status, activity, type, logs, tabs
         case statusLabel = "status_label"
@@ -178,6 +189,7 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
         case lastLoggedAt = "last_logged_at"
         case localFolder = "local_folder"
         case activeWindowId = "active_window_id"
+        case recurrentSeries = "recurrent_series"
     }
 
     init(from decoder: any Decoder) throws {
@@ -206,6 +218,7 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
         localFolder = try c.decodeIfPresent(String.self, forKey: .localFolder)
         tabs = try c.decodeIfPresent([String].self, forKey: .tabs) ?? []
         activeWindowId = try c.decodeIfPresent(Int.self, forKey: .activeWindowId)
+        recurrentSeries = try c.decodeIfPresent(String.self, forKey: .recurrentSeries)
     }
 
     /// Whether this task carries any GitHub binding at all.

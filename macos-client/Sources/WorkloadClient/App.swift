@@ -34,6 +34,11 @@ struct WorkloadClientApp: App {
                     .keyboardShortcut("k", modifiers: [.shift, .command])
                     .disabled(!store.isFiltering)
             }
+
+            // Plan §9: "Row actions via context menu **and the Task menu**."
+            CommandMenu("Task") {
+                TaskMenuCommands().environment(store)
+            }
         }
 
         Settings {

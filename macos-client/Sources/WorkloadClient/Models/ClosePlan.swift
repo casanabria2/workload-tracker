@@ -296,128 +296,15 @@ extension ClosePlanResponse {
     /// Built from the union of `target` (sprints with time), `planned` and
     /// `skipped`, so a `close` op on an old binding whose sprint has no time
     /// still gets a line rather than happening invisibly.
+    ///
+    /// Phase 6 moved the derivation into `ClosePlanRowBuilder` so the Sync
+    /// Sprints sheet renders the same plan the same way. The close sheet keeps
+    /// its two extra behaviours via the builder's parameters: it lists sprints
+    /// the plan does *not* touch, and it attaches the task's first issue.
     var rows: [ClosePlanRow] {
-        var order: [String] = []
-        var seen: Set<String> = []
-        func note(_ key: String?) {
-            let key = key ?? "—"
-            if seen.insert(key).inserted { order.append(key) }
-        }
-        plan.target.forEach { note($0.sprintId) }
-        plan.planned.forEach { note($0.sprintId) }
-        plan.skipped.filter { $0.needsIssue || $0.withheldHours }
-            .forEach { note($0.sprintId) }
-
-        let bindingsBySprint = Dictionary(
-            plan.bindings.map { ($0.sprintId ?? "—", $0) }, uniquingKeysWith: { first, _ in first })
-
-        let built: [ClosePlanRow] = order.map { key in
-            let target = plan.target.first { ($0.sprintId ?? "—") == key }
-            let ops = plan.planned.filter { ($0.sprintId ?? "—") == key }
-            let skips = plan.skipped.filter { ($0.sprintId ?? "—") == key }
-            let binding = bindingsBySprint[key]
-
-            let title = target?.sprint ?? ops.first?.sprint ?? skips.first?.sprint
-                ?? binding?.sprint ?? "unknown sprint"
-
-            let createOp = ops.first { $0.op == "create" }
-            let repointOp = ops.first { $0.op == "repoint" }
-            let hoursOp = ops.first { $0.op == "hours" }
-            let closeOp = ops.first { $0.op == "close" }
-            let supersedeOp = ops.first { $0.op == "supersede" }
-            let withheld = skips.first { $0.withheldHours }
-            let needsIssueSkip = skips.first { $0.needsIssue }
-
-            // The issue this sprint's hours land on. A `create` op has none yet;
-            // a `repoint` carries the task's live issue forward.
-            let issue = createOp != nil ? nil
-                : (repointOp?.issue ?? hoursOp?.issue ?? closeOp?.issue
-                   ?? binding?.issue ?? needsIssueSkip?.issue)
-
-            var actions: [String] = []
-            if let createOp {
-                if createOp.createIssue {
-                    actions.append("CREATE issue in \(createOp.repo ?? "its repo")")
-                    if let hours = createOp.hours, hours > 0 {
-                        actions.append("set hours to \(Self.hours(hours))")
-                    }
-                } else {
-                    actions.append("add local binding only "
-                                   + "(\(createOp.skippedGitHub ?? "no repo"))")
-                }
-            }
-            if let repointOp {
-                actions.append("carry \(repointOp.issue ?? "the issue") forward from "
-                               + "\(repointOp.fromSprint ?? "no sprint")")
-                if let hours = repointOp.hours, hours > 0 {
-                    actions.append("set hours to \(Self.hours(hours))")
-                }
-            }
-            if let hoursOp, let hours = hoursOp.hours {
-                let was = hoursOp.fromHours.map { Self.hours($0) } ?? "unknown"
-                actions.append("update hours \(was) → \(Self.hours(hours))")
-            }
-            if let supersedeOp {
-                actions.append("zero and close \(supersedeOp.issue ?? "duplicate issue") "
-                               + "(superseded by \(supersedeOp.primary ?? "the primary"))")
-            }
-            if closeOp != nil || createOp?.willClose == true {
-                actions.append("close issue — sprint has ended")
-            }
-            if let needsIssueSkip {
-                actions.append("NO ISSUE — \(Duration.format(minutes: needsIssueSkip.minutes ?? 0)) "
-                               + "would go unreported")
-            }
-            if let withheld {
-                let was = withheld.fromHours.map { Self.hours($0) } ?? "unknown"
-                let want = withheld.hours.map { Self.hours($0) } ?? "?"
-                actions.append("hours withheld (\(was) → \(want)) — other sprints "
-                               + "have unreported time")
-            }
-
-            return ClosePlanRow(
-                sprintId: target?.sprintId ?? ops.first?.sprintId ?? skips.first?.sprintId,
-                sprintTitle: title,
-                minutes: target?.minutes ?? ops.first?.minutes ?? skips.first?.minutes,
-                issue: issue,
-                createsIssue: createOp?.createIssue ?? false,
-                closesIssue: closeOp != nil || createOp?.willClose == true
-                    || supersedeOp != nil,
-                hoursWithheld: withheld != nil,
-                actions: actions)
-        }
-        return withFirstIssueRow(built)
-    }
-
-    /// Attaches the task's **first** issue creation to a row.
-    ///
-    /// `close_task` mints that issue itself, before the reconcile and outside
-    /// `planned[]`, so nothing in the plan mentions it — a real task on the
-    /// owner's data planned *no* operations at all yet would still have an
-    /// issue created on close. Without this the sheet would warn "1 issue will
-    /// be created" over a table that says "no change", which is exactly the
-    /// kind of quiet mismatch the preview exists to prevent.
-    ///
-    /// It lands on the current binding, so: the last sprint whose binding has
-    /// no issue, else the last row, else a row of its own.
-    private func withFirstIssueRow(_ rows: [ClosePlanRow]) -> [ClosePlanRow] {
-        guard needsIssue else { return rows }
-        let action = "CREATE the task’s first issue in \(repo ?? "its repo")"
-        guard !rows.isEmpty else {
-            return [ClosePlanRow(sprintId: nil, sprintTitle: plan.currentSprint ?? "—",
-                                 minutes: nil, issue: nil, createsIssue: true,
-                                 closesIssue: false, hoursWithheld: false,
-                                 actions: [action])]
-        }
-        let index = rows.lastIndex { $0.issue == nil && !$0.createsIssue } ?? rows.count - 1
-        var rows = rows
-        let row = rows[index]
-        rows[index] = ClosePlanRow(sprintId: row.sprintId, sprintTitle: row.sprintTitle,
-                                   minutes: row.minutes, issue: row.issue,
-                                   createsIssue: true, closesIssue: row.closesIssue,
-                                   hoursWithheld: row.hoursWithheld,
-                                   actions: [action] + row.actions)
-        return rows
+        ClosePlanRowBuilder.rows(from: plan,
+                                 includeUntouchedTargets: true,
+                                 firstIssue: (repo: repo, needed: needsIssue))
     }
 
     /// `21.0` → `"21h"`, `12.5` → `"12.5h"`, `12.25` → `"12.25h"`.
@@ -450,12 +337,22 @@ struct OperationRecord: Decodable, Sendable, Equatable {
     let finishedAt: TimeInterval?
     let progress: [String]
     let error: DaemonErrorBody?
+    /// The operation's return value once it completes. Carries the **non-fatal**
+    /// GitHub outcome, which `state == "completed"` alone does not imply — see
+    /// `OperationOutcome`.
+    let rawResult: RawJSON?
+
+    /// The close outcome, when this record is a `close`.
+    var result: OperationOutcome? { rawResult?.decode(OperationOutcome.self) }
+
+    /// The reconcile outcome, when this record is a `reconcile`.
+    var reconcileResult: ReconcileResponse? { rawResult?.decode(ReconcileResponse.self) }
 
     var isTerminal: Bool { state == "completed" || state == "failed" }
     var didFail: Bool { state == "failed" }
 
     enum CodingKeys: String, CodingKey {
-        case op, state, progress, error
+        case op, state, progress, error, result
         case operationId = "operation_id"
         case taskId = "task_id"
         case startedAt = "started_at"
@@ -476,5 +373,6 @@ struct OperationRecord: Decodable, Sendable, Equatable {
         // decodes straight from the record's own decoder. `try?` covers the
         // running case, where `error` is `null`.
         error = try? DaemonErrorBody(from: decoder)
+        rawResult = try? c.decodeIfPresent(RawJSON.self, forKey: .result)
     }
 }

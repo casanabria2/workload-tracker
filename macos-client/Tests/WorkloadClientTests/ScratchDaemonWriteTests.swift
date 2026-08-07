@@ -125,10 +125,14 @@ final class ScratchDaemonWriteTests: XCTestCase {
         var terminal = false
         for _ in 0..<120 {
             let phase = await store.closeSheet?.phase
-            if case .succeeded(let lines) = phase {
+            if case .succeeded(let lines, let outcome) = phase {
                 terminal = true
                 print("[scratch] close succeeded:")
                 for line in lines { print("[scratch]   \(line)") }
+                // Phase 6: "completed" is not "GitHub took it" — report both.
+                print("[scratch]   outcome: issue_closed="
+                      + "\(outcome?.issueClosed.description ?? "n/a") "
+                      + "error=\(outcome?.error ?? "none")")
                 break
             }
             if case .failed(let message, let code, _) = phase {

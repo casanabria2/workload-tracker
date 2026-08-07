@@ -1,0 +1,201 @@
+{
+  "_comment": [
+    "SYNTHETIC fixture for the Phase 6 recurrent shelf. Every task title, issue",
+    "ref, role and hour figure here is invented. The real ~/.workload_tracker.json",
+    "is the owner's private work history and must never be committed here.",
+    "",
+    "Shapes it exercises, each drawn from a real one measured on the owner's data",
+    "but with the content replaced:",
+    "  r-quiet     time only in OLD sprints, none in the current one. This is the",
+    "              row that proves the shelf ignores the Sprint facet: under the",
+    "              board's filter it vanishes when a past sprint is selected alone.",
+    "  r-live      time in the current sprint, an open binding, a linked issue.",
+    "  r-unlinked  no repo and no issue at all - End Series must still be offered,",
+    "              and must say that nothing is closed on GitHub.",
+    "  r-series    carries recurrent_series, which the daemon does NOT send today.",
+    "              Present so the forward-compatible path has coverage.",
+    "  b-open      a non-recurrent In Progress card, so shelf/board partitioning",
+    "              is assertable.",
+    "Sprint 102 is current; 100 and 101 have ended."
+  ],
+  "generated_at": 1776600000.0,
+  "roles": [
+    { "id": "other", "label": "Other", "color": "white" },
+    { "id": "demokit", "label": "Managing DemoKit", "color": "blue" }
+  ],
+  "sprints": [
+    { "id": "sp-100", "title": "Sprint 100", "start_date": "2026-03-16", "end_date": "2026-03-30", "field_id": "PVTIF_fixture" },
+    { "id": "sp-101", "title": "Sprint 101", "start_date": "2026-03-30", "end_date": "2026-04-13", "field_id": "PVTIF_fixture" },
+    { "id": "sp-102", "title": "Sprint 102", "start_date": "2026-04-13", "end_date": "2026-04-27", "field_id": "PVTIF_fixture" }
+  ],
+  "current_sprint": {
+    "id": "sp-102", "title": "Sprint 102",
+    "start_date": "2026-04-13", "end_date": "2026-04-27", "field_id": "PVTIF_fixture"
+  },
+  "active_timer": null,
+  "project_options": { "activity": ["Internal Enablement", "Demo Kit Maintenance"], "type": [] },
+  "config": {
+    "github_project_owner": "example-org",
+    "github_project_number": 999,
+    "github_repo": "example-org/example-repo"
+  },
+  "data_file": { "path": "/tmp/fixture.json", "readable": true, "reason": "ok", "tasks": 5 },
+  "tasks": [
+    {
+      "id": "r-quiet",
+      "title": "Quiet recurring sync",
+      "description": "Perpetual, but nothing logged this fortnight.",
+      "status": "recurrent",
+      "status_label": "Recurrent",
+      "role_id": "other",
+      "created_at": 1770000000.0,
+      "activity": "Internal Enablement",
+      "github_repo": "example-org/example-repo",
+      "type": null,
+      "sprints_with_time": [
+        { "sprint_id": "sp-100", "sprint_title": "Sprint 100", "start_date": "2026-03-16", "total_mins": 90.0 },
+        { "sprint_id": "sp-101", "sprint_title": "Sprint 101", "start_date": "2026-03-30", "total_mins": 45.0 }
+      ],
+      "start_sprint": "Sprint 100",
+      "start_sprint_id": "sp-100",
+      "sprint_issues": [
+        { "sprint_id": "sp-100", "sprint": "Sprint 100", "issue": "example-org/example-repo#300", "state": "closed", "hours_synced": 1.5 },
+        { "sprint_id": "sp-101", "sprint": "Sprint 101", "issue": "example-org/example-repo#301", "state": "open", "hours_synced": 0.75 }
+      ],
+      "current_issue": "example-org/example-repo#301",
+      "logged_mins": 135.0,
+      "live_mins": 0,
+      "reportable_mins": 45.0,
+      "last_logged_at": 1775600000.0,
+      "logs": [
+        { "id": "log-q1", "minutes": 90, "note": "Timer session", "at": 1774342800.0, "started_at": 1774337400.0, "ended_at": 1774342800.0 },
+        { "id": "log-q2", "minutes": 45, "note": "Timer session", "at": 1775600000.0, "started_at": 1775597300.0, "ended_at": 1775600000.0 }
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+    {
+      "id": "r-live",
+      "title": "Ad-hoc questions",
+      "description": "Perpetual, worked this sprint.",
+      "status": "recurrent",
+      "status_label": "Recurrent",
+      "role_id": "demokit",
+      "created_at": 1769000000.0,
+      "activity": "Demo Kit Maintenance",
+      "github_repo": "example-org/other-repo",
+      "type": null,
+      "sprints_with_time": [
+        { "sprint_id": "sp-101", "sprint_title": "Sprint 101", "start_date": "2026-03-30", "total_mins": 120.0 },
+        { "sprint_id": "sp-102", "sprint_title": "Sprint 102", "start_date": "2026-04-13", "total_mins": 169.0 }
+      ],
+      "start_sprint": "Sprint 101",
+      "start_sprint_id": "sp-101",
+      "sprint_issues": [
+        { "sprint_id": "sp-101", "sprint": "Sprint 101", "issue": "example-org/other-repo#400", "state": "closed", "hours_synced": 2.0 },
+        { "sprint_id": "sp-102", "sprint": "Sprint 102", "issue": "example-org/other-repo#401", "state": "open", "hours_synced": 1.5 }
+      ],
+      "current_issue": "example-org/other-repo#401",
+      "logged_mins": 289.0,
+      "live_mins": 0,
+      "reportable_mins": 169.0,
+      "last_logged_at": 1776500000.0,
+      "logs": [
+        { "id": "log-l1", "minutes": 120, "note": "Timer session", "at": 1775552400.0, "started_at": 1775545200.0, "ended_at": 1775552400.0 },
+        { "id": "log-l2", "minutes": 169, "note": "Timer session", "at": 1776500000.0, "started_at": 1776489860.0, "ended_at": 1776500000.0 }
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+    {
+      "id": "r-unlinked",
+      "title": "Untracked standing meeting",
+      "description": "No repo, no issue.",
+      "status": "recurrent",
+      "status_label": "Recurrent",
+      "role_id": "other",
+      "created_at": 1771000000.0,
+      "activity": null,
+      "github_repo": null,
+      "type": null,
+      "sprints_with_time": [],
+      "start_sprint": null,
+      "start_sprint_id": null,
+      "sprint_issues": [],
+      "current_issue": null,
+      "logged_mins": 0,
+      "live_mins": 0,
+      "reportable_mins": 0,
+      "last_logged_at": null,
+      "logs": [],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+    {
+      "id": "r-series",
+      "title": "Drifted title variant",
+      "description": "Carries the canonical series name the daemon does not send yet.",
+      "status": "recurrent",
+      "status_label": "Recurrent",
+      "role_id": "other",
+      "created_at": 1768000000.0,
+      "activity": "Internal Enablement",
+      "github_repo": "example-org/example-repo",
+      "type": null,
+      "recurrent_series": "Canonical Series Name",
+      "sprints_with_time": [
+        { "sprint_id": "sp-102", "sprint_title": "Sprint 102", "start_date": "2026-04-13", "total_mins": 30.0 }
+      ],
+      "start_sprint": "Sprint 102",
+      "start_sprint_id": "sp-102",
+      "sprint_issues": [
+        { "sprint_id": "sp-102", "sprint": "Sprint 102", "issue": "example-org/example-repo#500", "state": "open", "hours_synced": 0.5 }
+      ],
+      "current_issue": "example-org/example-repo#500",
+      "logged_mins": 30.0,
+      "live_mins": 0,
+      "reportable_mins": 30.0,
+      "last_logged_at": 1776510000.0,
+      "logs": [
+        { "id": "log-s1", "minutes": 30, "note": "Timer session", "at": 1776510000.0, "started_at": 1776508200.0, "ended_at": 1776510000.0 }
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    },
+    {
+      "id": "b-open",
+      "title": "An ordinary in-flight task",
+      "description": "Non-recurrent, so it belongs on the board and never on the shelf.",
+      "status": "inprogress",
+      "status_label": "In Progress",
+      "role_id": "demokit",
+      "created_at": 1776000000.0,
+      "activity": "Demo Kit Maintenance",
+      "github_repo": "example-org/other-repo",
+      "type": null,
+      "sprints_with_time": [
+        { "sprint_id": "sp-102", "sprint_title": "Sprint 102", "start_date": "2026-04-13", "total_mins": 75.0 }
+      ],
+      "start_sprint": "Sprint 102",
+      "start_sprint_id": "sp-102",
+      "sprint_issues": [
+        { "sprint_id": "sp-102", "sprint": "Sprint 102", "issue": "example-org/other-repo#600", "state": "open", "hours_synced": 1.25 }
+      ],
+      "current_issue": "example-org/other-repo#600",
+      "logged_mins": 75.0,
+      "live_mins": 0,
+      "reportable_mins": 75.0,
+      "last_logged_at": 1776520000.0,
+      "logs": [
+        { "id": "log-b1", "minutes": 75, "note": "Timer session", "at": 1776520000.0, "started_at": 1776515500.0, "ended_at": 1776520000.0 }
+      ],
+      "local_folder": null,
+      "tabs": [],
+      "active_window_id": null
+    }
+  ]
+}
