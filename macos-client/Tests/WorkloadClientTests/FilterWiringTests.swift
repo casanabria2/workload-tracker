@@ -34,7 +34,7 @@ final class FilterWiringTests: XCTestCase {
     func testTheFirstSnapshotSeedsTheCurrentSprint() {
         let store = makeStore()
         XCTAssertEqual(store.filter.sprints, [currentSprint])
-        XCTAssertEqual(store.filteredTasks.count, 18)
+        XCTAssertEqual(store.filteredTasks.count, 24)
         XCTAssertEqual(store.tasks.count, 55)
     }
 
@@ -247,9 +247,9 @@ final class FilterWiringTests: XCTestCase {
     /// this pins their relationship.
     func testColumnsCarryBothCounts() {
         let store = makeStore()  // default: the current sprint
-        XCTAssertEqual(store.filteredBoardTasks(.todo).count, 4)
+        XCTAssertEqual(store.filteredBoardTasks(.todo).count, 5)
         XCTAssertEqual(store.boardTasks(.todo).count, 5)
-        XCTAssertEqual(store.filteredBoardTasks(.inProgress).count, 1)
+        XCTAssertEqual(store.filteredBoardTasks(.inProgress).count, 6)
         XCTAssertEqual(store.boardTasks(.inProgress).count, 6)
         XCTAssertEqual(store.filteredBoardTasks(.done).count, 6)
         XCTAssertEqual(store.boardTasks(.done).count, 37)

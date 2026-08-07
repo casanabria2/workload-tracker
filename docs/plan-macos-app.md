@@ -579,14 +579,23 @@ Consequences, all measured:
   Sprint 100 shows the 8 tasks worked in it, whatever their current binding says.
 - The default selection is **the current sprint** (Sprint 105 → 13 tasks), which is
   what makes the Done column tractable without a separate scope control (§7).
-- **The zero-log exemption.** 5 tasks have no logs, 3 of them live `todo` cards. Under
-  a strict logged-time rule they would vanish from the default board — a card you
-  just created would be invisible. Rule: **a task with no logged time matches the
-  Sprint facet whenever the current sprint is among the selected sprints.** New and
-  unstarted work stays visible in the default view; it correctly disappears when you
-  filter to a past sprint, because it wasn't worked then.
-- A `done` task with no logs (2 exist) follows the same rule and shows in the current
-  sprint's Done column.
+- **The open-work exemption.** ⚠️ *This rule was too narrow as first written, and
+  the implementation proved it.* The original text exempted only tasks with **no
+  logs at all** (5 tasks, 3 of them live `todo` cards). Built that way, the default
+  current-sprint filter hid **5 of the 6 In Progress cards** — open work not yet
+  logged against this fortnight. The rationale for the exemption ("a card you just
+  created would be invisible") applies at least as strongly to work in flight.
+
+  The rule is therefore: **a task with no time in the selected sprints still matches
+  whenever the current sprint is among them and the task is not `done`** — plus a
+  `done` task with *no logged time at all*, which has no sprint anywhere and so can
+  only sensibly live in the current one. Zero-log tasks are now just the special
+  case with no logs.
+- **This must not un-scope the Done column**, which is the reason the facet exists:
+  a `done` task with time in *other* sprints belongs to those and stays hidden.
+  Measured: 31 of the 37 done tasks remain hidden under the default filter, while
+  every open task is visible. Default view = 24 of 55: todo 5 + inProgress 6 +
+  recurrent 7 + done 6.
 
 ### 8.3 Facets are derived from data, and self-hide
 

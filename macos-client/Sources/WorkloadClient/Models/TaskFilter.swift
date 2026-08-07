@@ -210,11 +210,36 @@ enum TaskFilter {
                                currentSprintID: String?) -> Bool {
         guard !selected.isEmpty else { return true }
         let worked = sprintIDs(of: task)
-        if worked.isEmpty {
-            guard let currentSprintID else { return false }
-            return selected.contains(currentSprintID)
-        }
-        return !worked.isDisjoint(with: selected)
+        if !worked.isDisjoint(with: selected) { return true }
+
+        // The open-work exemption.
+        //
+        // Sprint means "has logged time in that sprint", which is right for the
+        // Done column — that is the whole reason the facet exists, since 37 of
+        // 55 tasks are done and an unscoped Done column is unreadable. Applied
+        // to *open* work it is wrong: a task in flight that you have not logged
+        // against this fortnight is exactly the task you most want on the board.
+        //
+        // Measured on the real data before this rule existed: the default
+        // current-sprint filter hid **5 of the 6 In Progress cards**.
+        //
+        // So any non-`done` task with no time in the selected sprints stays
+        // visible while the *current* sprint is one of them. Selecting only past
+        // sprints still excludes it — it genuinely was not worked then. This
+        // subsumes the narrower zero-log exemption the plan originally specified
+        // (a brand-new task is just the special case with no logs at all).
+        guard let currentSprintID, selected.contains(currentSprintID) else { return false }
+
+        // Open work: always exempt.
+        if task.status != .done { return true }
+
+        // A *done* task is exempt only when it has no logged time at all. It has
+        // no sprint anywhere, so the current sprint is the only place it can
+        // sensibly appear. A done task that *does* have time belongs to the
+        // sprints it was worked in and must not leak into every other one —
+        // otherwise the Done column is unscoped again, which is the problem the
+        // Sprint facet exists to solve.
+        return worked.isEmpty
     }
 
     /// Free text over the title, the description and the current issue ref, so

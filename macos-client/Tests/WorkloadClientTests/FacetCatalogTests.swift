@@ -78,7 +78,7 @@ final class FacetCatalogTests: XCTestCase {
     func testTheCurrentSprintCountIncludesTheZeroLogTasks() {
         let current = try! XCTUnwrap(snapshot.currentSprint?.id)
         let option = try! XCTUnwrap(catalog.options(for: .sprint).first { $0.value == current })
-        XCTAssertEqual(option.count, 18)
+        XCTAssertEqual(option.count, 24)
         XCTAssertEqual(snapshot.tasks.count { TaskFilter.sprintIDs(of: $0).contains(current) },
                        13, "13 worked in it; the other 5 are the exemption")
     }

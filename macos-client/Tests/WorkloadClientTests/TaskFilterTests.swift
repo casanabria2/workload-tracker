@@ -92,7 +92,7 @@ final class TaskFilterTests: XCTestCase {
         let sprintOnly = ids(FilterState(sprints: [currentSprint]))
         let both = ids(FilterState(roles: ["role-a"], sprints: [currentSprint]))
         XCTAssertEqual(both, roleOnly.intersection(sprintOnly))
-        XCTAssertEqual(both.count, 7)
+        XCTAssertEqual(both.count, 10)
         XCTAssertLessThan(both.count, roleOnly.count)
         XCTAssertLessThan(both.count, sprintOnly.count)
     }
@@ -100,7 +100,7 @@ final class TaskFilterTests: XCTestCase {
     /// The full rule in one assertion: *(a OR b) AND worked-in-105*.
     func testOrWithinAndAndAcrossCompose() {
         XCTAssertEqual(ids(FilterState(roles: ["role-a", "role-b"],
-                                       sprints: [currentSprint])).count, 10)
+                                       sprints: [currentSprint])).count, 13)
     }
 
     /// Three facets at once, checked against the hand-computed intersection.
@@ -149,27 +149,57 @@ final class TaskFilterTests: XCTestCase {
             .union(ids(FilterState(sprints: [s96]))))
     }
 
-    // MARK: - The zero-log exemption (§8.2)
+    // MARK: - The open-work exemption (§8.2)
 
-    /// 5 tasks have no logs and 3 of them are live To Do cards. They must stay
-    /// visible in the default view, or creating a task would hide it.
+    /// Sprint means "worked in that sprint", which is right for Done and wrong
+    /// for open work: a task in flight you have not logged against this
+    /// fortnight is exactly the one you want on the board. Measured before this
+    /// rule existed, the default filter hid **5 of the 6 In Progress cards**.
+    func testEveryOpenTaskSurvivesTheCurrentSprintFilter() {
+        let matched = ids(FilterState(sprints: [currentSprint]))
+        for task in tasks where task.status != .done {
+            XCTAssertTrue(matched.contains(task.id),
+                          "\(task.id) is \(task.status.rawValue) and must stay visible")
+        }
+        // 13 worked in 105; the exemption brings open work and the 2 log-less
+        // done tasks along. 24 = todo 5 + inProgress 6 + recurrent 7 + done 6.
+        XCTAssertEqual(matched.count, 24)
+        XCTAssertEqual(tasks.count { TaskFilter.sprintIDs(of: $0).contains(currentSprint) }, 13)
+    }
+
+    /// The exemption must not un-scope the Done column — the reason the facet
+    /// exists. A done task with time in *other* sprints belongs to those.
+    func testDoneTasksWithTimeElsewhereStayHidden() {
+        let matched = ids(FilterState(sprints: [currentSprint]))
+        let hidden = tasks.filter {
+            $0.status == .done
+                && !TaskFilter.sprintIDs(of: $0).isEmpty
+                && !TaskFilter.sprintIDs(of: $0).contains(currentSprint)
+        }
+        XCTAssertEqual(hidden.count, 31, "the Done column must still be scoped")
+        for task in hidden { XCTAssertFalse(matched.contains(task.id)) }
+    }
+
+    /// Zero-log tasks are now just the special case with no logs at all.
     func testTasksWithNoLoggedTimeMatchTheCurrentSprint() {
         let matched = ids(FilterState(sprints: [currentSprint]))
         for id in ["t-01", "t-07", "t-14", "t-15", "t-30"] {
             XCTAssertTrue(matched.contains(id), "\(id) has no logs and must not vanish")
         }
-        // 13 tasks have time in Sprint 105; the exemption brings the 5 along.
-        XCTAssertEqual(matched.count, 18)
-        XCTAssertEqual(tasks.count { TaskFilter.sprintIDs(of: $0).contains(currentSprint) }, 13)
     }
 
     /// …and correctly disappear when you filter to a past sprint: they were not
-    /// worked then.
-    func testTasksWithNoLoggedTimeDoNotMatchAPastSprint() throws {
+    /// worked then. This is what keeps the exemption from meaning "always".
+    func testOpenAndLoglessTasksDoNotMatchAPastSprint() throws {
         let past = try sprint("Sprint 95")
         let matched = ids(FilterState(sprints: [past]))
         for id in ["t-01", "t-07", "t-14", "t-15", "t-30"] {
             XCTAssertFalse(matched.contains(id))
+        }
+        for task in tasks where task.status != .done
+            && !TaskFilter.sprintIDs(of: task).contains(past) {
+            XCTAssertFalse(matched.contains(task.id),
+                           "\(task.id) was not worked in Sprint 95")
         }
     }
 
