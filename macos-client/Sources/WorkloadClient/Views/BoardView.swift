@@ -16,10 +16,11 @@ struct BoardView: View {
 
     /// The card currently being dragged.
     ///
-    /// Held here rather than read out of the `NSItemProvider` because
-    /// `DropDelegate.validateDrop` and `dropUpdated` are synchronous — an item
-    /// provider can only be read asynchronously, which is too late to decide
-    /// whether to show the "no" cursor.
+    /// Set by the drag source (`DraggableIfAllowed`) and used only for *hover
+    /// styling* — whether the column under the pointer lights up or shows its
+    /// refusal. The drop itself reads the decoded payload that `.dropDestination`
+    /// hands back, which is what actually crossed the drag boundary; this is a
+    /// fallback for that.
     @State private var dragging: TaskDragPayload?
     /// The keyboard-selected card.
     @State private var selection: String?
@@ -308,9 +309,37 @@ struct BoardColumn: View {
                 RefusalOverlay(rejection: rejection(for: dragging))
             }
         }
-        .onDrop(of: [.workloadTask], delegate: ColumnDropDelegate(
-            column: status, store: store, dragging: $dragging,
-            isTargeted: $isTargeted, hoverY: $hoverY))
+        // `.dropDestination`, not `.onDrop(of:delegate:)`.
+        //
+        // This is the bug Phase 4 shipped with: `.draggable` produces a
+        // **Transferable** drag, `.onDrop(of:delegate:)` consumes an
+        // **NSItemProvider** one, and the two do not interoperate. The drag
+        // started and the card animated back, but no delegate callback ever
+        // fired — verified with probes on a real drag: `dragStart` logged,
+        // `validateDrop` / `dropEntered` / `performDrop` never did.
+        //
+        // `.dropDestination` is `.draggable`'s matching partner. It costs the
+        // two things `ColumnDropDelegate` was chosen for — a synchronous
+        // forbidden cursor, and a continuous hover location for spring-loaded
+        // auto-scroll — but a refusal is still *visible*: the column keeps its
+        // orange dashed border and `RefusalOverlay`, both driven by
+        // `isTargeted` + `dragging`, and returning `false` snaps the card back.
+        .dropDestination(for: TaskDragPayload.self) { items, _ in
+            isTargeted = false
+            hoverY = nil
+            // Prefer the decoded payload over the shared `dragging` state: it
+            // is what actually crossed the drag boundary.
+            guard let payload = items.first ?? dragging else { return false }
+            dragging = nil
+            _Concurrency.Task { await store.perform(drop: payload, on: status) }
+            // Refusals return false so the card animates home; `store.perform`
+            // still runs, because it owns the "why" message.
+            if case .rejected = BoardDropRules.decide(payload, to: status) { return false }
+            return true
+        } isTargeted: { targeted in
+            isTargeted = targeted
+            if !targeted { hoverY = nil }
+        }
     }
 
     private func rejection(for payload: TaskDragPayload) -> BoardDropRejection? {
@@ -515,56 +544,5 @@ private struct DraggableIfAllowed: ViewModifier {
             content
                 .help("Recurrent tasks can’t be dragged — closing one ends the series.")
         }
-    }
-}
-
-// MARK: - Drop delegate
-
-/// The column's drop target.
-///
-/// A `DropDelegate` rather than `.dropDestination`, for two things
-/// `.dropDestination` cannot give: a synchronous accept/refuse decision (so the
-/// cursor shows "no" over Done for a Done card) and a continuous hover location
-/// (so the column can spring-load its scroll).
-private struct ColumnDropDelegate: DropDelegate {
-    let column: TaskStatus
-    let store: Store
-    @Binding var dragging: TaskDragPayload?
-    @Binding var isTargeted: Bool
-    @Binding var hoverY: CGFloat?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        guard let dragging else { return info.hasItemsConforming(to: [.workloadTask]) }
-        return BoardDropRules.accepts(dragging, in: column)
-    }
-
-    func dropEntered(info: DropInfo) {
-        isTargeted = true
-        hoverY = info.location.y
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        hoverY = info.location.y
-        guard let dragging else { return DropProposal(operation: .move) }
-        return DropProposal(operation: BoardDropRules.accepts(dragging, in: column)
-                            ? .move : .forbidden)
-    }
-
-    func dropExited(info: DropInfo) {
-        isTargeted = false
-        hoverY = nil
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        isTargeted = false
-        hoverY = nil
-        guard let payload = dragging else { return false }
-        dragging = nil
-        // SwiftUI calls the delegate on the main actor; `Store` is
-        // `@MainActor`, and the protocol requirement is not isolated.
-        MainActor.assumeIsolated {
-            _Concurrency.Task { await store.perform(drop: payload, on: column) }
-        }
-        return true
     }
 }

@@ -11,11 +11,22 @@ import UniformTypeIdentifiers
 // critical logic that can only be exercised by driving a UI is logic that does
 // not get exercised.
 
-extension UTType {
-    /// The board's drag type. Private to this app: a task id only means
-    /// something to a client of the same daemon.
-    static let workloadTask = UTType(exportedAs: "com.carlossanabria.workloadtracker.task")
-}
+// NOTE: there is deliberately no custom `UTType` here any more.
+//
+// The board originally used `UTType(exportedAs: "com.carlossanabria.workloadtracker.task")`.
+// Drag-and-drop silently did not work: a card lifted, followed the pointer, and
+// animated home, and **no drop destination callback ever fired** — with
+// `.onDrop(of:delegate:)` and with `.dropDestination` alike.
+//
+// An `exportedAs:` type must be declared in the app's Info.plist under
+// `UTExportedTypeDeclarations`. This target is a bare SwiftPM executable with no
+// Info.plist and no bundle identifier, so the type was never registered, and
+// drag routing — which resolves conformance through the system type registry —
+// could never match it. Nothing warns you: `UTType.isDeclared` even answers
+// `true` in-process.
+//
+// See `TaskDragPayload.contentType`. When the app is packaged as a real `.app`
+// (plan §12 / Phase 9), a custom type can come back — declared properly.
 
 /// What a dragged card carries.
 ///
@@ -35,8 +46,16 @@ struct TaskDragPayload: Codable, Transferable, Sendable, Equatable, Hashable {
 
     var status: TaskStatus { TaskStatus(rawValue: sourceStatus) }
 
+    /// The drag type. **Must be a system-registered type** — see the note at the
+    /// top of this file. `.json` is honest about what a `CodableRepresentation`
+    /// actually puts on the pasteboard.
+    ///
+    /// The cost of a public type is that a column will accept JSON dragged from
+    /// anywhere; such a drop simply fails to decode and the card goes home.
+    static let contentType: UTType = .json
+
     static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .workloadTask)
+        CodableRepresentation(contentType: Self.contentType)
     }
 }
 

@@ -1,4 +1,5 @@
 import XCTest
+import UniformTypeIdentifiers
 @testable import WorkloadClient
 
 /// Plan §7's drop table, exercised as a pure function.
@@ -143,5 +144,35 @@ final class BoardDropRulesTests: XCTestCase {
         XCTAssertTrue(reopen.hint?.contains("gh issue reopen") == true, reopen.hint ?? "")
         XCTAssertTrue(recurrent.hint?.contains("series") == true, recurrent.hint ?? "")
         XCTAssertNil(BoardDropRejection.sameColumn.hint)
+    }
+}
+
+// MARK: - Drag type registration
+
+/// The drag type must stay system-registered.
+///
+/// This is a change-detector, deliberately. The board shipped with
+/// `UTType(exportedAs: "com.carlossanabria.workloadtracker.task")` and drag-and-
+/// drop silently did nothing: cards lifted and animated home, and no drop
+/// destination callback ever fired, because an `exportedAs:` type must be
+/// declared in an Info.plist and this target is a bare SwiftPM executable that
+/// has none. No unit test could catch it — `NSItemProvider` registers such a
+/// type happily, and `isDeclared` returns `true` in-process — so the guard is
+/// this assertion plus the note it points at.
+final class DragTypeRegistrationTests: XCTestCase {
+    func testPayloadUsesASystemRegisteredType() {
+        XCTAssertEqual(TaskDragPayload.contentType, .json,
+                       "Read the note at the top of BoardDrop.swift before changing this: "
+                       + "a custom exportedAs: type breaks drag-and-drop with no error "
+                       + "until the app is a real .app bundle declaring it.")
+        XCTAssertTrue(TaskDragPayload.contentType.isDeclared)
+    }
+
+    func testPayloadRoundTripsThroughItsRepresentation() async throws {
+        let original = TaskDragPayload(taskId: "abc123", sourceStatus: .todo)
+        let data = try JSONEncoder().encode(original)
+        let back = try JSONDecoder().decode(TaskDragPayload.self, from: data)
+        XCTAssertEqual(back, original)
+        XCTAssertEqual(back.status, .todo)
     }
 }
