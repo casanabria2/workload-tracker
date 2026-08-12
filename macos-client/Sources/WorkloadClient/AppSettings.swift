@@ -104,10 +104,21 @@ enum AppSettings {
     /// window frame and **no** `filterState` key, and the board came back on the
     /// default filter. So the scene value is mirrored here, where it survives.
     ///
-    /// When the app is packaged as a real `.app` (plan §12 / Phase 9) the scene
-    /// value starts working and takes precedence; this stays as the seed for a
-    /// brand-new window. Same failure shape as the Phase 4 `UTType` bug: a
-    /// mechanism that compiles, runs, and silently does nothing.
+    /// **Phase 9 update — measured, and the mirror is being kept.** With
+    /// `WorkloadTracker.app` (plan §12) the scene value does now persist: the
+    /// whole `com.carlossanabria.workloadtracker` defaults domain was deleted,
+    /// the app relaunched, and both the sidebar selection *and* a role filter
+    /// came back — so the restore did not come from here. `@SceneStorage` takes
+    /// precedence in `RootView.onAppear`, and this is the fallback behind it.
+    ///
+    /// It is not merely belt and braces. AppKit state restoration is switched
+    /// off by **System Settings → Desktop & Dock → "Close windows when quitting
+    /// an application"** (`NSQuitAlwaysKeepsWindows = 0`), and discarded by
+    /// `open --fresh`. In either case `@SceneStorage` silently reverts to its
+    /// default and this key is the only thing that remembers the filter. Same
+    /// failure shape as the Phase 4 `UTType` bug — a mechanism that compiles,
+    /// runs and silently does nothing — except here the trigger is a checkbox in
+    /// System Settings.
     ///
     /// `""` means "never written", which must stay distinguishable from an
     /// explicitly cleared filter — see `FilterStateCodec`.

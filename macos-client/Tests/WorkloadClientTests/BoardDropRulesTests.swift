@@ -151,20 +151,29 @@ final class BoardDropRulesTests: XCTestCase {
 
 /// The drag type must stay system-registered.
 ///
-/// This is a change-detector, deliberately. The board shipped with
-/// `UTType(exportedAs: "com.carlossanabria.workloadtracker.task")` and drag-and-
-/// drop silently did nothing: cards lifted and animated home, and no drop
-/// destination callback ever fired, because an `exportedAs:` type must be
-/// declared in an Info.plist and this target is a bare SwiftPM executable that
-/// has none. No unit test could catch it — `NSItemProvider` registers such a
-/// type happily, and `isDeclared` returns `true` in-process — so the guard is
-/// this assertion plus the note it points at.
+/// This is a change-detector, deliberately, and **the reason it exists has
+/// changed**. It used to guard against an impossibility: an `exportedAs:` type
+/// could not work at all, because there was no Info.plist to declare it in.
+/// Phase 9 (plan §12) added one, so the type is now genuinely declared and
+/// registered with LaunchServices — the switch is possible.
+///
+/// What this now guards is a **verification gap, not a defect**. A SwiftUI drag
+/// cannot be exercised from a test: synthesised mouse drags do not start one,
+/// which is how the original bug shipped. So flipping `contentType` swaps a
+/// hand-verified working drag for one nothing has checked, and it must be a
+/// deliberate act followed by a manual drag in the bundled app — not a passing
+/// test suite. `isDeclared` is still asserted, and is still worth nothing on its
+/// own: it answered `true` throughout the era when the drag was broken.
+///
+/// See the note at the top of `BoardDrop.swift` and the "custom drag type"
+/// section of `macos-client/README.md`.
 final class DragTypeRegistrationTests: XCTestCase {
     func testPayloadUsesASystemRegisteredType() {
         XCTAssertEqual(TaskDragPayload.contentType, .json,
                        "Read the note at the top of BoardDrop.swift before changing this: "
-                       + "a custom exportedAs: type breaks drag-and-drop with no error "
-                       + "until the app is a real .app bundle declaring it.")
+                       + "the custom exportedAs: type is declared in Info.plist now, so it "
+                       + "*can* work — but only a manual drag in the bundled .app can show "
+                       + "that it does, and no test here can.")
         XCTAssertTrue(TaskDragPayload.contentType.isDeclared)
     }
 

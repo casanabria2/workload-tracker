@@ -8,3 +8,7 @@ venv/
 # SwiftPM build products and per-user IDE state for the macOS client.
 macos-client/.build/
 macos-client/.swiftpm/
+
+# The packaged app bundle (make-app.sh output). The script and Info.plist are
+# committed; the artifact is rebuilt, never checked in.
+macos-client/dist/

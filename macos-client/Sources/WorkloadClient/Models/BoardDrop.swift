@@ -11,22 +11,46 @@ import UniformTypeIdentifiers
 // critical logic that can only be exercised by driving a UI is logic that does
 // not get exercised.
 
-// NOTE: there is deliberately no custom `UTType` here any more.
+// NOTE: the custom `UTType` is now **declared but not used**. Read this before
+// changing `TaskDragPayload.contentType`.
 //
-// The board originally used `UTType(exportedAs: "com.carlossanabria.workloadtracker.task")`.
-// Drag-and-drop silently did not work: a card lifted, followed the pointer, and
-// animated home, and **no drop destination callback ever fired** — with
-// `.onDrop(of:delegate:)` and with `.dropDestination` alike.
+// History: the board originally used
+// `UTType(exportedAs: "com.carlossanabria.workloadtracker.task")` and
+// drag-and-drop silently did not work — a card lifted, followed the pointer, and
+// animated home, and **no drop destination callback ever fired**, with
+// `.onDrop(of:delegate:)` and with `.dropDestination` alike. An `exportedAs:`
+// type must be declared in the app's Info.plist under
+// `UTExportedTypeDeclarations`; the target was a bare SwiftPM executable with no
+// Info.plist and no bundle identifier, so the type was never registered and drag
+// routing — which resolves conformance through the system type registry — could
+// never match it. Nothing warns you: `UTType.isDeclared` even answers `true`
+// in-process.
 //
-// An `exportedAs:` type must be declared in the app's Info.plist under
-// `UTExportedTypeDeclarations`. This target is a bare SwiftPM executable with no
-// Info.plist and no bundle identifier, so the type was never registered, and
-// drag routing — which resolves conformance through the system type registry —
-// could never match it. Nothing warns you: `UTType.isDeclared` even answers
-// `true` in-process.
+// What changed in Phase 9 (plan §12): `macos-client/Info.plist` now declares the
+// type, `make-app.sh` builds a real `WorkloadTracker.app` around it, and
+// `lsregister` registers it. Verified in the LaunchServices database:
 //
-// See `TaskDragPayload.contentType`. When the app is packaged as a real `.app`
-// (plan §12 / Phase 9), a custom type can come back — declared properly.
+//     type id: com.carlossanabria.workloadtracker.task
+//     flags:   active  exported  untrusted
+//     conforms to: public.data
+//
+// So the blocker is gone — but `contentType` is deliberately **still `.json`**:
+//
+//   1. A SwiftUI drag cannot be exercised by an automated test. Synthesised
+//      mouse drags do not start one, which is exactly how the original bug
+//      survived to ship. Flipping the type would trade a hand-verified working
+//      feature for an unverifiable one.
+//   2. The registration carries the `untrusted` flag, because the bundle is
+//      ad-hoc signed rather than Developer-ID signed. Whether that matters to
+//      drag conformance resolution is unknown, and unknowable without the manual
+//      drag in (1).
+//
+// To switch (one line, and one manual test — see macos-client/README.md):
+//
+//     static let contentType = UTType(exportedAs: "com.carlossanabria.workloadtracker.task")
+//
+// then run the **bundled** app (not `swift run`) and drag a card from To Do to
+// In Progress. If nothing moves, revert; do not "fix" the drop handlers.
 
 /// What a dragged card carries.
 ///
@@ -52,6 +76,11 @@ struct TaskDragPayload: Codable, Transferable, Sendable, Equatable, Hashable {
     ///
     /// The cost of a public type is that a column will accept JSON dragged from
     /// anywhere; such a drop simply fails to decode and the card goes home.
+    ///
+    /// Since Phase 9 the app's Info.plist *does* declare
+    /// `com.carlossanabria.workloadtracker.task`, so the custom type is a
+    /// one-line switch away — kept out of the shipped default until someone
+    /// performs the one manual drag that no test can perform for them.
     static let contentType: UTType = .json
 
     static var transferRepresentation: some TransferRepresentation {

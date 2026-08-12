@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for WorkloadTracker.app — plan §12 (Phase 9).
+
+  This file is the source of truth; `make-app.sh` copies it verbatim into
+  `Contents/`, lints it with `plutil`, and stamps nothing at build time. There
+  is nothing machine-specific in it, so unlike the launchd plists it needs no
+  __REPO__/__HOME__ substitution.
+
+  Three things depended on this file existing, and were silently broken while it
+  did not (see macos-client/README.md § "Why the bundle matters"):
+
+    1. `UTType(exportedAs:)` needs `UTExportedTypeDeclarations`. Without it the
+       Phase 4 board drag lifted a card and no drop callback ever fired.
+    2. `@SceneStorage` rides on AppKit state restoration, which is keyed by
+       bundle identifier. Without one, nothing was ever restored.
+    3. `UserDefaults.standard` keys off the bundle identifier too — unbundled
+       they landed in a domain named after the executable (`WorkloadClient`).
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.carlossanabria.workloadtracker</string>
+
+    <!--
+      Matches the file in Contents/MacOS. `make-app.sh` copies SwiftPM's
+      `WorkloadClient` binary in under this name so the Dock, Activity Monitor
+      and `ps` all say WorkloadTracker — and so a bundled instance is
+      distinguishable from a `swift run` debug one at a glance.
+    -->
+    <key>CFBundleExecutable</key>
+    <string>WorkloadTracker</string>
+
+    <key>CFBundleName</key>
+    <string>WorkloadTracker</string>
+    <key>CFBundleDisplayName</key>
+    <string>Workload Tracker</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!-- Tracks the plan phase, not semver: 0.9 == Phase 9. -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.9.0</string>
+    <key>CFBundleVersion</key>
+    <string>9</string>
+
+    <!-- Required for an AppKit/SwiftUI app to get a real GUI session. -->
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!--
+      macOS 26 unconditionally, matching Package.swift's `.macOS(.v26)`. Both of
+      the owner's Macs run 26.x, so there is no `#available` gating anywhere in
+      the codebase and the plist must not imply otherwise.
+    -->
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+
+    <!--
+      Deliberately NO LSUIElement. The menu-bar monitor is an accessory app and
+      sets it; this one is a document-shaped window app with a Dock icon and a
+      menu bar. Adding LSUIElement here would hide the Dock icon and break the
+      `⌘,` Settings scene and the Task menu.
+    -->
+
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+
+    <!--
+      No CFBundleIconFile. Plan §11 wants the icon authored in Icon Composer,
+      which is a GUI tool; shipping a fabricated placeholder would be worse than
+      the generic icon, which reads honestly as "not done yet". See README.
+    -->
+
+    <!--
+      The drag type Phase 4 could not use.
+
+      `TaskDragPayload` puts a JSON encoding of {taskId, sourceStatus} on the
+      pasteboard. Declaring the type here is what registers it with
+      LaunchServices, which is what lets SwiftUI's drag routing resolve
+      conformance and actually deliver a drop.
+
+      Conforms to `public.data` only: this is a pasteboard type, not a document
+      type, and it is deliberately not listed under CFBundleDocumentTypes — the
+      app claims no files. No `UTTypeTagSpecification` either, for the same
+      reason: there is no filename extension or MIME type to bind, and inventing
+      one would register the app as the handler for a file kind that does not
+      exist.
+
+      NOTE: declaring the type does not by itself switch the app onto it. See
+      `TaskDragPayload.contentType` in Models/BoardDrop.swift — the shipped
+      default is still `.json`, because a SwiftUI drag cannot be verified by an
+      automated test and the working feature is not worth risking on an
+      unverifiable change.
+    -->
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.carlossanabria.workloadtracker.task</string>
+            <key>UTTypeDescription</key>
+            <string>Workload Tracker Task</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
