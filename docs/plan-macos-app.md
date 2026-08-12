@@ -906,6 +906,43 @@ table at all** (`1:1 with TomD`, `Alex KC 1:1 calls - casanabria`), so even a
 correct implementation resolves five of seven. The aliases need extending, which
 is a data question for the owner rather than a code one.
 
+### 1e. Delete the retired recurrent planner, don't just refuse it at the CLI
+
+Surfaced by the **Sprint 106 boundary** (2026-08-10), which is when it first
+became reachable. `wt close-recurrent` / `wt new-recurrent` hard-refuse with
+`sys.exit(2)`, so the CLI is genuinely blocked — but
+`create_current_sprint_recurrent_tasks()` and
+`find_recurrent_tasks_to_recreate()` are still importable and still *work*.
+
+Measured at the boundary, called directly on a copy of the live data: the planner
+selected **all 7 perpetual series** and ran the full
+`create_github_issue → add_issue_to_project → sync_project_status → …` sequence
+for each. Mid-sprint it selects nothing, because every series already has a
+current-sprint copy — which is why `tools/test_phase3.py`'s "the retired
+new-recurrent planner creates nothing for a merged series" passed for weeks and
+fails now.
+
+Under the post-Phase-5 model this behaviour is simply wrong: it would mint
+per-sprint clones of tasks that are meant to be perpetual. The CLI refusal is a
+guard rail in front of live code. **Delete the two functions**, and rewrite that
+harness section to assert the *retirement* rather than the incidental "creates
+nothing" — an assertion that only holds for 13 days out of every 14 is not an
+assertion.
+
+### 1f. Reconcile leaves a stale `hours_synced` on a fresh sprint's binding
+
+Also boundary-only. After a reconcile at the start of Sprint 106,
+`tools/test_tracker_phase3.py` finds a binding whose cache and logs disagree:
+`{'969e05ef': (6.0, 0.0)}` — 6h recorded as synced for a sprint with no logged
+time, because the carry-forward moves the long-lived issue onto the new sprint
+without clearing what the *old* sprint had told GitHub.
+
+Self-correcting in practice: the values differ, so the next hours sync writes the
+right number. But in the window between, a client reading `hours_synced` — the
+app's sync sheet does — will report hours that were never logged in that sprint.
+Not present in the live data (no Sprint 106 bindings exist yet), so this is a
+latent correctness bug, not current damage.
+
 ### 2. Collapse the daemon's `_guarded_load()`
 
 `wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
