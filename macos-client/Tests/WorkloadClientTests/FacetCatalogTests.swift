@@ -178,3 +178,24 @@ final class FacetCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.options(for: .role).last?.count, 1)
     }
 }
+
+// MARK: - Labelling a sprint that is not an option
+
+extension FacetCatalogTests {
+    /// The filter can hold a sprint the catalog does not offer: options come from
+    /// sprints with *logged time*, and the default seed is the current sprint,
+    /// which has none on its first day. That is not hypothetical — on the morning
+    /// Sprint 106 opened, the toolbar token read `969e05ef`.
+    func testASprintWithNoLoggedTimeStillGetsItsTitle() throws {
+        let withTime = try XCTUnwrap(catalog.options(for: .sprint).first)
+        XCTAssertEqual(catalog.label(for: withTime.value, in: .sprint), withTime.label)
+
+        // A cached sprint that no task has time in: absent from the options…
+        let optionIDs = Set(catalog.options(for: .sprint).map(\.value))
+        let unworked = try XCTUnwrap(snapshot.sprints.first { !optionIDs.contains($0.id) })
+        XCTAssertFalse(optionIDs.contains(unworked.id))
+        // …but still labelled by title rather than by raw id.
+        XCTAssertEqual(catalog.label(for: unworked.id, in: .sprint), unworked.displayName)
+        XCTAssertNotEqual(catalog.label(for: unworked.id, in: .sprint), unworked.id)
+    }
+}

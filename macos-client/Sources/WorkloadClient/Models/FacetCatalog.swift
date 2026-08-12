@@ -21,11 +21,20 @@ struct FacetOption: Identifiable, Hashable, Sendable {
 /// Every facet's options, with the self-hide rule applied.
 struct FacetCatalog: Equatable, Sendable {
     private let byFacet: [Facet: [FacetOption]]
+    /// Every cached sprint's title, not only the ones that are *options*.
+    ///
+    /// A sprint becomes an option when some task has logged time in it, but the
+    /// filter can legitimately hold a sprint with none — the default seed is the
+    /// *current* sprint, and on the first day of a new sprint nothing has been
+    /// logged yet. Without this the token rendered the raw id
+    /// (`969e05ef`), which is what a user saw on the morning Sprint 106 opened.
+    private let sprintTitles: [String: String]
 
-    static let empty = FacetCatalog(byFacet: [:])
+    static let empty = FacetCatalog(byFacet: [:], sprintTitles: [:])
 
-    private init(byFacet: [Facet: [FacetOption]]) {
+    private init(byFacet: [Facet: [FacetOption]], sprintTitles: [String: String]) {
         self.byFacet = byFacet
+        self.sprintTitles = sprintTitles
     }
 
     // MARK: - Building
@@ -109,7 +118,7 @@ struct FacetCatalog: Equatable, Sendable {
                                label: sprintTitles[$0] ?? $0,
                                count: count(.sprint, $0)) }
 
-        return FacetCatalog(byFacet: byFacet)
+        return FacetCatalog(byFacet: byFacet, sprintTitles: sprintTitles)
     }
 
     private static func singleValued(_ facet: Facet,
@@ -142,7 +151,14 @@ struct FacetCatalog: Equatable, Sendable {
     /// accessibility label should ever render one, since `FilterState.unset` is
     /// a control character.
     func label(for value: String, in facet: Facet) -> String {
-        options(for: facet).first { $0.value == value }?.label
-            ?? (value == FilterState.unset ? "None" : value)
+        if let option = options(for: facet).first(where: { $0.value == value }) {
+            return option.label
+        }
+        if value == FilterState.unset { return "None" }
+        // A sprint the filter holds but the catalog does not offer — see
+        // `sprintTitles`. Falling through to the raw value here put a UUID in
+        // the toolbar.
+        if facet == .sprint, let title = sprintTitles[value] { return title }
+        return value
     }
 }
