@@ -71,6 +71,20 @@ final class Store {
     /// `RootView` via `@SceneStorage`.
     var timelineZoom: TimelineZoom = .week
 
+    /// The Gantt's **explicit viewport**, or `nil` when the range is derived
+    /// (Sprint facet → logged time → current sprint → around now).
+    ///
+    /// Written only by `stepTimeline` and cleared only by `timelineToToday` and
+    /// by a change to the Sprint facet — see `TimelineAnchor` for the rule. Not
+    /// persisted: a viewport is where you *were*, and reopening the app on a
+    /// fortnight in March because that is where you stopped scrolling last week
+    /// would be worse than opening on the present.
+    private(set) var timelineAnchor: TimelineAnchor?
+
+    /// The Sprint facet that navigation took away, so **Today** can hand it
+    /// back. `nil` means navigation has taken nothing.
+    private var sprintFilterReleasedByNavigation: Set<String>?
+
     /// **The selected task, shared by the Board and the Timeline** (plan §10:
     /// "clicking a bar selects the task and syncs the Inspector and Board
     /// selection").
@@ -439,6 +453,7 @@ final class Store {
     func restoreFilter(_ state: FilterState) {
         didSeedDefaultSprint = true
         filter = state
+        releaseTimelineAnchor()
     }
 
     /// Everything the filter admits, recurrent included.
@@ -484,6 +499,7 @@ final class Store {
     /// views of it" is enforced by there being no other mutator.
     func toggle(_ value: String, in facet: Facet) {
         filter.toggle(value, in: facet)
+        if facet == .sprint { releaseTimelineAnchor() }
     }
 
     func isSelected(_ value: String, in facet: Facet) -> Bool {
@@ -492,10 +508,12 @@ final class Store {
 
     func clearFilters() {
         filter = FilterState()
+        releaseTimelineAnchor()
     }
 
     func clear(_ facet: Facet) {
         filter[facet] = []
+        if facet == .sprint { releaseTimelineAnchor() }
     }
 
     /// The active facet values as search-field tokens (§8.4).
@@ -518,9 +536,13 @@ final class Store {
     /// sidebar row and menu item: there is one state, and the token list is a
     /// projection of it that can be written back.
     func applyTokens(_ tokens: [FilterToken]) {
+        let before = filter.sprints
         for facet in Facet.allCases {
             filter[facet] = Set(tokens.filter { $0.facet == facet }.map(\.value))
         }
+        // Removing a sprint chip in the search field is touching the facet, and
+        // the facet wins over the anchor when it is touched.
+        if filter.sprints != before { releaseTimelineAnchor() }
     }
 
     /// Which facets to name in the empty state, and offer a one-click clear for.
@@ -552,7 +574,88 @@ final class Store {
                             selectedSprintIDs: filter.sprints,
                             zoom: timelineZoom,
                             activeTimer: snapshot?.activeTimer,
-                            now: now)
+                            now: now,
+                            anchor: timelineAnchor,
+                            navigationTasks: timelineNavigableTasks)
+    }
+
+    /// What the Previous/Next bounds are computed from: everything the filter
+    /// admits **with the Sprint facet taken out**, because stepping releases
+    /// that facet. Without this, the default view (an empty current sprint)
+    /// would disable both buttons.
+    private var timelineNavigableTasks: [TrackerTask] {
+        var unscoped = filter
+        unscoped.sprints = []
+        return TaskFilter.apply(unscoped, to: tasks, currentSprintID: currentSprint?.id)
+    }
+
+    /// The tasks the Gantt actually plots: everything the filter admits, **less
+    /// the recurrent ones**, which live on the shelf (plan §9).
+    ///
+    /// Exists so the view's empty state counts the same population the chart
+    /// draws. `TimelineModel.build` applies the same rule itself rather than
+    /// trusting a caller to pre-filter.
+    var timelineTasks: [TrackerTask] {
+        filteredTasks.filter { $0.status != .recurrent }
+    }
+
+    // MARK: Timeframe navigation
+
+    /// Steps the viewport by one unit of the current zoom.
+    ///
+    /// **Also releases the Sprint facet** when one is set — see `TimelineAnchor`
+    /// for why, and `timelineToToday()` for the inverse. No-ops (and the
+    /// controls disable) at the ends of the data.
+    func stepTimeline(_ direction: TimelineNavigation.Direction) {
+        let data = timeline
+        guard let next = TimelineNavigation.step(direction,
+                                                 from: data.range,
+                                                 zoom: timelineZoom,
+                                                 sprints: snapshot?.sprints ?? [],
+                                                 bounds: data.navigationBounds)
+        else { return }
+        timelineAnchor = next
+        if !filter.sprints.isEmpty {
+            if sprintFilterReleasedByNavigation == nil {
+                sprintFilterReleasedByNavigation = filter.sprints
+            }
+            filter.sprints = []
+            show(.info("Showing \(next.label). The Sprint filter was released so "
+                       + "the range could move — Today puts it back."))
+        }
+    }
+
+    func canStepTimeline(_ direction: TimelineNavigation.Direction) -> Bool {
+        let data = timeline
+        return TimelineNavigation.step(direction,
+                                       from: data.range,
+                                       zoom: timelineZoom,
+                                       sprints: snapshot?.sprints ?? [],
+                                       bounds: data.navigationBounds) != nil
+    }
+
+    /// Returns the viewport to the present: drops the anchor, so the range is
+    /// derived again, and restores whatever Sprint facet navigation released.
+    func timelineToToday() {
+        timelineAnchor = nil
+        if let released = sprintFilterReleasedByNavigation {
+            if filter.sprints.isEmpty { filter.sprints = released }
+            sprintFilterReleasedByNavigation = nil
+        }
+    }
+
+    /// Whether Today has anything to undo. False on the default view, which is
+    /// already the present.
+    var canReturnToToday: Bool {
+        timelineAnchor != nil || sprintFilterReleasedByNavigation != nil
+    }
+
+    /// Called by every Sprint-facet mutation: touching the facet makes it
+    /// authoritative again, so the anchor goes and there is nothing left to
+    /// restore.
+    private func releaseTimelineAnchor() {
+        timelineAnchor = nil
+        sprintFilterReleasedByNavigation = nil
     }
 
     /// `⌘+` / `⌘-`. No-ops at the ends rather than wrapping, which is what every

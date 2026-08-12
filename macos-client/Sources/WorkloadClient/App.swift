@@ -46,6 +46,27 @@ struct WorkloadClientApp: App {
                 Button("Zoom Out") { store.zoomTimeline(in: false) }
                     .keyboardShortcut("-", modifiers: .command)
                     .disabled(store.selection != .timeline || !store.canZoomTimelineOut)
+
+                Divider()
+
+                // Timeframe navigation. **`⌥←`/`⌥→`, deliberately not `⌘←`/`⌘→`**
+                // — the Board binds those to *moving the selected card* between
+                // columns (`BoardView.handle(_:)`), and a menu-bar shortcut wins
+                // over a view's `onKeyPress`, so reusing them would silently
+                // retire the board's keyboard move. Every item here is also
+                // gated on the Timeline being the visible pane, so these do
+                // nothing at all while the Board is showing.
+                Button("Previous Period") { store.stepTimeline(.previous) }
+                    .keyboardShortcut(.leftArrow, modifiers: .option)
+                    .disabled(store.selection != .timeline
+                              || !store.canStepTimeline(.previous))
+                Button("Next Period") { store.stepTimeline(.next) }
+                    .keyboardShortcut(.rightArrow, modifiers: .option)
+                    .disabled(store.selection != .timeline
+                              || !store.canStepTimeline(.next))
+                Button("Today") { store.timelineToToday() }
+                    .keyboardShortcut("t", modifiers: [.option, .command])
+                    .disabled(store.selection != .timeline || !store.canReturnToToday)
             }
 
             // Plan §9: "Row actions via context menu **and the Task menu**."

@@ -68,6 +68,7 @@ final class TimelineModelTests: XCTestCase {
                        sprints selected: Set<String> = [],
                        tasks: [TrackerTask]? = nil,
                        activeTimer: ActiveTimer? = nil,
+                       anchor: TimelineAnchor? = nil,
                        now: Date = Date(timeIntervalSince1970: 1786075563)) -> TimelineData {
         TimelineModel.build(tasks: tasks ?? snapshot.tasks,
                             roles: snapshot.roles,
@@ -76,7 +77,8 @@ final class TimelineModelTests: XCTestCase {
                             selectedSprintIDs: selected,
                             zoom: zoom,
                             activeTimer: activeTimer,
-                            now: now)
+                            now: now,
+                            anchor: anchor)
     }
 
     // MARK: - Zoom changes what a bar is
@@ -376,12 +378,19 @@ final class TimelineModelTests: XCTestCase {
     /// Checked per zoom against the logs in that zoom's own range, because the
     /// window length differs by zoom and there is no shared range to compare
     /// across.
+    ///
+    /// Both expectations are over the **non-recurrent** tasks, which is the
+    /// population the Gantt plots: the strip has to total what the chart draws,
+    /// and a strip that reported the recurrent tasks' hours next to a chart with
+    /// no recurrent bars would be the exact dishonesty the summary exists to
+    /// prevent.
     func testRoleTotalsCountLoggedMinutesInRangeNotBarWidths() throws {
         let snapshot = try loadSnapshot()
+        let plotted = snapshot.tasks.filter { $0.status != .recurrent }
         let s103 = try sprint("Sprint 103", in: snapshot)
         for zoom in TimelineZoom.ordered {
             let data = build(snapshot, zoom: zoom, sprints: [s103.id])
-            let expected = snapshot.tasks
+            let expected = plotted
                 .flatMap { logsInRange($0, data.range) }
                 .reduce(0.0) { $0 + $1.minutes }
             XCTAssertEqual(data.totalMinutes, expected, accuracy: 0.01, "\(zoom)")
@@ -390,11 +399,21 @@ final class TimelineModelTests: XCTestCase {
         // And the Sprint-zoom figure over one sprint is that sprint's own
         // total, which is the number the rest of the app reports for it.
         let sprintZoom = build(snapshot, zoom: .sprint, sprints: [s103.id])
-        let fromBindings = snapshot.tasks
+        let fromBindings = plotted
             .reduce(0.0) { $0 + $1.minutes(inSprint: s103.id) }
         XCTAssertEqual(sprintZoom.totalMinutes, fromBindings, accuracy: 1,
                        "the strip must agree with sprints_with_time, which is "
                        + "the timestamp-bucketed truth")
+
+        // The exclusion is not free, and the test says how much it costs: the
+        // recurrent tasks really do carry hours in this sprint, and they are
+        // deliberately not in the figure above.
+        let recurrentInSprint = snapshot.tasks
+            .filter { $0.status == .recurrent }
+            .reduce(0.0) { $0 + $1.minutes(inSprint: s103.id) }
+        XCTAssertGreaterThan(recurrentInSprint, 0,
+                             "the fixture's recurrent tasks must have time in "
+                             + "Sprint 103, or this assertion is vacuous")
     }
 
     /// Rows are grouped into role sections in the sidebar's role order, and each
@@ -567,5 +586,345 @@ final class TimelineModelTests: XCTestCase {
             XCTAssertTrue(bar.sprintTitle == "Sprint 104" || bar.sprintTitle == "Sprint 105",
                           "\(bar.sprintTitle ?? "nil")")
         }
+    }
+
+    // MARK: - Recurrent tasks live on the shelf, not the Gantt
+
+    /// A perpetual task has no meaningful start or end, so it gets no bar — at
+    /// **any** zoom, and selected on `status`, never on the title.
+    func testRecurrentTasksAreNeverPlottedAtAnyZoom() throws {
+        let snapshot = try loadSnapshot()
+        let recurrent = Set(snapshot.tasks.filter { $0.status == .recurrent }.map(\.id))
+        XCTAssertEqual(recurrent.count, 7, "the fixture's measured recurrent count")
+
+        let all = Set(snapshot.sprints.map(\.id))
+        for zoom in TimelineZoom.ordered {
+            let data = build(snapshot, zoom: zoom, sprints: all)
+            XCTAssertTrue(data.bars.allSatisfy { !recurrent.contains($0.taskId) },
+                          "\(zoom): a recurrent task got a bar")
+            XCTAssertTrue(data.rows.allSatisfy { !recurrent.contains($0.id) },
+                          "\(zoom): a recurrent task got a row")
+        }
+    }
+
+    /// The exclusion is **said out loud**, with the measured numbers, so the
+    /// summary strip's total dropping by about a third is accounted for on
+    /// screen rather than looking like a bug.
+    func testTheExclusionIsCountedRatherThanSilent() throws {
+        let snapshot = try loadSnapshot()
+        let data = build(snapshot, zoom: .quarter, sprints: Set(snapshot.sprints.map(\.id)))
+        XCTAssertEqual(data.excludedRecurrentTaskCount, 7)
+        XCTAssertEqual(data.excludedRecurrentEntryCount, 146,
+                       "the measured 146 recurrent log entries")
+
+        let recurrentMinutes = snapshot.tasks
+            .filter { $0.status == .recurrent }
+            .flatMap(\.logs)
+            .reduce(0.0) { $0 + $1.minutes }
+        XCTAssertEqual(recurrentMinutes / 60, 123.8, accuracy: 0.1,
+                       "the measured 123.8 hours this change removes")
+    }
+
+    /// "M off-range" must mean *reachable by moving the range*. Recurrent
+    /// entries are not off-range, they are off this chart entirely, so folding
+    /// them into that figure would send the user stepping through months looking
+    /// for hours that live on the shelf.
+    func testOffRangeCountExcludesRecurrentEntries() throws {
+        let snapshot = try loadSnapshot()
+        let s103 = try sprint("Sprint 103", in: snapshot)
+        let data = build(snapshot, zoom: .sprint, sprints: [s103.id])
+
+        let expected = snapshot.tasks
+            .filter { $0.status != .recurrent }
+            .flatMap(\.logs)
+            .count { log in
+                guard let span = TimelineModel.span(of: log) else { return false }
+                return span.end < data.range.lowerBound || span.start > data.range.upperBound
+            }
+        XCTAssertEqual(data.hiddenEntryCount, expected)
+        XCTAssertGreaterThan(data.hiddenEntryCount, 0, "otherwise this asserts nothing")
+    }
+
+    /// Excluding them inside the model is the same as never handing them over —
+    /// which is what makes `Store.timelineTasks` (used by the empty state) and
+    /// the builder agree by construction rather than by coincidence.
+    func testExcludingRecurrentIsEquivalentToNotPassingThemIn() throws {
+        let snapshot = try loadSnapshot()
+        let all = Set(snapshot.sprints.map(\.id))
+        let withRecurrent = build(snapshot, zoom: .week, sprints: all)
+        let without = build(snapshot, zoom: .week, sprints: all,
+                            tasks: snapshot.tasks.filter { $0.status != .recurrent })
+        XCTAssertEqual(withRecurrent.bars.map(\.id), without.bars.map(\.id))
+        XCTAssertEqual(withRecurrent.totalMinutes, without.totalMinutes, accuracy: 0.01)
+        XCTAssertEqual(withRecurrent.hiddenEntryCount, without.hiddenEntryCount)
+        XCTAssertEqual(withRecurrent.range, without.range,
+                       "the domain must be derived from the plotted tasks only")
+    }
+
+    // MARK: - Timeframe navigation
+
+    /// Every zoom steps, in both directions, and says so.
+    func testEveryZoomStepsBackwardsAndForwards() throws {
+        let store = try makeStore()
+        store.clearFilters()
+        for zoom in TimelineZoom.ordered {
+            store.timelineToToday()
+            store.timelineZoom = zoom
+            let derived = store.timeline.range
+            XCTAssertFalse(store.timeline.rangeSource.isNavigated, "\(zoom)")
+
+            XCTAssertTrue(store.canStepTimeline(.previous), "\(zoom): cannot go back")
+            store.stepTimeline(.previous)
+            let back = store.timeline.range
+            XCTAssertTrue(store.timeline.rangeSource.isNavigated, "\(zoom)")
+            XCTAssertLessThan(back.lowerBound, derived.lowerBound, "\(zoom)")
+
+            XCTAssertTrue(store.canStepTimeline(.next), "\(zoom): cannot come back")
+            store.stepTimeline(.next)
+            XCTAssertGreaterThan(store.timeline.range.lowerBound, back.lowerBound, "\(zoom)")
+        }
+    }
+
+    /// **A step lands on the period it names**, at Day and at Week alike.
+    ///
+    /// Both cases were found by looking. Shifting the rolling 24-hour window
+    /// gave a Day range running 14:18 → 14:18 captioned "showing Mon, Aug 3";
+    /// shifting the current sprint's clamped window gave a **three-day** range
+    /// captioned "showing week of Aug 3". A caption that names a period has to
+    /// be that period, so every step snaps.
+    func testStepsLandOnWholeCalendarPeriods() throws {
+        let calendar = Calendar.current
+        let store = try makeStore()
+        store.clearFilters()
+
+        store.timelineZoom = .day
+        store.stepTimeline(.previous)
+        var range = store.timeline.range
+        XCTAssertEqual(range.lowerBound, calendar.startOfDay(for: range.lowerBound),
+                       "a Day window must start at midnight")
+        XCTAssertEqual(range.upperBound.timeIntervalSince(range.lowerBound),
+                       86_400, accuracy: 3_600, "and last one day")
+        XCTAssertEqual(store.timeline.rangeSource,
+                       .navigated(label: TimelineNavigation.dayLabel(range.lowerBound)))
+        // From there each further press is exactly one day.
+        store.stepTimeline(.previous)
+        XCTAssertEqual(range.lowerBound.timeIntervalSince(store.timeline.range.lowerBound),
+                       86_400, accuracy: 3_600)
+
+        store.timelineToToday()
+        store.timelineZoom = .week
+        store.stepTimeline(.previous)
+        range = store.timeline.range
+        let week = try XCTUnwrap(calendar.dateInterval(of: .weekOfYear,
+                                                       for: range.lowerBound))
+        XCTAssertEqual(range.lowerBound, week.start,
+                       "a Week window must start on the week's first day")
+        XCTAssertEqual(range.upperBound, week.end,
+                       "and end on its last")
+        XCTAssertEqual(store.timeline.rangeSource,
+                       .navigated(label: TimelineNavigation.weekLabel(range.lowerBound)))
+        store.stepTimeline(.previous)
+        XCTAssertEqual(range.lowerBound.timeIntervalSince(store.timeline.range.lowerBound),
+                       7 * 86_400, accuracy: 3_600)
+    }
+
+    /// Sprint stepping walks the **cached sprint calendar**, landing on real
+    /// boundaries rather than on a nominal fortnight.
+    func testSprintSteppingWalksTheCachedSprintCalendar() throws {
+        let store = try makeStore()
+        let snapshot = try XCTUnwrap(store.snapshot)
+        let s103 = try sprint("Sprint 103", in: snapshot)
+        let s102 = try sprint("Sprint 102", in: snapshot)
+        store.clearFilters()
+        store.toggle(s103.id, in: .sprint)
+        store.timelineZoom = .sprint
+        XCTAssertEqual(store.timeline.range.lowerBound, try XCTUnwrap(s103.start))
+
+        store.stepTimeline(.previous)
+        XCTAssertEqual(store.timeline.range.lowerBound, try XCTUnwrap(s102.start))
+        XCTAssertEqual(store.timeline.range.upperBound, try XCTUnwrap(s102.end))
+        XCTAssertEqual(store.timeline.rangeSource, .navigated(label: "Sprint 102"))
+    }
+
+    /// Quarter stepping moves whole calendar quarters and names them.
+    func testQuarterSteppingMovesWholeCalendarQuarters() throws {
+        let calendar = Calendar.current
+        let july = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 7, day: 15)))
+        let bounds = TimelineModel.widened(
+            try XCTUnwrap(calendar.date(from: DateComponents(year: 2025, month: 1, day: 1))),
+            try XCTUnwrap(calendar.date(from: DateComponents(year: 2027, month: 1, day: 1))))
+        let current = TimelineNavigation.period(of: .quarter, containing: july,
+                                                sprints: [], calendar: calendar)
+        XCTAssertEqual(current.label, "Q3 2026")
+
+        let previous = try XCTUnwrap(
+            TimelineNavigation.step(.previous, from: current.range, zoom: .quarter,
+                                    sprints: [], bounds: bounds, calendar: calendar))
+        XCTAssertEqual(previous.label, "Q2 2026")
+        XCTAssertEqual(calendar.component(.month, from: previous.start), 4)
+
+        let backAgain = try XCTUnwrap(
+            TimelineNavigation.step(.next, from: previous.range, zoom: .quarter,
+                                    sprints: [], bounds: bounds, calendar: calendar))
+        XCTAssertEqual(backAgain.label, "Q3 2026")
+        XCTAssertEqual(backAgain.start, current.start)
+    }
+
+    /// **No scrolling into empty infinity.** Stepping past the data returns
+    /// `nil`, which is the same call the button's `disabled` reads — so what is
+    /// greyed out and what would no-op cannot drift apart.
+    func testSteppingStopsAtTheEndsOfTheDataRatherThanScrollingForever() throws {
+        let calendar = Calendar.current
+        let start = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 3, day: 1)))
+        let end = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 4, day: 1)))
+        let bounds = TimelineModel.widened(start, end)
+
+        var window = start...start.addingTimeInterval(7 * 86_400)
+        var steps = 0
+        while let next = TimelineNavigation.step(.previous, from: window, zoom: .week,
+                                                 sprints: [], bounds: bounds,
+                                                 calendar: calendar) {
+            window = next.range
+            steps += 1
+            XCTAssertLessThan(steps, 20, "stepping past the data never terminated")
+        }
+        XCTAssertGreaterThan(steps, 0, "the first step back should have been allowed")
+
+        // And the same property through the store, over the real fixture.
+        let store = try makeStore()
+        store.clearFilters()
+        store.timelineZoom = .week
+        var walked = 0
+        while store.canStepTimeline(.previous) && walked < 200 {
+            store.stepTimeline(.previous)
+            walked += 1
+        }
+        XCTAssertLessThan(walked, 200, "the store walked off the end of the data")
+        XCTAssertFalse(store.canStepTimeline(.previous))
+        XCTAssertTrue(store.canStepTimeline(.next), "the way back must stay open")
+    }
+
+    /// Zooming while navigated keeps the **period you were looking at** rather
+    /// than snapping back to today: the anchor is re-derived for the new zoom.
+    func testZoomingWhileNavigatedKeepsThePeriodYouWereLookingAt() throws {
+        let store = try makeStore()
+        let snapshot = try XCTUnwrap(store.snapshot)
+        let s103 = try sprint("Sprint 103", in: snapshot)
+        let s102 = try sprint("Sprint 102", in: snapshot)
+        store.clearFilters()
+        store.toggle(s103.id, in: .sprint)
+        store.timelineZoom = .sprint
+        store.stepTimeline(.previous)          // → Sprint 102
+
+        store.timelineZoom = .day
+        let day = store.timeline
+        XCTAssertTrue(day.rangeSource.isNavigated)
+        XCTAssertGreaterThanOrEqual(day.range.lowerBound, try XCTUnwrap(s102.start))
+        XCTAssertLessThanOrEqual(day.range.upperBound, try XCTUnwrap(s102.end))
+    }
+
+    // MARK: The Sprint facet ↔ navigation rule (one range, last touched wins)
+
+    /// Navigating releases the Sprint facet — otherwise the axis would step onto
+    /// a period whose work the facet had just filtered out — and **Today gives
+    /// it back**. The two controls are exact inverses.
+    func testNavigatingReleasesTheSprintFacetAndTodayRestoresIt() throws {
+        let store = try makeStore()
+        let snapshot = try XCTUnwrap(store.snapshot)
+        let s103 = try sprint("Sprint 103", in: snapshot)
+        store.clearFilters()
+        store.toggle(s103.id, in: .sprint)
+        store.timelineZoom = .sprint
+        XCTAssertEqual(store.timeline.rangeSource, .sprintFacet(titles: ["Sprint 103"]))
+        XCTAssertFalse(store.canReturnToToday, "nothing to undo before navigating")
+
+        store.stepTimeline(.previous)
+        XCTAssertTrue(store.filter.sprints.isEmpty, "the facet must be released")
+        XCTAssertTrue(store.timeline.rangeSource.isNavigated)
+        XCTAssertTrue(store.canReturnToToday)
+
+        store.timelineToToday()
+        XCTAssertEqual(store.filter.sprints, [s103.id], "Today must hand the facet back")
+        XCTAssertEqual(store.timeline.rangeSource, .sprintFacet(titles: ["Sprint 103"]))
+        XCTAssertFalse(store.canReturnToToday)
+    }
+
+    /// Touching the Sprint facet makes it authoritative again: the anchor goes.
+    /// This is the other half of "last touched wins", and it is what stops the
+    /// range having two owners.
+    func testTouchingTheSprintFacetClearsTheAnchor() throws {
+        let store = try makeStore()
+        let snapshot = try XCTUnwrap(store.snapshot)
+        let s103 = try sprint("Sprint 103", in: snapshot)
+        store.clearFilters()
+        store.timelineZoom = .week
+        store.stepTimeline(.previous)
+        XCTAssertTrue(store.timeline.rangeSource.isNavigated)
+
+        store.toggle(s103.id, in: .sprint)
+        XCTAssertEqual(store.timeline.rangeSource, .sprintFacet(titles: ["Sprint 103"]))
+        XCTAssertNil(store.timelineAnchor)
+        XCTAssertFalse(store.canReturnToToday,
+                       "a facet the user set is not something Today should undo")
+    }
+
+    /// A role filter is **not** a range source, so it must not disturb the
+    /// anchor — only the Sprint facet competes for the viewport.
+    func testANonSprintFilterLeavesTheAnchorAlone() throws {
+        let store = try makeStore()
+        store.clearFilters()
+        store.timelineZoom = .week
+        store.stepTimeline(.previous)
+        let navigated = store.timeline.range
+
+        let role = try XCTUnwrap(store.timeline.roleTotals.first?.roleId)
+        store.toggle(role, in: .role)
+        XCTAssertTrue(store.timeline.rangeSource.isNavigated)
+        XCTAssertEqual(store.timeline.range, navigated)
+    }
+
+    /// **The chart's y domain is never empty**, because Swift Charts traps when
+    /// a categorical domain goes from non-empty to empty:
+    /// *"CGFloat value cannot be converted to Int because it is outside the
+    /// representable range"*, thrown from its vertical-scroll path, which
+    /// divides the plot height by the category count.
+    ///
+    /// This is a real crash, found by stepping the range onto a period with no
+    /// logged time — a period the Gantt had no way to reach before this change.
+    /// The assertion lives here rather than in the view because it is a
+    /// property of a value, and a crash in a chart is not something a test can
+    /// otherwise catch.
+    func testTheChartsYDomainIsNeverEmpty() throws {
+        let empty = TimelineData.empty(zoom: .week, now: .now)
+        XCTAssertTrue(empty.rows.isEmpty)
+        XCTAssertEqual(TimelineView.yDomain(for: empty).count, 1,
+                       "an empty categorical domain crashes Swift Charts")
+
+        // And when there are rows it is exactly them, in their order.
+        let snapshot = try loadSnapshot()
+        let data = build(snapshot, zoom: .week, sprints: Set(snapshot.sprints.map(\.id)))
+        XCTAssertFalse(data.rows.isEmpty)
+        XCTAssertEqual(TimelineView.yDomain(for: data), data.rows.map(\.id))
+        XCTAssertFalse(TimelineView.yDomain(for: data).contains(TimelineView.placeholderRowID))
+    }
+
+    /// **The default view must be navigable.** Sprint 106 opens with no logged
+    /// time, so bounds computed from the sprint-filtered tasks would be a single
+    /// instant and both buttons would be dead on exactly the screen the feature
+    /// exists for. Stepping back must reach the work.
+    func testTheEmptyCurrentSprintCanStillBeSteppedAwayFrom() throws {
+        let store = try makeStore(currentSprintTitle: "Sprint 106")
+        XCTAssertTrue(store.timeline.isEmpty, "precondition: the default view is empty")
+        XCTAssertTrue(store.canStepTimeline(.previous),
+                      "Previous was dead on the empty current sprint")
+
+        var steps = 0
+        while store.timeline.isEmpty && steps < 6 {
+            store.stepTimeline(.previous)
+            steps += 1
+        }
+        XCTAssertFalse(store.timeline.isEmpty,
+                       "stepping back from the empty sprint never reached any work")
+        XCTAssertTrue(store.timeline.rangeSource.isNavigated)
     }
 }

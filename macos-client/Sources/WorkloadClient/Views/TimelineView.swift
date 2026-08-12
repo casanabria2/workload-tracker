@@ -52,6 +52,12 @@ struct TimelineView: View {
         let data = store.timeline
 
         VStack(spacing: 0) {
+            // Navigating releases the Sprint facet, which the Board reads too.
+            // A shared filter must never change silently, so the Timeline shows
+            // the same bar the Board does rather than its own thing.
+            if let feedback = store.feedback {
+                FeedbackBar(feedback: feedback) { store.clearFeedback() }
+            }
             TimelineSummaryStrip(data: data)
             Divider()
             content(data)
@@ -60,6 +66,7 @@ struct TimelineView: View {
             ToolbarItem(placement: .status) {
                 TimelineStatusLabel(data: data)
             }
+            ToolbarItem { TimelineNavigationControls() }
             ToolbarItem {
                 Picker("Zoom", selection: $store.timelineZoom) {
                     ForEach(TimelineZoom.ordered) { zoom in
@@ -76,6 +83,10 @@ struct TimelineView: View {
         // A filter change can pull the pinned bar's task out of the view.
         .onChange(of: store.filter) { _, _ in pinned = nil; hovered = nil }
         .onChange(of: store.timelineZoom) { _, _ in pinned = nil; hovered = nil }
+        // Stepping the range does the same: the pinned bar was clipped to the
+        // old window, so keeping its tooltip up would caption the new one with
+        // a period that is no longer on screen.
+        .onChange(of: store.timelineAnchor) { _, _ in pinned = nil; hovered = nil }
     }
 
     // MARK: - Body states
@@ -105,6 +116,28 @@ struct TimelineView: View {
     /// The plot's chrome: the x axis and its labels below, and the room the
     /// "Now" and sprint-boundary annotations need above.
     private static let chrome: CGFloat = 96
+
+    /// The id of the invisible placeholder row that keeps the categorical y
+    /// domain non-empty.
+    static let placeholderRowID = "\u{1}no-rows"
+
+    /// The chart's categorical y domain — **never empty**.
+    ///
+    /// Found by crashing the app: stepping the range onto a period with no
+    /// logged time took the domain from six categories to zero and Swift Charts
+    /// trapped with
+    /// *"CGFloat value cannot be converted to Int because it is outside the
+    /// representable range"* — its vertical-scroll path divides the plot height
+    /// by the category count, and 0 categories makes that infinite. The empty
+    /// state renders fine on a *fresh* build of an empty range; it is the
+    /// transition into one that traps, which is why the Gantt's own empty state
+    /// never hit it before there was a way to navigate into an empty period.
+    ///
+    /// One placeholder category costs nothing: it has no bar, and the y-axis
+    /// label looks its row up by id and finds nothing, so it draws nothing.
+    static func yDomain(for data: TimelineData) -> [String] {
+        data.rows.isEmpty ? [placeholderRowID] : data.rows.map(\.id)
+    }
 
     /// How many row slots the plot gets.
     ///
@@ -154,7 +187,7 @@ struct TimelineView: View {
             }
         }
         .chartXScale(domain: data.range)
-        .chartYScale(domain: data.rows.map(\.id))
+        .chartYScale(domain: Self.yDomain(for: data))
         .chartYAxis {
             AxisMarks(preset: .aligned, position: .leading) { value in
                 AxisValueLabel {
@@ -325,6 +358,59 @@ struct TimelineView: View {
     }
 }
 
+// MARK: - Timeframe navigation
+
+/// Previous · Today · Next.
+///
+/// The buttons are here **and** in the menu bar (`App.swift`), where the
+/// shortcuts live: a `keyboardShortcut` attached to a view only fires while that
+/// view is on screen *and* focused, and the chart loses focus to the zoom picker
+/// — the same reason `⌘+`/`⌘-` are menu items. The menu items are gated on
+/// `store.selection == .timeline`, so `⌥←`/`⌥→` cannot shadow the Board's
+/// `⌘←`/`⌘→` (different modifier) *or* fire while the Board is showing.
+///
+/// Disabled at the ends of the data rather than scrolling into empty infinity:
+/// `Store.canStepTimeline` asks the same pure `TimelineNavigation.step` the
+/// button would call, so what is greyed out and what would no-op cannot drift.
+private struct TimelineNavigationControls: View {
+    @Environment(Store.self) private var store
+
+    var body: some View {
+        ControlGroup {
+            Button {
+                store.stepTimeline(.previous)
+            } label: {
+                Label("Previous", systemImage: "chevron.left")
+            }
+            .disabled(!store.canStepTimeline(.previous))
+            .help("Show the previous \(unit) (⌥←)")
+
+            Button("Today") { store.timelineToToday() }
+                .disabled(!store.canReturnToToday)
+                .help("Return to the present, and put back any Sprint filter "
+                      + "navigation released (⌥⌘T)")
+
+            Button {
+                store.stepTimeline(.next)
+            } label: {
+                Label("Next", systemImage: "chevron.right")
+            }
+            .disabled(!store.canStepTimeline(.next))
+            .help("Show the next \(unit) (⌥→)")
+        }
+    }
+
+    /// What one press moves by, named for the current zoom.
+    private var unit: String {
+        switch store.timelineZoom {
+        case .day: "day"
+        case .week: "week"
+        case .sprint: "sprint"
+        case .quarter: "quarter"
+        }
+    }
+}
+
 // MARK: - Row label
 
 /// A y-axis row: the role's colour dot and the task's title.
@@ -385,10 +471,22 @@ private struct TimelineSummaryStrip: View {
         .scrollIndicators(.never)
     }
 
+    /// The dates on the axis, why they are those dates, and — when it applies —
+    /// what is *not* in the total sitting right above this line.
+    ///
+    /// The last clause matters because excluding recurrent tasks removed about a
+    /// third of the plotted hours. A total that quietly shrank by 123.8h with
+    /// nothing on screen accounting for it would read as a bug.
     private var rangeCaption: String {
         let start = data.range.lowerBound.formatted(.dateTime.month(.abbreviated).day())
         let end = data.range.upperBound.formatted(.dateTime.month(.abbreviated).day())
-        return "\(start) – \(end) · \(data.rangeSource.explanation)"
+        var caption = "\(start) – \(end) · \(data.rangeSource.explanation)"
+        if data.excludedRecurrentTaskCount > 0 {
+            caption += " · \(data.excludedRecurrentTaskCount) recurrent "
+                + (data.excludedRecurrentTaskCount == 1 ? "task" : "tasks")
+                + " on the shelf, not plotted"
+        }
+        return caption
     }
 }
 
@@ -572,9 +670,20 @@ private struct TimelineEmptyOverlay: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             HStack(spacing: 8) {
-                if !store.filter.sprints.isEmpty {
-                    Button("Show All Sprints") { store.clear(.sprint) }
+                // Offered first when the user navigated here: the likeliest way
+                // out of an empty period is back to the present, not a filter
+                // change they did not make.
+                if store.canReturnToToday {
+                    Button("Today") { store.timelineToToday() }
                         .keyboardShortcut(.defaultAction)
+                }
+                if !store.filter.sprints.isEmpty {
+                    let sprints = Button("Show All Sprints") { store.clear(.sprint) }
+                    // Only one default button, and Today takes it when it is
+                    // offered.
+                    if store.canReturnToToday { sprints } else {
+                        sprints.keyboardShortcut(.defaultAction)
+                    }
                 }
                 if store.isFiltering {
                     Button("Clear All Filters") { store.clearFilters() }
@@ -593,6 +702,8 @@ private struct TimelineEmptyOverlay: View {
 
     private var headline: String {
         switch data.rangeSource {
+        case .navigated(let label):
+            "No logged time in \(label)"
         case .sprintFacet(let titles) where titles.count == 1:
             "No logged time in \(titles[0]) yet"
         case .sprintFacet:
@@ -602,15 +713,23 @@ private struct TimelineEmptyOverlay: View {
         }
     }
 
+    /// Counts **plotted** tasks, not everything the filter admits: recurrent
+    /// tasks pass the filter and are never drawn here, so including them would
+    /// promise bars that stepping the range can never produce.
     private var detail: String {
+        let plotted = store.timelineTasks.count
         var lines = ["The range is drawn, the tasks are just not in it — "
-                     + "\(store.filteredTasks.count) task"
-                     + (store.filteredTasks.count == 1 ? "" : "s")
+                     + "\(plotted) task" + (plotted == 1 ? "" : "s")
                      + " pass the filter with no time logged here."]
         if data.hiddenEntryCount > 0 {
             lines.append("\(data.hiddenEntryCount) entr"
                          + (data.hiddenEntryCount == 1 ? "y falls" : "ies fall")
                          + " outside it.")
+        }
+        if data.excludedRecurrentTaskCount > 0 {
+            lines.append("\(data.excludedRecurrentTaskCount) recurrent task"
+                         + (data.excludedRecurrentTaskCount == 1 ? " is" : "s are")
+                         + " on the shelf and never plotted here.")
         }
         return lines.joined(separator: " ")
     }
@@ -643,7 +762,19 @@ private struct TimelineStatusLabel: View {
         return "\(bars) \(unit)"
     }
 
+    /// **What is not on screen, and why.**
+    ///
+    /// Two different absences, kept apart on purpose. "Off-range" entries are
+    /// reachable — step or widen the range and they appear. Recurrent tasks are
+    /// not: they are never plotted here at any range. Reporting them as
+    /// off-range would send the user stepping through months looking for 123.8h
+    /// that lives on the shelf.
     private var detail: String {
-        data.hiddenEntryCount > 0 ? "\(data.hiddenEntryCount) off-range" : "all shown"
+        var parts: [String] = []
+        if data.hiddenEntryCount > 0 { parts.append("\(data.hiddenEntryCount) off-range") }
+        if data.excludedRecurrentTaskCount > 0 {
+            parts.append("\(data.excludedRecurrentTaskCount) recurrent on shelf")
+        }
+        return parts.isEmpty ? "all shown" : parts.joined(separator: " · ")
     }
 }

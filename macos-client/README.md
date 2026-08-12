@@ -199,6 +199,9 @@ tests were already green**:
 | `Mon 10  Mon 10  Tue 11  Tue 11` | `.automatic(desiredCount: 7)` over a 3-day window with a day-resolution label | stride on the calendar unit the label names |
 | Sprint boundaries drawn with nothing naming them | a mark's `.top` annotation scrolls with `chartScrollableAxes(.vertical)` and is clipped | put the sprint (and "Now") labels on a **top x axis** — axis chrome does not scroll |
 | Nine role swatches wrapped onto two lines | a legend duplicating the summary strip | legend carries only the hatch, the running timer and the sprint rule |
+| **Crash**: `CGFloat value cannot be converted to Int` | stepping onto a period with no logged time takes Swift Charts' categorical y domain to **zero** categories, and its vertical-scroll path divides the plot height by that count | `TimelineView.yDomain(for:)` — one invisible placeholder row, so the domain is never empty |
+| `Jul 22 – Jul 29 · showing Jul 22 – Jul 29` | a navigated week labelled with its own dates | name the period (`week of 22 Jul`) instead of spanning it |
+| `Aug 3 – Aug 4 · showing Mon, Aug 3` | shifting the *rolling* window instead of snapping to a calendar period | every step lands on a whole day / week / sprint / quarter |
 
 **The hatch** (`Design/HatchPattern.swift`) is an `ImagePaint` over a generated
 `NSImage` tile, because `ChartContent.foregroundStyle(_:)` takes a `ShapeStyle`
@@ -213,13 +216,57 @@ the chart.
 **The empty state is a real state.** The Sprint facet defaults to the current
 sprint and a sprint has no logged time on the morning it opens, so the default
 view is an empty range. The axis, the sprint rules and the "Now" line still draw;
-an overlay explains, and offers Show All Sprints / Clear All Filters.
+an overlay explains, and offers Today / Show All Sprints / Clear All Filters.
+
+**Recurrent tasks are not plotted.** They are perpetual — one task object
+accumulating time in every sprint it runs through — so a Gantt bar for one has no
+meaningful start or end. They live on the shelf (plan §9), exactly as the Board
+leaves them out, and they are excluded on `status`, never on the title. Measured:
+this removes **7 tasks, 146 log entries, 123.8 hours** — about a third of what
+the chart used to total. Because that is a big, silent-looking drop, it is said
+out loud in three places: the summary strip's caption, the toolbar's
+`N off-range · 7 recurrent on shelf`, and the empty state. "Off-range" and "on
+the shelf" are kept apart on purpose — off-range entries are reachable by moving
+the range, shelf ones never are.
+
+### Timeframe navigation
+
+Previous / Today / Next in the toolbar, and in the menu bar with **`⌥←` `⌥→`
+`⌥⌘T`**. Deliberately *not* `⌘←`/`⌘→`: the Board binds those to moving the
+selected card between columns, a menu shortcut beats a view's `onKeyPress`, and
+reusing them would silently retire the board's keyboard move. Every item is also
+gated on the Timeline being the visible pane.
+
+Each press moves one **named period** — a calendar day, a calendar week, a sprint
+from the 72 cached sprints, a calendar quarter — so the caption can always name
+what is on screen. Stepping stops at the ends of the data: `TimelineNavigation.step`
+returns `nil`, which is the same call the buttons' `disabled` reads, so what is
+greyed out and what would no-op cannot drift. A step *toward* the data is always
+allowed even from a window with none, which is what keeps Previous alive on the
+empty current sprint.
+
+**The range has exactly one source** (`TimelineAnchor`): the anchor when it is
+set, the derived domain (Sprint facet → logged time → current sprint → around
+now) when it is not. **Last touched wins**, and the controls are exact inverses:
+
+* navigating sets the anchor **and releases the Sprint facet** — that facet both
+  frames the axis (§8.5) *and* subtracts tasks, so keeping it would step onto a
+  period whose work had just been filtered out. What was released is remembered,
+  and the release is announced in the feedback bar, because the Board reads that
+  filter too;
+* **Today** drops the anchor and hands the facet back, returning to the derived
+  range — which anchors on now;
+* touching the Sprint facet drops the anchor, so the facet is authoritative again
+  the moment the user picks a sprint.
+
+Zooming while navigated keeps the period you were looking at: the anchor is
+re-derived for the new zoom rather than snapping back to today.
 
 ## Tests
 
 ```bash
 swift build            # debug
-swift test             # 250 tests, 4 skipped (the skips need a live daemon)
+swift test             # 265 tests, 4 skipped (the skips need a live daemon)
 ```
 
 `swift test` never touches `~/.workload_tracker.json` and makes no GitHub calls.

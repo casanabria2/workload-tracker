@@ -218,7 +218,11 @@ struct BoardView: View {
 
 /// The refused-drop / rolled-back-move bar. Transient, dismissible, and never a
 /// modal: a refused drop is information, not an interruption.
-private struct FeedbackBar: View {
+///
+/// Not `private` any more: the Timeline shows it too, because navigating there
+/// **releases the shared Sprint facet** (see `TimelineAnchor`) and a filter that
+/// the Board also reads must not change without saying so.
+struct FeedbackBar: View {
     let feedback: BoardFeedback
     let dismiss: () -> Void
 

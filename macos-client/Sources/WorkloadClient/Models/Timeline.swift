@@ -186,6 +186,10 @@ struct TimelineRoleTotal: Identifiable, Hashable, Sendable {
 /// Where the visible x-range came from, so the view can say so rather than
 /// leaving the axis unexplained.
 enum TimelineRangeSource: Equatable, Sendable {
+    /// The user stepped the viewport with Previous/Next. **This wins over every
+    /// other source** — see `TimelineAnchor` for the rule that keeps the range
+    /// single-sourced.
+    case navigated(label: String)
     /// Plan §8.5: the Sprint facet also sets the viewport.
     case sprintFacet(titles: [String])
     /// The span of the filtered tasks' logged time.
@@ -198,6 +202,7 @@ enum TimelineRangeSource: Equatable, Sendable {
 
     var explanation: String {
         switch self {
+        case .navigated(let label): "showing \(label)"
         case .sprintFacet(let titles):
             titles.isEmpty ? "sprint filter"
                 : "showing " + ListFormatter.localizedString(byJoining: titles)
@@ -205,6 +210,307 @@ enum TimelineRangeSource: Equatable, Sendable {
         case .currentSprint(let title): "showing \(title)"
         case .aroundNow: "showing the last two weeks"
         }
+    }
+
+    /// Whether the user put the viewport where it is, rather than the data or a
+    /// facet. Drives the Today control's enablement.
+    var isNavigated: Bool {
+        if case .navigated = self { return true }
+        return false
+    }
+}
+
+// MARK: - Navigation (the explicit viewport)
+
+/// An **explicit viewport**, set by Previous/Next.
+///
+/// ## The one rule, because a range with two owners is a bug generator
+///
+/// The visible range has exactly one source at any moment: this anchor when it
+/// is set, and the derived domain (Sprint facet → logged time → current sprint →
+/// around now) when it is not. There is no blending and no second range state
+/// anywhere — `TimelineModel.build` reads `anchor` first and stops.
+///
+/// **Last touched wins**, and the two controls are exact inverses:
+///
+/// - *Navigating* sets the anchor **and releases the Sprint facet**. That facet
+///   both frames the axis (§8.5) *and* subtracts tasks, so leaving it on would
+///   step the axis onto a period whose work had just been filtered out — the
+///   chart would go blank for a reason that has nothing to do with the data.
+///   What was released is remembered.
+/// - *Today* clears the anchor and hands the released facet back, returning the
+///   view to exactly the derived range it had before the first step.
+/// - *Touching the Sprint facet* clears the anchor, so the facet is authoritative
+///   again the moment the user picks a sprint.
+struct TimelineAnchor: Equatable, Sendable, Codable {
+    let start: Date
+    let end: Date
+    /// The zoom the anchor was computed for. `build` re-derives it when the zoom
+    /// changes underneath, so zooming keeps the period you were looking at
+    /// instead of jumping back to today.
+    let zoom: TimelineZoom
+    /// What to call the period on screen: `Sprint 104`, `Q3 2026`, `6 – 12 Jul`.
+    let label: String
+
+    var range: ClosedRange<Date> { TimelineModel.widened(start, end) }
+}
+
+/// Stepping the viewport. Pure and calendar-injectable, so "what does Previous
+/// do at Quarter zoom on the earliest quarter with data" is a unit test rather
+/// than a click.
+enum TimelineNavigation {
+
+    enum Direction: Int, Sendable, Equatable, CaseIterable {
+        case previous = -1
+        case next = 1
+    }
+
+    /// The period of `zoom` that contains `date`.
+    ///
+    /// Day and Week are calendar periods; **Sprint comes from the cached sprint
+    /// calendar** (72 sprints, offline), not from a nominal fortnight, so a step
+    /// lands on real sprint boundaries; Quarter is the calendar quarter.
+    static func period(of zoom: TimelineZoom,
+                       containing date: Date,
+                       sprints: [Sprint],
+                       calendar: Calendar = .current) -> TimelineAnchor {
+        switch zoom {
+        case .day:
+            let start = calendar.startOfDay(for: date)
+            let end = calendar.date(byAdding: .day, value: 1, to: start)
+                ?? start.addingTimeInterval(86_400)
+            return TimelineAnchor(start: start, end: end, zoom: zoom,
+                                  label: dayLabel(start))
+        case .week:
+            let interval = calendar.dateInterval(of: .weekOfYear, for: date)
+            let start = interval?.start ?? calendar.startOfDay(for: date)
+            let end = interval?.end ?? start.addingTimeInterval(7 * 86_400)
+            return TimelineAnchor(start: start, end: end, zoom: zoom,
+                                  label: weekLabel(start))
+        case .sprint:
+            if let sprint = sprint(containing: date, in: sprints),
+               let start = sprint.start, let end = sprint.end {
+                return TimelineAnchor(start: start, end: end, zoom: zoom,
+                                      label: sprint.displayName)
+            }
+            // Outside the cached calendar. Fall back to a fortnight so the
+            // control still moves rather than silently doing nothing.
+            let start = calendar.startOfDay(for: date)
+            let end = start.addingTimeInterval(14 * 86_400)
+            return TimelineAnchor(start: start, end: end, zoom: zoom,
+                                  label: spanLabel(start, end))
+        case .quarter:
+            let interval = calendar.dateInterval(of: .quarter, for: date)
+            let start = interval?.start ?? calendar.startOfDay(for: date)
+            let end = interval?.end ?? start.addingTimeInterval(91 * 86_400)
+            return TimelineAnchor(start: start, end: end, zoom: zoom,
+                                  label: quarterLabel(start, calendar: calendar))
+        }
+    }
+
+    /// One step of the current zoom, or `nil` at the ends of the data.
+    ///
+    /// **Every zoom steps between named periods**: a calendar day, a calendar
+    /// week, a sprint from the cached calendar, a calendar quarter. One rule,
+    /// four units, and the caption can always name what is on screen.
+    ///
+    /// The alternative — shifting the current window by one unit — was tried and
+    /// looked wrong. The *derived* window is a rolling one clamped to the
+    /// domain, so shifting it preserved its odd width and offset: a Day press
+    /// gave a range running 14:18 → 14:18 captioned "showing Mon, Aug 3", and a
+    /// Week press on the current sprint gave a **three-day** range captioned
+    /// "showing week of Aug 3". Both were screenshots. Snapping costs one thing
+    /// — the very first press away from a rolling window can move by more or
+    /// less than a whole unit — and buys a viewport that is always the period it
+    /// says it is.
+    ///
+    /// Returns `nil` — and the buttons disable — when the step would move
+    /// *away* from the data with none left in that direction, so the axis cannot
+    /// scroll into empty infinity. See `permits(_:_:_:)`.
+    static func step(_ direction: Direction,
+                     from visible: ClosedRange<Date>,
+                     zoom: TimelineZoom,
+                     sprints: [Sprint],
+                     bounds: ClosedRange<Date>,
+                     calendar: Calendar = .current) -> TimelineAnchor? {
+        let candidate: TimelineAnchor?
+        switch zoom {
+        case .day:
+            let base = calendar.startOfDay(for: visible.lowerBound)
+            candidate = calendar.date(byAdding: .day, value: direction.rawValue, to: base)
+                .map { period(of: .day, containing: $0,
+                              sprints: sprints, calendar: calendar) }
+        case .week:
+            // Pivot from the middle so a *clamped* window (the current sprint's
+            // first three days, say) steps to the week beside the one it mostly
+            // covers rather than to one it barely touches.
+            let base = period(of: .week, containing: midpoint(of: visible),
+                              sprints: sprints, calendar: calendar)
+            let pivot = direction == .next
+                ? base.end.addingTimeInterval(86_400)
+                : base.start.addingTimeInterval(-86_400)
+            candidate = period(of: .week, containing: pivot,
+                               sprints: sprints, calendar: calendar)
+        case .sprint:
+            candidate = neighbouringSprint(direction, from: visible,
+                                           sprints: sprints, calendar: calendar)
+        case .quarter:
+            let current = period(of: .quarter, containing: midpoint(of: visible),
+                                 sprints: sprints, calendar: calendar)
+            // A day either side of the current quarter is inside its neighbour,
+            // whatever that quarter's length.
+            let pivot = direction == .next
+                ? current.end.addingTimeInterval(86_400)
+                : current.start.addingTimeInterval(-86_400)
+            candidate = period(of: .quarter, containing: pivot,
+                               sprints: sprints, calendar: calendar)
+        }
+        guard let candidate, permits(candidate.range, bounds, direction) else { return nil }
+        return candidate
+    }
+
+    /// Whether a step is allowed to land on `candidate`.
+    ///
+    /// Not simply "does it overlap the data": a step that *moves toward* the
+    /// data is always allowed, even from a window that has none. Measured on the
+    /// default view — the current sprint opens two weeks in the future of the
+    /// last log, so a strict overlap rule disabled Previous on precisely the
+    /// screen the feature exists for. Only a step that would move **further
+    /// away** from the data is refused, which is what stops the axis scrolling
+    /// into empty infinity while still letting it scroll back out of it.
+    private static func permits(_ candidate: ClosedRange<Date>,
+                                _ bounds: ClosedRange<Date>,
+                                _ direction: Direction) -> Bool {
+        if intersects(candidate, bounds) { return true }
+        switch direction {
+        case .previous: return candidate.upperBound > bounds.lowerBound
+        case .next: return candidate.lowerBound < bounds.upperBound
+        }
+    }
+
+    /// Everything Previous/Next may reach: the span of the navigable tasks'
+    /// logged time, always extended to include *now* so the present is reachable
+    /// from either end of the history.
+    ///
+    /// Fed the filter's result **with the Sprint facet taken out** (see
+    /// `TimelineData.navigationBounds`). Measured on today's default view: the
+    /// current sprint is empty, so bounds computed from the sprint-filtered
+    /// tasks would be a single instant and Previous would be disabled on the
+    /// very screen the feature exists for. Since stepping releases that facet
+    /// anyway, the reachable span is the one you get once it is released.
+    static func bounds(tasks: [TrackerTask], now: Date) -> ClosedRange<Date> {
+        var lower: Date?
+        var upper: Date?
+        for task in tasks {
+            for log in task.logs {
+                guard let span = TimelineModel.span(of: log) else { continue }
+                lower = min(lower ?? span.start, span.start)
+                upper = max(upper ?? span.end, span.end)
+            }
+        }
+        return TimelineModel.widened(min(lower ?? now, now), max(upper ?? now, now))
+    }
+
+    // MARK: Helpers
+
+    private static func shifted(_ visible: ClosedRange<Date>,
+                                byDays days: Int,
+                                zoom: TimelineZoom,
+                                calendar: Calendar) -> TimelineAnchor? {
+        guard let start = calendar.date(byAdding: .day, value: days,
+                                        to: visible.lowerBound),
+              let end = calendar.date(byAdding: .day, value: days,
+                                      to: visible.upperBound) else { return nil }
+        return TimelineAnchor(start: start, end: end, zoom: zoom,
+                              label: zoom == .day ? dayLabel(start)
+                                                  : weekLabel(start))
+    }
+
+    private static func neighbouringSprint(_ direction: Direction,
+                                           from visible: ClosedRange<Date>,
+                                           sprints: [Sprint],
+                                           calendar: Calendar) -> TimelineAnchor? {
+        let ordered = sprints
+            .filter { $0.start != nil && $0.end != nil }
+            .sorted { ($0.start ?? .distantPast) < ($1.start ?? .distantPast) }
+        guard !ordered.isEmpty else {
+            return shifted(visible, byDays: 14 * direction.rawValue,
+                           zoom: .sprint, calendar: calendar)
+        }
+        // The sprint the **middle** of the window sits in. Using the lower bound
+        // would make Next from a rolling fortnight land on the sprint most of
+        // the window is already showing.
+        let reference = midpoint(of: visible)
+        let index = ordered.firstIndex { sprint in
+            guard let start = sprint.start, let end = sprint.end else { return false }
+            return reference >= start && reference < end
+        } ?? nearestIndex(to: reference, in: ordered)
+        guard let index else {
+            return shifted(visible, byDays: 14 * direction.rawValue,
+                           zoom: .sprint, calendar: calendar)
+        }
+        let target = index + direction.rawValue
+        guard ordered.indices.contains(target) else { return nil }
+        let sprint = ordered[target]
+        guard let start = sprint.start, let end = sprint.end else { return nil }
+        return TimelineAnchor(start: start, end: end, zoom: .sprint,
+                              label: sprint.displayName)
+    }
+
+    private static func nearestIndex(to date: Date, in ordered: [Sprint]) -> Int? {
+        ordered.enumerated().min {
+            abs(($0.element.start ?? .distantPast).timeIntervalSince(date))
+                < abs(($1.element.start ?? .distantPast).timeIntervalSince(date))
+        }?.offset
+    }
+
+    /// The cached sprint whose half-open `[start, end)` contains `date`, the
+    /// same rule as `wt.find_sprint_for_date`.
+    static func sprint(containing date: Date, in sprints: [Sprint]) -> Sprint? {
+        sprints.first { sprint in
+            guard let start = sprint.start, let end = sprint.end else { return false }
+            return date >= start && date < end
+        }
+    }
+
+    private static func midpoint(of range: ClosedRange<Date>) -> Date {
+        range.lowerBound.addingTimeInterval(
+            range.upperBound.timeIntervalSince(range.lowerBound) / 2)
+    }
+
+    private static func intersects(_ lhs: ClosedRange<Date>,
+                                   _ rhs: ClosedRange<Date>) -> Bool {
+        lhs.lowerBound <= rhs.upperBound && lhs.upperBound >= rhs.lowerBound
+    }
+
+    // MARK: Labels
+
+    static func dayLabel(_ date: Date) -> String {
+        date.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated))
+    }
+
+    /// A week is named, not spanned.
+    ///
+    /// The summary strip already prints the range's dates, so a label of
+    /// `22 Jul – 29 Jul` rendered as *"Jul 22 – Jul 29 · showing Jul 22 – Jul
+    /// 29"* — measured in a screenshot. A name adds something the dates do not.
+    static func weekLabel(_ start: Date) -> String {
+        "week of " + start.formatted(.dateTime.day().month(.abbreviated))
+    }
+
+    static func spanLabel(_ start: Date, _ end: Date) -> String {
+        // The window is half-open, so its last *drawn* day is the instant before
+        // the upper bound. Printing the bound itself labelled a Sun–Sat week
+        // with the following Sunday.
+        let last = end.addingTimeInterval(-1)
+        return start.formatted(.dateTime.day().month(.abbreviated))
+            + " – " + last.formatted(.dateTime.day().month(.abbreviated))
+    }
+
+    static func quarterLabel(_ start: Date, calendar: Calendar) -> String {
+        let month = calendar.component(.month, from: start)
+        let year = calendar.component(.year, from: start)
+        return "Q\((month - 1) / 3 + 1) \(year)"
     }
 }
 
@@ -222,21 +528,46 @@ struct TimelineData: Sendable {
     let roleTotals: [TimelineRoleTotal]
     /// Sprint starts inside the range, for the boundary rules.
     let sprintBoundaries: [(date: Date, title: String)]
-    /// Log entries the filter admits that fall **outside** the visible range, so
-    /// the summary strip can say the axis is not the whole story.
+    /// Log entries **of the plotted tasks** that fall outside the visible range,
+    /// so the summary strip can say the axis is not the whole story.
+    ///
+    /// Recurrent tasks are not counted here: they are not off-range, they are
+    /// not on this chart at all, and folding the two together would make the
+    /// "M off-range" figure promise work that stepping the range can never
+    /// reveal. They get their own count.
     let hiddenEntryCount: Int
+    /// Recurrent tasks the filter admits that the Gantt does not plot — they
+    /// live on the shelf (plan §9). Measured: 7 tasks, 146 logs, 123.8h.
+    let excludedRecurrentTaskCount: Int
+    let excludedRecurrentEntryCount: Int
     /// Whether any drawn bar is approximately placed — drives the legend entry.
     let hasApproximateBars: Bool
+    /// What Previous/Next may reach, so the buttons' enablement and the step
+    /// itself are decided by the same numbers.
+    ///
+    /// Deliberately **not** bounded by the Sprint facet: stepping releases that
+    /// facet, so the reachable span is the one that exists once it is gone.
+    /// Otherwise the default view — the current sprint, empty on the morning it
+    /// opens — would disable both buttons.
+    let navigationBounds: ClosedRange<Date>
 
     var totalMinutes: Double { roleTotals.reduce(0) { $0 + $1.minutes } }
     var isEmpty: Bool { bars.isEmpty }
+    /// Whether the viewport is where the user put it rather than where the data
+    /// or the Sprint facet put it.
+    var isNavigated: Bool { rangeSource.isNavigated }
 
     static func empty(zoom: TimelineZoom, now: Date) -> TimelineData {
-        TimelineData(zoom: zoom,
-                     range: now.addingTimeInterval(-7 * 24 * 3600)...now,
-                     rangeSource: .aroundNow,
-                     rows: [], bars: [], roleTotals: [], sprintBoundaries: [],
-                     hiddenEntryCount: 0, hasApproximateBars: false)
+        let range = now.addingTimeInterval(-7 * 24 * 3600)...now
+        return TimelineData(zoom: zoom,
+                            range: range,
+                            rangeSource: .aroundNow,
+                            rows: [], bars: [], roleTotals: [], sprintBoundaries: [],
+                            hiddenEntryCount: 0,
+                            excludedRecurrentTaskCount: 0,
+                            excludedRecurrentEntryCount: 0,
+                            hasApproximateBars: false,
+                            navigationBounds: range)
     }
 }
 
@@ -263,30 +594,63 @@ enum TimelineModel {
     /// `tasks` is expected to be **already filtered** (`Store.filteredTasks`) —
     /// plan §8.1 is explicit that there is one filter state and the timeline
     /// reads it rather than owning a second one.
-    static func build(tasks: [TrackerTask],
+    static func build(tasks allTasks: [TrackerTask],
                       roles: [Role],
                       sprints: [Sprint],
                       currentSprint: Sprint?,
                       selectedSprintIDs: Set<String>,
                       zoom: TimelineZoom,
                       activeTimer: ActiveTimer?,
-                      now: Date) -> TimelineData {
+                      now: Date,
+                      anchor: TimelineAnchor? = nil,
+                      navigationTasks: [TrackerTask]? = nil,
+                      calendar: Calendar = .current) -> TimelineData {
 
         let roleOrder = Dictionary(uniqueKeysWithValues:
             roles.enumerated().map { ($0.element.id, $0.offset) })
         let roleLabels = Dictionary(roles.map { ($0.id, $0.displayName) },
                                     uniquingKeysWith: { first, _ in first })
 
-        // 1. The domain — every instant the view could show.
-        let (domain, source) = self.domain(tasks: tasks, sprints: sprints,
-                                           currentSprint: currentSprint,
-                                           selectedSprintIDs: selectedSprintIDs,
-                                           activeTimer: activeTimer,
-                                           now: now)
+        // 0. **Recurrent tasks are not plotted**, the same way the Board leaves
+        //    them out: they are perpetual by construction — one object
+        //    accumulating time in every sprint it runs through — so a Gantt bar
+        //    for one has no meaningful start or end. They live on the shelf
+        //    (plan §9). Selected on `status`, never on the title.
+        //
+        //    This is done *first* so everything downstream — the domain, the
+        //    summary strip, the off-range count, the navigation bounds — is
+        //    computed from what is actually drawn. Measured: 7 tasks, 146 logs,
+        //    123.8h leave the chart, so the strip's total drops by about a
+        //    third, and that is the honest figure.
+        let tasks = allTasks.filter { $0.status != .recurrent }
+        let excludedRecurrent = allTasks.filter { $0.status == .recurrent }
+        let excludedRecurrentEntries = excludedRecurrent.reduce(0) { $0 + $1.logs.count }
 
-        // 2. The window — the zoom's slice of it.
-        let range = window(in: domain, zoom: zoom,
-                           isSprintScoped: source.isSprintScoped, now: now)
+        // 1. The domain — every instant the view could show.
+        //
+        //    **One source of truth**: an explicit anchor wins outright, and the
+        //    derived domain is then not consulted at all. See `TimelineAnchor`.
+        let range: ClosedRange<Date>
+        let source: TimelineRangeSource
+        if let anchor {
+            // Re-derive when the zoom changed under the anchor, so zooming keeps
+            // the period you were looking at rather than snapping back to today.
+            let effective = anchor.zoom == zoom ? anchor
+                : TimelineNavigation.period(of: zoom, containing: anchor.start,
+                                            sprints: sprints, calendar: calendar)
+            range = effective.range
+            source = .navigated(label: effective.label)
+        } else {
+            let (domain, derived) = self.domain(tasks: tasks, sprints: sprints,
+                                                currentSprint: currentSprint,
+                                                selectedSprintIDs: selectedSprintIDs,
+                                                activeTimer: activeTimer,
+                                                now: now)
+            source = derived
+            // 2. The window — the zoom's slice of it.
+            range = window(in: domain, zoom: zoom,
+                           isSprintScoped: derived.isSprintScoped, now: now)
+        }
 
         // 3. The logs that land in it.
         var placed: [PlacedLog] = []
@@ -436,7 +800,13 @@ enum TimelineModel {
                             roleTotals: roleTotals,
                             sprintBoundaries: boundaries,
                             hiddenEntryCount: hidden,
-                            hasApproximateBars: bars.contains(where: \.isApproximate))
+                            excludedRecurrentTaskCount: excludedRecurrent.count,
+                            excludedRecurrentEntryCount: excludedRecurrentEntries,
+                            hasApproximateBars: bars.contains(where: \.isApproximate),
+                            navigationBounds: TimelineNavigation.bounds(
+                                tasks: (navigationTasks ?? allTasks)
+                                    .filter { $0.status != .recurrent },
+                                now: now))
     }
 
     /// One log that falls inside the visible range, with its resolved geometry.
