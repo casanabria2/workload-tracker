@@ -180,13 +180,46 @@ would not be. To add it later: author `AppIcon.icns` in Icon Composer, drop it i
 
 * The plan's optional `SMAppService` login-item toggle for the daemon. The
   LaunchAgent in `launchd/` already covers "daemon up without a terminal".
-* Anything from plan §11 (Phase 8) or §7 (Phase 7).
+* Anything from plan §11 (Phase 8). *(§10, Phase 7 — the Gantt — landed after
+  this file was written; see below.)*
+
+## The Timeline (Phase 7, plan §10)
+
+Swift Charts, no third-party dependency. `Models/Timeline.swift` is the pure,
+tested part — what a bar is at each zoom, where the x-range comes from, how the
+timestamp-less logs are marked — and `Views/TimelineView.swift` only draws it.
+
+Four things about it are counter-intuitive enough to be worth writing down,
+because each of them was found by **looking at a screenshot of a build whose
+tests were already green**:
+
+| Symptom on screen | Cause | Fix |
+|---|---|---|
+| Ten rows 65pt tall, bars like blocks | `chartYVisibleDomain` left to fill the plot | derive the visible-row count from the pane height ÷ a fixed `rowHeight` |
+| `Mon 10  Mon 10  Tue 11  Tue 11` | `.automatic(desiredCount: 7)` over a 3-day window with a day-resolution label | stride on the calendar unit the label names |
+| Sprint boundaries drawn with nothing naming them | a mark's `.top` annotation scrolls with `chartScrollableAxes(.vertical)` and is clipped | put the sprint (and "Now") labels on a **top x axis** — axis chrome does not scroll |
+| Nine role swatches wrapped onto two lines | a legend duplicating the summary strip | legend carries only the hatch, the running timer and the sprint rule |
+
+**The hatch** (`Design/HatchPattern.swift`) is an `ImagePaint` over a generated
+`NSImage` tile, because `ChartContent.foregroundStyle(_:)` takes a `ShapeStyle`
+and `ImagePaint` is the only built-in one that tiles an arbitrary drawing. It is
+tinted per role, so the tile is cached by resolved sRGB components.
+
+**Zoom** is `⌘+`/`⌘-` in the menu bar plus the toolbar's segmented control. The
+shortcuts live in `App.swift` rather than on the picker: a shortcut attached to a
+view only fires while that view has focus, and the picker takes focus away from
+the chart.
+
+**The empty state is a real state.** The Sprint facet defaults to the current
+sprint and a sprint has no logged time on the morning it opens, so the default
+view is an empty range. The axis, the sprint rules and the "Now" line still draw;
+an overlay explains, and offers Show All Sprints / Clear All Filters.
 
 ## Tests
 
 ```bash
 swift build            # debug
-swift test             # 221 tests, 4 skipped (the skips need a live daemon)
+swift test             # 250 tests, 4 skipped (the skips need a live daemon)
 ```
 
 `swift test` never touches `~/.workload_tracker.json` and makes no GitHub calls.

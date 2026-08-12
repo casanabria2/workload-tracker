@@ -20,9 +20,18 @@ struct BoardView: View {
     /// hands back, which is what actually crossed the drag boundary; this is a
     /// fallback for that.
     @State private var dragging: TaskDragPayload?
-    /// The keyboard-selected card.
-    @State private var selection: String?
     @FocusState private var boardFocused: Bool
+
+    /// The keyboard-selected card.
+    ///
+    /// **Held in the `Store`, not in this view** (plan §10): clicking a bar on
+    /// the Gantt selects the task, and that selection is this one. Through Phase
+    /// 6 it was `@State` here, which made the two views' selections independent
+    /// by construction.
+    private var selection: String? {
+        get { store.boardSelection }
+        nonmutating set { store.selectTask(newValue) }
+    }
 
     /// What the column shows, after the shared `FilterState` (plan §8).
     private func column(_ status: TaskStatus) -> [TrackerTask] {
@@ -142,7 +151,8 @@ struct BoardView: View {
                                 tasks: column(status),
                                 unfilteredTasks: store.boardTasks(status),
                                 dragging: $dragging,
-                                selection: $selection)
+                                selection: Binding(get: { store.boardSelection },
+                                                   set: { store.selectTask($0) }))
                     if index < TaskStatus.boardColumns.count - 1 {
                         Divider()
                     }

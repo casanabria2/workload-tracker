@@ -33,6 +33,19 @@ struct WorkloadClientApp: App {
                 Button("Clear All Filters") { store.clearFilters() }
                     .keyboardShortcut("k", modifiers: [.shift, .command])
                     .disabled(!store.isFiltering)
+
+                Divider()
+
+                // Plan §10's `⌘+`/`⌘-`. In the menu bar rather than on the
+                // Timeline's segmented control, because a shortcut attached to a
+                // view only fires while that view is on screen *and* focused,
+                // and the picker takes focus away from the chart.
+                Button("Zoom In") { store.zoomTimeline(in: true) }
+                    .keyboardShortcut("+", modifiers: .command)
+                    .disabled(store.selection != .timeline || !store.canZoomTimelineIn)
+                Button("Zoom Out") { store.zoomTimeline(in: false) }
+                    .keyboardShortcut("-", modifiers: .command)
+                    .disabled(store.selection != .timeline || !store.canZoomTimelineOut)
             }
 
             // Plan §9: "Row actions via context menu **and the Task menu**."

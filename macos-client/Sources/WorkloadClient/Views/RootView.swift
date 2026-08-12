@@ -10,6 +10,9 @@ struct RootView: View {
     /// round-trips through `FilterStateCodec` — the same shape the sidebar
     /// selection already uses.
     @SceneStorage("filterState") private var storedFilter: String = ""
+    /// The Gantt's zoom (plan §10/§11: "`@SceneStorage` for selection, zoom
+    /// level, shelf height and `FilterState`").
+    @SceneStorage("timelineZoom") private var storedZoom: String = ""
     @State private var selection: SidebarSelection? = .board
 
     var body: some View {
@@ -37,7 +40,11 @@ struct RootView: View {
                 ?? FilterStateCodec.decode(AppSettings.lastFilterState) {
                 store.restoreFilter(restored)
             }
+            if let zoom = TimelineZoom(rawValue: storedZoom) {
+                store.timelineZoom = zoom
+            }
         }
+        .onChange(of: store.timelineZoom) { _, new in storedZoom = new.rawValue }
         .onChange(of: selection) { _, new in
             storedSelection = Self.encode(new ?? .board)
             if let new { store.selection = new }
@@ -78,14 +85,7 @@ struct RootView: View {
         case .board:
             BoardView()
         case .timeline:
-            PhasePlaceholderView(
-                title: "Timeline",
-                symbol: "chart.bar.xaxis",
-                summary: "A zoomable Gantt of logged time — one bar per session at "
-                + "Day/Week, one per task at Sprint/Quarter, with the "
-                + "timestamp-less logs drawn as approximate rather than invented.",
-                phase: "Arrives in Phase 7 of docs/plan-macos-app.md"
-            )
+            TimelineView()
         case .overview:
             PhasePlaceholderView(
                 title: "Overview",

@@ -63,6 +63,22 @@ final class Store {
     /// Whether the recurrent shelf is expanded.
     var showsRecurrentShelf: Bool = true
 
+    // MARK: - Phase 7 timeline state
+
+    /// The Gantt's zoom level (plan §10). Held here rather than in the view so
+    /// the `⌘+`/`⌘-` menu commands and the toolbar's segmented control write one
+    /// value, and so it survives switching to the Board and back. Persisted by
+    /// `RootView` via `@SceneStorage`.
+    var timelineZoom: TimelineZoom = .week
+
+    /// **The selected task, shared by the Board and the Timeline** (plan §10:
+    /// "clicking a bar selects the task and syncs the Inspector and Board
+    /// selection").
+    ///
+    /// It lived in `BoardView` as `@State` through Phase 6, which made the two
+    /// views' selections independent by construction. One property, two readers.
+    var boardSelection: String?
+
     // MARK: - Phase 5 filter state
 
     /// **The** filter (plan §8.1). One instance, written by the sidebar's Roles
@@ -515,6 +531,45 @@ final class Store {
     /// Whether the free-text term alone is what emptied the result.
     var textIsBlocking: Bool {
         TaskFilter.textIsBlocking(filter, tasks: tasks, currentSprintID: currentSprint?.id)
+    }
+
+    // MARK: - The timeline (plan §10)
+
+    /// Everything the Gantt draws, for the current filter, zoom and tick.
+    ///
+    /// Built on demand rather than cached: it is a single pass over the filtered
+    /// tasks' logs (419 on the owner's data, far below any threshold worth
+    /// caching for), and it has to recompute on the 1 Hz tick anyway because the
+    /// running-timer bar grows against `now`.
+    ///
+    /// **`filteredTasks`, not `tasks`** — plan §8.1's one filter state, read
+    /// here rather than re-implemented.
+    var timeline: TimelineData {
+        TimelineModel.build(tasks: filteredTasks,
+                            roles: roles,
+                            sprints: snapshot?.sprints ?? [],
+                            currentSprint: currentSprint,
+                            selectedSprintIDs: filter.sprints,
+                            zoom: timelineZoom,
+                            activeTimer: snapshot?.activeTimer,
+                            now: now)
+    }
+
+    /// `⌘+` / `⌘-`. No-ops at the ends rather than wrapping, which is what every
+    /// other zoom control on the system does.
+    func zoomTimeline(in zoomIn: Bool) {
+        guard let next = zoomIn ? timelineZoom.zoomedIn : timelineZoom.zoomedOut
+        else { return }
+        timelineZoom = next
+    }
+
+    var canZoomTimelineIn: Bool { timelineZoom.zoomedIn != nil }
+    var canZoomTimelineOut: Bool { timelineZoom.zoomedOut != nil }
+
+    /// Selects a task from either view. Clicking a Gantt bar comes through here,
+    /// which is what keeps the Board's cursor on the same card.
+    func selectTask(_ id: String?) {
+        boardSelection = id
     }
 
     // MARK: - Optimistic status
