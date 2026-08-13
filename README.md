@@ -146,7 +146,8 @@ wt log "DemoKit PR" 30
 wt done "DemoKit PR"
 
 # Sprint rollover for recurring work.
-#   `wt close-recurrent` and `wt new-recurrent` are RETIRED and now hard-refuse.
+#   `wt close-recurrent` and `wt new-recurrent` are RETIRED: the planners behind
+#   them have been deleted and the commands hard-refuse (exit 2).
 #   Recurring work is one perpetual task with a GitHub issue per sprint, so there
 #   are no per-sprint copies to close or recreate. Use sync-sprints instead:
 wt sync-sprints --all --dry-run        # preview across every non-recurrent task
@@ -281,7 +282,7 @@ Allows Claude (via Claude Code or Claude Desktop) to interact directly with task
 | `stop_timer` | Stop the running timer |
 | `log_time` | Log time manually to a task |
 | `set_task_status` | Change task status (todo/inprogress/done) |
-| ~~`close_previous_recurrent_tasks`~~ | **RETIRED** — hard-refuses. Recurring work is one perpetual task with an issue per sprint; use `sync_task_sprints` instead |
+| ~~`close_previous_recurrent_tasks`~~ | **RETIRED** — returns an explanation and nothing else; its planner in `wt.py` has been deleted. Recurring work is one perpetual task with an issue per sprint; use `sync_task_sprints` instead |
 | `delete_task` | Delete a task |
 | `get_status` | Get time summary by role |
 | `get_notes_path` | Get notes location (GitHub issue or local file path) |

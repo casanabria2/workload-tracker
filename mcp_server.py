@@ -27,7 +27,6 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from wt import sync_project_status, get_all_sprints, get_current_sprint, _match_sprint, delete_github_issue, setup_issue_in_project, mins_to_quarter_hours
 from wt import build_time_report, format_time_report, _parse_last_arg, get_cached_sprints, get_role_ids
-from wt import find_recurrent_tasks_to_close, close_previous_sprint_recurrent_tasks
 from wt import get_task_repo, get_cached_project_options, _migrate_role_github_fields
 # Phase 3 (docs/plan-sprint-bindings.md §4): shadow tasks are gone, replaced by
 # per-sprint ``sprint_issues`` bindings. Every ``github_issue`` read goes through
@@ -998,20 +997,20 @@ def _render_close(result: dict, create_issue: bool) -> str:
 
 @mcp.tool()
 def close_previous_recurrent_tasks(all_previous: bool = False, dry_run: bool = False) -> str:
-    """Close recurrent tasks from a prior sprint by updating their GitHub issues.
+    """RETIRED — recurring work no longer has per-sprint copies to close.
 
-    Finds every task with status 'recurrent' that is linked to a GitHub issue and
-    belongs to a prior sprint, then closes each one: the GitHub Project fields are
-    updated (Status=Done, Hours, Activity, Sprint, Type) and the issue is closed.
-    Recurrent tasks without a linked GitHub issue are ignored.
+    Use sync_task_sprints(all_tasks=True, create_issues=True) instead: it closes
+    the sprint that just ended and opens the new one on the same perpetual task.
 
     Args:
-        all_previous: If False (default), only close tasks from the sprint
-            immediately before the current one. If True, close tasks from every
-            sprint earlier than the current one.
-        dry_run: If True, only list the tasks that would be closed without making
-            any changes.
+        all_previous: ignored; kept so an old call still gets the explanation.
+        dry_run: ignored; kept so an old call still gets the explanation.
     """
+    # The planner behind this tool (wt.find_recurrent_tasks_to_close /
+    # close_previous_sprint_recurrent_tasks) has been deleted. Its selection rule
+    # — status == "recurrent" plus a prior-sprint sprint_id — matches the merged
+    # perpetual task, so a call would have ended a live recurrence. Only the
+    # refusal remains, so a caller gets a pointer rather than a missing tool.
     return (
         "close_previous_recurrent_tasks has been retired.\n\n"
         "Recurring work is now one perpetual task with a GitHub issue per\n"
@@ -1021,38 +1020,6 @@ def close_previous_recurrent_tasks(all_previous: bool = False, dry_run: bool = F
         "Use sync_task_sprints(all_tasks=True, create_issues=True) instead: it\n"
         "closes the sprint that just ended and opens the new one."
     )
-    data = load()
-    current = get_current_sprint(data)
-    if not current:
-        return "ERROR: could not determine the current sprint; aborting."
-
-    scope = "all previous sprints" if all_previous else "the previous sprint"
-    tasks = find_recurrent_tasks_to_close(data, all_previous=all_previous)
-
-    if not tasks:
-        return f"No recurrent tasks from {scope} to close (current: {current['title']})."
-
-    if dry_run:
-        lines = [f"Would close {len(tasks)} recurrent task(s) from {scope}:"]
-        for t in tasks:
-            lines.append(f"  - {t['title']} [{t.get('sprint', '?')}] "
-                         f"{task_current_issue(t, data)}")
-        return "\n".join(lines)
-
-    summary = close_previous_sprint_recurrent_tasks(data, save, all_previous=all_previous)
-    lines = [f"Closed recurrent tasks from {scope} (current: {summary['current_sprint']}):"]
-    for r in summary["results"]:
-        if r["success"]:
-            bits = []
-            if r.get("issue_closed"):
-                bits.append("issue closed")
-            if r.get("project_updated"):
-                bits.append("project updated")
-            extra = f" ({', '.join(bits)})" if bits else ""
-            lines.append(f"  ✓ {r['title']} [{r.get('sprint', '?')}]{extra}")
-        else:
-            lines.append(f"  ✗ {r['title']}: {r.get('error')}")
-    return "\n".join(lines)
 
 
 @mcp.tool()

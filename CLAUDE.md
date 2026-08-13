@@ -67,9 +67,9 @@ WT_DATA_FILE=/tmp/wt-work.json python3 wt.py sync-sprints --all --dry-run
 The harnesses swap `subprocess` for a guard that raises on any attribute access,
 so a missed stub fails loudly instead of reaching GitHub — **never** let a test
 run `gh issue create`/`close`; those writes are irreversible. Use `--dry-run`
-where available (`sync-sprints`, `close-recurrent`, `new-recurrent`). Because the
-data file is the single source of truth and syncs across Macs, avoid `save()`
-until you've confirmed the in-memory change is correct.
+where available (`sync-sprints`). Because the data file is the single source of
+truth and syncs across Macs, avoid `save()` until you've confirmed the in-memory
+change is correct.
 
 ## Architecture
 
@@ -504,98 +504,36 @@ set_task_activity("My task", "Demo Kit Maintenance")
 set_task_type("My task", "Feature")
 ```
 
-### Bulk-closing recurrent tasks from previous sprints
+### Retired: the per-sprint recurrent clone commands
 
-Recurrent tasks (`status == "recurrent"`) intentionally span sprints, so each
-sprint typically has its own per-sprint copy (e.g. `Stand Up Calls - casanabria
-- Sprint 100`). Once a sprint ends, its recurrent copies should be closed. The
-`close-recurrent` feature does this in one shot, running each qualifying task
-through the standard `close_task()` workflow (updates the GitHub issue's project
-fields — Status=Done, Hours, Activity, Sprint, Type — and closes the issue).
+`wt close-recurrent`, `wt new-recurrent` and the MCP
+`close_previous_recurrent_tasks` are **retired**, and since plan §13.5 item 1e
+the planners behind them are **deleted**, not merely unreachable.
 
-**A task qualifies only if it:**
-- has `status == "recurrent"`,
-- has a linked `github_issue` (tasks without one are skipped entirely),
-- has a `sprint_id` matching a target sprint.
+They existed when recurring work was one cloned task per sprint (`<base> -
+Sprint N`): one command closed last sprint's copies, the other minted this
+sprint's. Phase 5 merged each series into a single perpetual task that grows one
+binding per sprint, which makes both operations wrong rather than obsolete —
+the close side's selection rule (`status == "recurrent"` plus a prior-sprint
+`sprint_id`) matches the merged task, so it would end a live recurrence; the
+recreate side would mint per-sprint clones of a task that is meant to be
+perpetual (measured at the Sprint 106 boundary: it selected all 7 series and ran
+the full issue-creation sequence for each).
 
-**Scope (default vs. opt-in):** by default only the sprint *immediately before*
-the current one is targeted. Pass `--all-previous` (CLI) / `all_previous=True`
-(MCP) to target every sprint earlier than the current one. If the current sprint
-can't be resolved, the operation aborts (returns empty) to avoid closing
-current-sprint tasks.
+Gone from `wt.py`: `find_recurrent_tasks_to_close`,
+`close_previous_sprint_recurrent_tasks`, `find_recurrent_tasks_to_recreate`,
+`create_current_sprint_recurrent_tasks`, plus the private helpers
+`_recurrent_source_sort_key` and `_same_recurrent_series`.
 
-**CLI:**
-```bash
-wt close-recurrent                 # previous sprint only (default)
-wt close-recurrent --all-previous  # every earlier sprint
-wt close-recurrent --dry-run       # preview; combine with --all-previous
-```
+What remains is only the refusal, so the commands explain themselves instead of
+printing "unknown command": `cmd_close_recurrent` / `cmd_new_recurrent` call
+`_recurrent_command_retired()` and `sys.exit(2)`, and the MCP tool stays
+registered (still 43) returning the same explanation. `tools/test_phase3.py`
+asserts the retirement — absent functions, exit 2 on every flag combination, an
+untouched data file.
 
-**MCP:**
-```python
-close_previous_recurrent_tasks()                       # previous sprint only
-close_previous_recurrent_tasks(all_previous=True)      # every earlier sprint
-close_previous_recurrent_tasks(dry_run=True)           # preview without changes
-```
-
-**Key functions in wt.py:**
-- `find_recurrent_tasks_to_close(data, all_previous=False) -> list[dict]` — selection logic (network call via `get_all_sprints` to resolve current/previous sprint).
-- `close_previous_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — closes each via `close_task()`; returns `{error, current_sprint, results: [{task_id, title, sprint, issue, success, issue_closed, project_updated, error}]}`.
-
-### Recreating recurrent tasks for the current sprint
-
-The counterpart to `close-recurrent`: at the start of a new sprint, the
-`new-recurrent` feature recreates the previous sprint's recurring tasks in the
-**current** sprint, each with a fresh GitHub issue. It runs each new task
-through `create_github_issue()` + `setup_issue_in_project()` (Status=In
-Progress, Activity, Sprint, Hours), exactly like `wt add --create-issue`.
-
-**Identifying recurring tasks (dual signal):** because closing a recurrent task
-sets `status="done"` and drops the `recurrent` marker, selection can't rely on
-status alone. A source task in the target sprint(s) is treated as recurring when
-**either**:
-- its title carries the per-sprint ` - Sprint N` suffix (`SPRINT_SUFFIX_RE`) —
-  this is the recurring-task naming convention and is the only signal for a
-  series whose copies are *all* closed (e.g. `General Demo Kit maintenance -
-  Sprint 100`); **or**
-- its base name (`strip_sprint_suffix(title)`) matches some task
-  anywhere that currently has `status == "recurrent"` (covers recurring tasks
-  without the suffix).
-
-This picks up **open and closed** copies. Non-recurring one-offs (e.g. `SLO
-Workshop Quarterly Sync`, `CAP audit cleanup`) lack the suffix and are ignored.
-
-**What gets copied:** title, description, role. The new task gets a fresh `id`,
-empty `logs`, `status="recurrent"`, the current sprint's `sprint`/`sprint_id`,
-and its own `github_issue`. If the source title ended in ` - Sprint N`, the new
-title is re-suffixed with the current sprint (` - Sprint M`); titles without the
-suffix are copied verbatim.
-
-**Scope / safety:**
-- Default targets only the sprint immediately before the current one;
-  `--all-previous` sources every earlier sprint (deduped to one new task per base
-  name, most-recent source as template).
-- A series that already has a copy in the current sprint is skipped, so the
-  command is **safe to re-run** (won't double-create). Dedup uses
-  `_same_recurrent_series()`, a prefix-boundary match that tolerates
-  trailing-qualifier drift (e.g. `Ad-hoc Slack Questions - casanabria` in the
-  previous sprint vs `Ad-hoc Slack Questions` in the current one).
-- Aborts (empty result) if the current sprint can't be resolved.
-- Source tasks without a `github_repo` still get a new task created, but the
-  GitHub issue step is skipped and noted per result. New copies inherit the
-  source task's `github_repo`/`activity`/`type`.
-
-**CLI:**
-```bash
-wt new-recurrent                 # previous sprint only (default)
-wt new-recurrent --all-previous  # every earlier sprint
-wt new-recurrent --dry-run       # preview; combine with --all-previous
-```
-
-**Key functions in wt.py:**
-- `find_recurrent_tasks_to_recreate(data, all_previous=False) -> list[dict]` — planning/selection (suffix-or-recurrent detection, dedup, current-sprint skip); returns plan dicts `{source, new_title, role_id, description}` plus the source's `github_repo`/`activity`/`type` when set.
-- `_same_recurrent_series(a, b) -> bool` — prefix-boundary helper used for drift-tolerant current-sprint dedup.
-- `create_current_sprint_recurrent_tasks(data, save_callback, all_previous=False) -> dict` — creates each task + issue; returns `{error, current_sprint, results: [{title, role, issue, created, issue_created, project_updated, skipped_github, error}]}`.
+**Use instead:** `wt sync-sprints --all --create-issues` — one command that
+closes the sprint that just ended and opens the new one on the same task.
 
 ### Sprint Tracking
 
@@ -643,16 +581,18 @@ wt add "title" --sprint none        # Create task without sprint
 
 `wt split-sprint` still works as a deprecated alias for `wt sync-sprints`.
 
-**Two safety rules baked into `sync-sprints`:**
+**Two things to know about `sync-sprints`:**
 - `--all` **does not create issues** unless `--create-issues` is passed. A
   blanket run over a long history can want to mint a couple dozen issues for
   sprints predating this workflow; those show as
   `SKIP … re-run with --create-issues` rather than being silently bound
   issue-less. It always prints an itemised plan and prompts `Proceed? [Y/n]`
   (`--yes` to skip, `--dry-run` to print and exit).
-- **`recurrent` tasks are skipped** and reported as such. They're still one task
-  object per sprint, handled by `close-recurrent` / `new-recurrent`; unifying
-  them into a single task with one binding per sprint is a later phase.
+- **`recurrent` tasks are no longer skipped.** Phase 5 removed that
+  exclusion: a series is now one perpetual task with a binding per sprint, so
+  reconcile is exactly the right thing to run on it — it opens the new sprint's
+  issue and closes the one that just ended, which is what the retired
+  `close-recurrent` / `new-recurrent` pair used to do by hand.
 
 **Three task lifecycle patterns:**
 1. **Single-sprint**: fully contained in one sprint. One binding, no special handling.
@@ -1031,7 +971,7 @@ wt.save(data)
 - Don't read `task["github_issue"]` directly — use `task_current_issue(task, data)`. A task has one issue *per sprint*; the raw key is a legacy mirror of the current one.
 - Don't call `get_project_info()` in a per-task or per-field loop assuming it's cheap — it's two GraphQL calls. It's memoised now, but don't defeat that by passing `refresh=True` in a loop, and do pass `project_info=` down to the `update_project_*` helpers (they re-fetch when it's omitted).
 - **GraphQL, not REST, is the limit that bites.** `gh project` operations are GraphQL-backed with a 5000-point/hour budget; `gh api rate_limit` shows `resources.graphql` separately from `resources.core`. A rate-limited `gh project item-add` fails with `unknown owner type`, which looks like a config error but isn't.
-- Don't run or resurrect `wt close-recurrent` / `wt new-recurrent` / `close_previous_recurrent_tasks`. They are retired and hard-refuse. Their selection rule (`status == "recurrent"` + a prior-sprint `sprint_id`) matches the merged perpetual task, so running one would set a whole recurring series to done and close its live issue.
+- Don't resurrect `wt close-recurrent` / `wt new-recurrent` / `close_previous_recurrent_tasks`. They are retired, their planners are deleted, and only the refusal remains. The close side's selection rule (`status == "recurrent"` + a prior-sprint `sprint_id`) matches the merged perpetual task, so running it would set a whole recurring series to done and close its live issue; the recreate side would mint per-sprint clones of a perpetual task. `wt sync-sprints --all --create-issues` does the sprint rollover.
 - Don't give a `recurrent` task a carry-forward. Each sprint of a perpetual series keeps its own issue; re-pointing the last sprint's issue onto the new one strands the hours it carries.
 - Don't group recurring series by fuzzy title matching — use `RECURRENT_SERIES_ALIASES` / `recurrent_series_for_title()`. Real titles drifted three ways for one series.
 - Don't reintroduce a "does this task span sprints?" gate before reconciling. Reconcile is idempotent by construction; gates were how the old code needed 0-minute marker logs.

@@ -932,30 +932,49 @@ def test_creation_paths(wt, migrated, scratch):
     check(again["existed"] is True and again["task"] is res["task"],
           "…and dedupes off the binding even with no legacy key", str(again))
 
-    # new-recurrent / close-recurrent are RETIRED (Phase 5 merged the per-sprint
-    # clones into one perpetual task, and these commands' selection rule —
-    # status=="recurrent" + a prior-sprint sprint_id — matches that merged task,
-    # so running one would close a live recurring series). This used to assert
-    # that new-recurrent creates tasks with issues; that expectation is now
-    # exactly backwards, so it asserts the retirement instead.
+    # new-recurrent / close-recurrent are RETIRED, and since plan §13.5 item 1e
+    # the planners behind them are *deleted*, not merely unreachable.
+    #
+    # This section used to call the recreate planner and assert it "creates
+    # nothing for a merged series". That held for 13 days out of every 14 — only
+    # because mid-sprint every series already has a current-sprint copy. At the
+    # Sprint 106 boundary the same call selected all 7 perpetual series and ran
+    # the full create_github_issue → add_issue_to_project → … sequence for each,
+    # which under the post-Phase-5 model is wrong rather than obsolete: it mints
+    # per-sprint clones of tasks that are meant to be perpetual. So the assertion
+    # is now the retirement itself — absent functions and a refusing CLI — which
+    # is true on every day of the sprint.
     env3 = Env(wt, migrated, scratch / "create3.json")
-    with CliStubs(wt, mode="record", sprints=env3.sprints) as st3:
-        summary = wt.create_current_sprint_recurrent_tasks(env3.data, wt.save)
-    made = [r for r in summary["results"] if r.get("issue")]
-    check(summary["error"] is None and not made,
-          "the retired new-recurrent planner creates nothing for a merged series",
-          str(summary)[:300])
-    check(st3.count("create_github_issue") == 0,
-          "…and mints no GitHub issue", str(st3.names()))
-    check(wt.find_recurrent_tasks_to_recreate(env3.data) == [],
-          "…because no per-sprint clone is left to use as a template")
+    for gone in ("find_recurrent_tasks_to_recreate",
+                 "create_current_sprint_recurrent_tasks",
+                 "find_recurrent_tasks_to_close",
+                 "close_previous_sprint_recurrent_tasks"):
+        check(not hasattr(wt, gone), f"wt.{gone} is gone, not just unreachable")
+    src = (REPO / "wt.py").read_text()
+    check(not re.search(r"^def (find_recurrent_tasks_to_(close|recreate)|"
+                        r"(create_current_sprint|close_previous_sprint)_recurrent_tasks)",
+                        src, re.M),
+          "…and no definition survives in wt.py")
+    # mcp_server keeps the tool registered so a caller gets the explanation
+    # rather than a missing tool, but it must not import a planner any more.
+    mcp_src = (REPO / "mcp_server.py").read_text()
+    check("from wt import find_recurrent_tasks_to_close" not in mcp_src,
+          "mcp_server no longer imports the close-side planner")
+
+    disk_before = env3.path.read_bytes()
     for name, fn in (("close-recurrent", wt.cmd_close_recurrent),
                      ("new-recurrent", wt.cmd_new_recurrent)):
-        with CliStubs(wt, mode="strict", sprints=env3.sprints) as st4:
-            out, code = run_cmd(wt, fn, ["--dry-run"])
-        check(code == 2 and "has been retired" in out and st4.calls == [],
-              f"`wt {name}` hard-refuses (exit 2, no GitHub call)",
-              f"code={code} {out[:160]!r}")
+        for argv in ([], ["--dry-run"], ["--all-previous"]):
+            with CliStubs(wt, mode="strict", sprints=env3.sprints) as st4:
+                out, code = run_cmd(wt, fn, argv)
+            shown = " ".join(["wt", name, *argv])
+            check(code == 2 and "has been retired" in out and st4.calls == [],
+                  f"`{shown}` hard-refuses (exit 2, no GitHub call)",
+                  f"code={code} {out[:160]!r}")
+        check("sync-sprints" in out, f"…and `wt {name}` names its replacement",
+              out[:200])
+    check(env3.path.read_bytes() == disk_before,
+          "…and six refusals left the data file byte-identical")
 
 
 class FakeGhAddIssue:
