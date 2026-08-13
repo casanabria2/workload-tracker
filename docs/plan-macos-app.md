@@ -943,6 +943,44 @@ app's sync sheet does — will report hours that were never logged in that sprin
 Not present in the live data (no Sprint 106 bindings exist yet), so this is a
 latent correctness bug, not current damage.
 
+### 1g. The harnesses have rotted again — this time in the *checker*
+
+Phase 0.5 fixed characterisation tests pinned to one afternoon's data by deriving
+expectations from the fixture at runtime. The same rot has returned by a
+different route, and it will keep returning until this is fixed.
+
+Proven by A/B on **identical code** (`a4c0678`), same commit, two fixtures:
+
+| Fixture | `test_reconcile` | `test_wt_api` |
+|---|---|---|
+| Live data, 2026-08-13 | 123/126 | 152/157 |
+| Backup, 2026-08-06 | **all pass** | **all pass** |
+
+So nothing regressed in the code. What changed is the data: a sprint rolled over,
+the ritual created Sprint 106 bindings, a task was closed by hand and a new one
+added.
+
+The root cause is **`check_invariants.py`, not the tests**. The harnesses
+*demigrate* each recurrent series into per-sprint clones and re-migrate, then
+assert every binding traceable to a shadow is `state: "closed"` with a numeric
+`hours_synced`. A live current-sprint binding is legitimately `state: "open"` with
+`hours_synced: None`, so the moment a fresh sprint exists the check fails:
+
+```
+x [6/shadow-binding-hours] '1:1 with TomD' Sprint 106 hours_synced None, expected 0.0
+x [6/shadow-binding-state] '1:1 with TomD' Sprint 106 state 'open', expected 'closed'
+```
+
+**The owner's live data passes `check_invariants` cleanly** — this only bites the
+reconstructed fixture.
+
+Fix: teach the shadow-binding checks to exempt the current sprint (an open,
+unsynced binding is the correct state for it), and re-audit the remaining
+fixture-coupled assertions in `test_wt_api` — `edit_log`/`split_log`/`merge_logs`
+pick a log by prefix and assume its minutes. Until then, every harness run needs
+its results read against the *data of the day*, which is precisely the ambiguity
+Phase 0.5 set out to remove.
+
 ### 2. Collapse the daemon's `_guarded_load()`
 
 `wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
