@@ -100,11 +100,36 @@ private struct SidebarFooter: View {
     @Environment(Store.self) private var store
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Divider()
-            if let task = store.activeTimerTask, let elapsed = store.activeTimerElapsed {
-                HStack(spacing: 6) {
-                    Image(systemName: "record.circle")
+            timerPill
+            if let sprint = store.currentSprint {
+                Text("\(sprint.displayName) · "
+                     + Duration.formatZeroed(minutes: store.currentSprintMinutes))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// **The timer pill** — plan §11 names it explicitly as a Liquid Glass
+    /// surface. It is chrome: a floating status control over the sidebar's
+    /// list, not content within it.
+    ///
+    /// The start/stop control is the whole pill, and it goes through
+    /// `Store.toggleTimer` — the same call `⌘T` makes.
+    @ViewBuilder
+    private var timerPill: some View {
+        Button {
+            _Concurrency.Task { await store.toggleTimer() }
+        } label: {
+            HStack(spacing: 8) {
+                if let task = store.activeTimerTask, let elapsed = store.activeTimerElapsed {
+                    Image(systemName: "stop.circle")
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.red)
                     VStack(alignment: .leading, spacing: 1) {
@@ -112,26 +137,43 @@ private struct SidebarFooter: View {
                         Text(Duration.formatElapsed(elapsed))
                             .font(.caption.monospacedDigit().weight(.semibold))
                     }
+                } else {
+                    Image(systemName: "play.circle")
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                    Text(store.menuTask == nil
+                         ? "No timer running"
+                         : "Start “\(store.menuTask?.title ?? "")”")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Timer running on \(task.title), "
-                                    + "\(Duration.formatElapsed(elapsed)) elapsed")
-            } else {
-                Label("No timer running", systemImage: "pause.circle")
-                    .symbolRenderingMode(.hierarchical)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
             }
-
-            if let sprint = store.currentSprint {
-                Text("\(sprint.displayName) · "
-                     + Duration.formatZeroed(minutes: store.currentSprintMinutes))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(.rect)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .buttonStyle(.plain)
+        .glassEffect(.regular, in: .rect(cornerRadius: 10))
+        .disabled(!store.canToggleTimer)
+        .help(timerHelp)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(timerAccessibilityLabel)
+        .accessibilityHint("Starts or stops the timer. \(AppShortcut.toggleTimer.display)")
+    }
+
+    private var timerHelp: String {
+        store.snapshot?.activeTimer == nil
+            ? "Start the timer on the selected task (\(AppShortcut.toggleTimer.display))"
+            : "Stop the running timer and log the session (\(AppShortcut.toggleTimer.display))"
+    }
+
+    private var timerAccessibilityLabel: String {
+        guard let task = store.activeTimerTask, let elapsed = store.activeTimerElapsed
+        else { return "No timer running" }
+        return "Timer running on \(task.title), "
+            + "\(Duration.formatElapsed(elapsed)) elapsed"
     }
 }

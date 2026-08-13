@@ -72,6 +72,18 @@ struct FilterState: Codable, Equatable, Sendable {
         self.text = text
     }
 
+    /// The same state with the free text dropped.
+    ///
+    /// Used to decide whether a change is worth registering with the
+    /// `UndoManager` (plan §11). Typing in the search field is undone by the
+    /// text field's own stack; registering per keystroke here would bury the
+    /// facet changes — the ones with no other way back — underneath it.
+    var withoutText: FilterState {
+        var copy = self
+        copy.text = ""
+        return copy
+    }
+
     /// One facet selected, everything else open. The shape `FacetCatalog` uses
     /// to count an option, so a menu count always equals what picking it yields.
     init(facet: Facet, value: String) {

@@ -17,11 +17,22 @@ struct TaskCardView: View {
     /// "moved" and "moved and confirmed" are not the same picture — a rollback
     /// has to look like something reverting, not like a card teleporting.
     var isPending: Bool = false
+    /// Whether the board has keyboard focus. The selected card is the keyboard
+    /// cursor, so it must look like the cursor **only** while the keys would
+    /// actually move it (plan §11: "visible focus rings").
+    var isBoardFocused: Bool = false
+    /// The card's actions, offered to VoiceOver as custom actions so the
+    /// context menu is reachable without a right-click (plan §11: "a custom
+    /// action set matching its context menu"). Empty in previews.
+    var actions: [(name: String, perform: () -> Void)] = []
+
+    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiate
 
     private var isRunning: Bool { elapsed != nil }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 8) {
             header
             HStack(spacing: 8) {
                 RoleChip(label: roleLabel, color: roleColor)
@@ -29,19 +40,19 @@ struct TaskCardView: View {
                 hours
             }
             if !badges.isEmpty {
-                FlowRow(spacing: 5) {
+                FlowRow(spacing: 4) {
                     ForEach(badges, id: \.text) { badge in
                         Badge(text: badge.text, symbol: badge.symbol)
                     }
                 }
             }
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.background.secondary, in: .rect(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(borderColor, lineWidth: isRunning || isSelected ? 2 : 1)
+                .strokeBorder(borderColor, lineWidth: borderWidth)
         }
         // Bottom-trailing, not top: the top-right corner is where a running
         // timer's m:ss label lives, and the two collided.
@@ -54,21 +65,56 @@ struct TaskCardView: View {
             }
         }
         .opacity(isPending ? 0.6 : 1)
+        // One accessible element with a custom action set (plan §11), rather
+        // than eight children a VoiceOver user has to walk through to learn one
+        // card's worth of facts.
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityDescription)
+        .accessibilityValue(Duration.formatZeroed(minutes: task.reportableMins))
+        .accessibilityHint(isSelected
+                           ? "Command left and right arrow move this card between columns."
+                           : "Arrow keys move the selection.")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityActions {
+            ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                Button(action.name, action: action.perform)
+            }
+        }
     }
 
     /// Running beats selected: a live timer is a fact about the data, selection
     /// is a fact about the cursor.
+    ///
+    /// With **Increase Contrast** on, the resting border stops being a hairline
+    /// tint and becomes a visible edge — `0.08` alpha is exactly the sort of
+    /// value that vanishes under the setting that exists to stop things
+    /// vanishing.
     private var borderColor: Color {
         if isRunning { return .accentColor }
-        if isSelected { return .secondary }
-        return .primary.opacity(0.08)
+        if isSelected { return isBoardFocused ? .accentColor : .secondary }
+        return .primary.opacity(contrast == .increased ? 0.35 : 0.08)
+    }
+
+    /// The focused selection gets the thickest edge: it is the keyboard cursor,
+    /// and a cursor you cannot find is not a cursor.
+    private var borderWidth: CGFloat {
+        if isSelected && isBoardFocused { return 3 }
+        if isRunning || isSelected { return 2 }
+        return contrast == .increased ? 1.5 : 1
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            // Selection carried by a shape as well as by the border, for
+            // `accessibilityDifferentiateWithoutColor` — the border alone is a
+            // colour difference, which is precisely what that setting says not
+            // to rely on.
+            if differentiate && isSelected {
+                Image(systemName: "chevron.right.circle.fill")
+                    .symbolRenderingMode(.hierarchical)
+                    .font(.caption)
+                    .accessibilityHidden(true)
+            }
             Text(task.title)
                 .font(.headline)
                 .lineLimit(2)
@@ -76,10 +122,21 @@ struct TaskCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             if let elapsed {
-                Text(Duration.formatElapsed(elapsed))
-                    .font(.caption.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .accessibilityLabel("Running, \(Duration.formatElapsed(elapsed))")
+                // The symbol is unconditional rather than gated on the
+                // differentiate setting: a running timer is the most consequential
+                // state a card has, and "accent-coloured text" was its only
+                // distinguishing mark.
+                Label {
+                    Text(Duration.formatElapsed(elapsed))
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                } icon: {
+                    Image(systemName: "record.circle")
+                        .symbolRenderingMode(.hierarchical)
+                        .font(.caption)
+                }
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(Color.accentColor)
+                .accessibilityLabel("Running, \(Duration.formatElapsed(elapsed))")
             }
         }
     }

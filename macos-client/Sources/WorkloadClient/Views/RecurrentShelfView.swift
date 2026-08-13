@@ -107,7 +107,7 @@ struct RecurrentShelfView: View {
                     // it is not the selected one, which a plain `.contextMenu`
                     // on a `Table` does not.
                     if let id = ids.first, let task = tasks.first(where: { $0.id == id }) {
-                        ShelfActionMenu(task: task)
+                        TaskActionMenu(task: task)
                     }
                 }
             }
@@ -172,28 +172,33 @@ struct RecurrentShelfView: View {
 
 // MARK: - The row action menu
 
-/// The shelf's five row actions, in `ShelfAction.menu` order.
+/// A task's actions, in `TaskAction.menu(for:)` order.
 ///
-/// One view, used by both the context menu and the Task menu, so the two cannot
-/// present different items or a different order. In particular **`End Series`
-/// is last, separated, destructive-styled, and carries no keyboard shortcut** —
-/// all four properties are asserted in `ShelfActionTests`.
-struct ShelfActionMenu: View {
+/// **One view, four surfaces**: the shelf's row context menu, the board card's
+/// context menu, the inspector's button row and the menu bar's Task menu. They
+/// cannot present different items, a different order or a different gate,
+/// because they all read one table.
+///
+/// Phase 8 widened it from `ShelfAction` to `TaskAction` so board cards get the
+/// same treatment; `End Series` is still last, separated, destructive-styled and
+/// **without a keyboard shortcut** — asserted in `ShelfActionTests` and again in
+/// `TaskActionTests` — and is still offered only on recurrent tasks.
+struct TaskActionMenu: View {
     let task: TrackerTask
     @Environment(Store.self) private var store
 
     var body: some View {
-        ForEach(ShelfAction.menu) { action in
+        ForEach(TaskAction.menu(for: task)) { action in
             if action.isSeparatedInMenu { Divider() }
             item(action)
         }
     }
 
     @ViewBuilder
-    private func item(_ action: ShelfAction) -> some View {
+    private func item(_ action: TaskAction) -> some View {
         let availability = action.availability(
             for: task, isTimerRunning: store.isTimerRunning(on: task))
-        Button(role: action == .endSeries ? .destructive : nil) {
+        Button(role: action.isDestructive ? .destructive : nil) {
             _Concurrency.Task { await store.perform(action, on: task) }
         } label: {
             Label(action.title, systemImage: action.systemImage)
@@ -202,17 +207,20 @@ struct ShelfActionMenu: View {
         .help(availability.reason ?? helpText(action))
     }
 
-    private func helpText(_ action: ShelfAction) -> String {
+    private func helpText(_ action: TaskAction) -> String {
         switch action {
-        case .startTimer: "Start the timer on this task"
-        case .logTime: "Add a time entry to this task"
-        case .openIssue: "Open \(task.currentIssue ?? "the issue") in your browser"
-        case .syncSprints:
+        case .shelf(.startTimer): "Start the timer on this task"
+        case .shelf(.logTime): "Add a time entry to this task"
+        case .shelf(.openIssue): "Open \(task.currentIssue ?? "the issue") in your browser"
+        case .shelf(.syncSprints):
             "Preview reconciling this task's per-sprint issues. "
             + "Shows a dry run before anything is sent."
-        case .endSeries:
+        case .shelf(.endSeries):
             "Ends the recurrence and closes the live GitHub issue. "
             + "Asks you to type the series name first."
+        case .markDone:
+            "Close this task. Shows the plan — hours, issues, sprints — "
+            + "before anything is sent."
         }
     }
 }

@@ -63,6 +63,28 @@ final class Store {
     /// Whether the recurrent shelf is expanded.
     var showsRecurrentShelf: Bool = true
 
+    // MARK: - Phase 8 chrome state
+
+    /// Whether the trailing task inspector is open (plan §11: "a panel, not a
+    /// modal, because it's inspection of a selection"). Persisted by `RootView`
+    /// via `@SceneStorage`.
+    var showsInspector: Bool = false
+
+    /// Bumped by the **Find** command; the search field watches it and takes
+    /// focus.
+    ///
+    /// A counter rather than a `Bool` because the request has to be repeatable:
+    /// a flag that is already `true` produces no `onChange`, so pressing `⌘F`
+    /// twice after clicking away would do nothing the second time.
+    private(set) var searchFocusRequests: Int = 0
+
+    /// Which surface last moved its selection, so the Task menu knows whose
+    /// task it is acting on. See `TaskSurface`.
+    private(set) var lastSelectionSurface: TaskSurface = .board
+
+    /// Whether **Help ▸ Keyboard Shortcuts** is open.
+    var showsShortcutHelp: Bool = false
+
     // MARK: - Phase 7 timeline state
 
     /// The Gantt's zoom level (plan §10). Held here rather than in the view so
@@ -494,6 +516,47 @@ final class Store {
 
     var isFiltering: Bool { !filter.isEmpty }
 
+    /// **What a VoiceOver user is told when the filter changes** (plan §11:
+    /// "Active filters announced when they change, so a VoiceOver user isn't
+    /// looking at a silently-reduced board").
+    ///
+    /// It names the facets and the resulting count, because the count is the
+    /// part that is otherwise invisible: a filter that removes nothing and a
+    /// filter that removes everything read identically if all you hear is
+    /// "filtering by Role".
+    ///
+    /// Pure and derived, so the announcement and the screen cannot drift, and so
+    /// the wording is assertable without a screen reader.
+    var filterAnnouncement: String {
+        let shown = filteredTasks.count
+        let total = tasks.count
+        guard isFiltering else {
+            return "Filters cleared. \(total) task\(total == 1 ? "" : "s") shown."
+        }
+        var parts: [String] = Facet.allCases.compactMap { facet in
+            let values = filter[facet]
+            guard !values.isEmpty else { return nil }
+            return "\(facet.displayName): "
+                + values.map { facets.label(for: $0, in: facet) }.sorted()
+                    .joined(separator: ", ")
+        }
+        let text = filter.text.trimmingCharacters(in: .whitespaces)
+        if !text.isEmpty { parts.append("search “\(text)”") }
+        let scope = parts.isEmpty ? "Filtered" : "Filtering by " + parts.joined(separator: "; ")
+        return "\(scope). \(shown) of \(total) tasks shown."
+    }
+
+    /// Replaces the whole filter in one step — the shape an **undo** needs.
+    ///
+    /// `clearFilters`/`toggle`/`clear` are the user-facing mutators; this one is
+    /// for restoring a previous value wholesale, and it releases the timeline
+    /// anchor for the same reason they do.
+    func applyFilter(_ state: FilterState) {
+        didSeedDefaultSprint = true
+        filter = state
+        releaseTimelineAnchor()
+    }
+
     /// Turns one facet value on or off. The sidebar's Roles rows and the
     /// toolbar's facet menu both come through here — plan §8.4's "one state, two
     /// views of it" is enforced by there being no other mutator.
@@ -673,6 +736,67 @@ final class Store {
     /// which is what keeps the Board's cursor on the same card.
     func selectTask(_ id: String?) {
         boardSelection = id
+        if id != nil { lastSelectionSurface = .board }
+    }
+
+    // MARK: - Phase 8: the task the menu bar acts on
+
+    /// The selected **board** card, resolved against the current snapshot.
+    var boardSelectedTask: TrackerTask? {
+        guard let id = boardSelection else { return nil }
+        return tasks.first { $0.id == id }
+    }
+
+    /// **The task the Task menu and the inspector act on.**
+    ///
+    /// Two selections exist at once — a board card and a shelf row — and both
+    /// surfaces are visible together, so "the selection" is only well defined
+    /// once you say which one moved last. That is `lastSelectionSurface`; the
+    /// other surface is the fallback, so a menu is never dead merely because
+    /// focus is on the pane whose selection is empty.
+    var menuTask: TrackerTask? {
+        switch lastSelectionSurface {
+        case .shelf: selectedShelfTask ?? boardSelectedTask
+        case .board: boardSelectedTask ?? selectedShelfTask
+        }
+    }
+
+    /// The Task menu's items for the current target, empty when there is none.
+    var menuActions: [TaskAction] {
+        menuTask.map(TaskAction.menu(for:)) ?? []
+    }
+
+    /// Dispatches a `TaskAction`. The board's context menu, the shelf's context
+    /// menu and the menu bar all come through here, so the three cannot diverge
+    /// on what an action does or on what gates it.
+    func perform(_ action: TaskAction, on task: TrackerTask) async {
+        guard action.availability(for: task, isTimerRunning: isTimerRunning(on: task))
+            .isAvailable else { return }
+        switch action {
+        case .shelf(let shelfAction):
+            await perform(shelfAction, on: task)
+        case .markDone:
+            await beginClose(task)
+        }
+    }
+
+    /// `⌘T`. Stops a running timer, starts one on the menu's task when idle.
+    func toggleTimer() async {
+        if snapshot?.activeTimer != nil {
+            await stopTimer()
+        } else if let task = menuTask {
+            await startTimer(on: task)
+        }
+    }
+
+    /// Whether `⌘T` would do anything right now.
+    var canToggleTimer: Bool {
+        snapshot?.activeTimer != nil || menuTask != nil
+    }
+
+    /// `⌘F`. Asks the search field to take focus.
+    func focusSearchField() {
+        searchFocusRequests &+= 1
     }
 
     // MARK: - Optimistic status
@@ -928,7 +1052,16 @@ final class Store {
     /// The Log Time sheet, or `nil` when none is open.
     private(set) var logSheet: LogSheetState?
     /// The shelf row the Task menu acts on.
-    var shelfSelection: String?
+    ///
+    /// Written directly by the `Table`'s selection binding, which is why the
+    /// surface bookkeeping is a `didSet` rather than a setter method — there is
+    /// no call site to put it in.
+    var shelfSelection: String? {
+        didSet {
+            guard shelfSelection != oldValue, shelfSelection != nil else { return }
+            lastSelectionSurface = .shelf
+        }
+    }
 
     /// The operation id of a running reconcile, so SSE `progress` and `error`
     /// events route to the sync sheet instead of the connection state.

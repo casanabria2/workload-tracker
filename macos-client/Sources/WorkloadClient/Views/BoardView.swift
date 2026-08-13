@@ -119,8 +119,10 @@ struct BoardView: View {
                              set: { if $0 == nil { store.dismissLogSheet() } })) { sheet in
             LogTimeSheetView(sheet: sheet).environment(store)
         }
-        // The Task menu acts on the shelf row the menu bar can see.
-        .focusedSceneValue(\.shelfTask, store.selectedShelfTask)
+        // The Task menu acts on whichever selection moved last — a board card
+        // or a shelf row. `Store.menuTask` owns that precedence rule, so the
+        // menu never has to guess.
+        .focusedSceneValue(\.trackerTask, store.menuTask)
         .filterSearchField(store)
         .toolbar {
             ToolbarItem(placement: .status) {
@@ -131,9 +133,14 @@ struct BoardView: View {
             ToolbarItem {
                 Toggle(isOn: $store.showsRecurrentShelf) {
                     Label("Recurrent Shelf", systemImage: "tray.2")
+                        .symbolRenderingMode(.hierarchical)
                 }
-                .help("Show or hide the recurrent task shelf")
-                .keyboardShortcut("r", modifiers: [.command, .option])
+                // **No `.keyboardShortcut` here any more.** `⌥⌘R` moved to the
+                // View menu (`ViewCommands`), which is where it is discoverable
+                // and where it is registered exactly once — a toolbar control
+                // only carries its shortcut while its view is on screen, and a
+                // shortcut bound in two places is a collision with itself.
+                .help("Show or hide the recurrent task shelf (\(AppShortcut.toggleShelf.display))")
             }
         }
     }
@@ -152,11 +159,27 @@ struct BoardView: View {
                                 unfilteredTasks: store.boardTasks(status),
                                 dragging: $dragging,
                                 selection: Binding(get: { store.boardSelection },
-                                                   set: { store.selectTask($0) }))
+                                                   set: { store.selectTask($0) }),
+                                isBoardFocused: boardFocused)
                     if index < TaskStatus.boardColumns.count - 1 {
                         Divider()
                     }
                 }
+            }
+            // Plan §11: "`.backgroundExtensionEffect()` where the board scrolls
+            // under the toolbar."
+            //
+            // Applied to a **backdrop fill**, never to the columns themselves:
+            // the effect mirrors and blurs its content into the safe area, so
+            // putting it on the cards would draw ghost cards under the toolbar.
+            // On a plain surface it does the one thing it is for — carries the
+            // board's own ground up behind the glass toolbar instead of ending
+            // at a hard edge.
+            .background {
+                Rectangle()
+                    .fill(.background)
+                    .backgroundExtensionEffect()
+                    .ignoresSafeArea()
             }
         }
     }
@@ -248,9 +271,13 @@ struct FeedbackBar: View {
             .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.5))
+        // Liquid Glass, plan §11 — **floating chrome**, which is what this bar
+        // is: it sits over the board rather than in it, and it comes and goes.
+        // Glass is explicitly *not* applied to the cards underneath, where it
+        // would cost legibility on text-dense content for no gain.
+        .glassEffect(.regular, in: .rect(cornerRadius: 0))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isStaticText)
         .transition(.move(edge: .top).combined(with: .opacity))
@@ -295,8 +322,14 @@ struct BoardColumn: View {
     let unfilteredTasks: [TrackerTask]
     @Binding var dragging: TaskDragPayload?
     @Binding var selection: String?
+    /// Whether the board itself has keyboard focus, so the selected card can
+    /// look like a cursor only while the keys would move it.
+    var isBoardFocused: Bool = false
 
     @Environment(Store.self) private var store
+    /// Plan §11: "Honour `accessibilityReduceMotion` (cross-fade instead of card
+    /// spring)."
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isTargeted = false
     @State private var hoverY: CGFloat?
     @State private var columnHeight: CGFloat = 0
@@ -324,7 +357,18 @@ struct BoardColumn: View {
             Divider()
             body(for: tasks)
         }
-        .frame(minWidth: 260, maxWidth: .infinity, maxHeight: .infinity)
+        // **220, not the 260 this was through Phase 7.**
+        //
+        // Three columns at 260 put a hard 780pt floor under the detail pane,
+        // and with the sidebar and the new trailing inspector either side of it
+        // the window's content minimum exceeded its own default width — so the
+        // inspector opened *outside* the window and was drawn clipped to a
+        // 40pt strip. `windowResizability(.contentMinSize)` sets a floor; it
+        // does not grow a window that already exists.
+        //
+        // A card is legible at 220: the title wraps to two lines either way,
+        // and the badges already use a wrapping `FlowRow`.
+        .frame(minWidth: 220, maxWidth: .infinity, maxHeight: .infinity)
         .background {
             GeometryReader { proxy in
                 Color.clear.onChange(of: proxy.size.height, initial: true) { _, height in
@@ -422,8 +466,11 @@ struct BoardColumn: View {
                             InsertionIndicator()
                         }
                     }
-                    .padding(10)
-                    .animation(.snappy(duration: 0.18), value: insertionRow)
+                    .padding(12)
+                    // Cross-fade rather than spring when Reduce Motion is on.
+                    .animation(reduceMotion ? .easeInOut(duration: 0.12)
+                                            : .snappy(duration: 0.18),
+                               value: insertionRow)
                 }
                 .onChange(of: hoverY) { _, y in autoScroll(to: y, proxy: proxy, tasks: tasks) }
                 .onChange(of: isTargeted) { _, targeted in
@@ -443,7 +490,9 @@ struct BoardColumn: View {
             elapsed: elapsed(for: task),
             currentSprint: store.currentSprint,
             isSelected: selection == task.id,
-            isPending: store.pendingStatus[task.id] != nil)
+            isPending: store.pendingStatus[task.id] != nil,
+            isBoardFocused: isBoardFocused && selection == task.id,
+            actions: accessibilityActions(for: task))
         .onTapGesture { selection = task.id }
         .contextMenu { menu(for: task) }
         // Recurrent cards are not draggable at all, so the prohibition is felt
@@ -451,19 +500,60 @@ struct BoardColumn: View {
         .modifier(DraggableIfAllowed(payload: payload, dragging: $dragging))
     }
 
+    /// The card's context menu.
+    ///
+    /// Plan §11: "Every menu action is also a card context menu." Through Phase
+    /// 7 this offered only column moves, so the four actions in the menu bar had
+    /// no context-menu equivalent on the board at all. `TaskActionMenu` is the
+    /// same view the shelf and the inspector use, so the surfaces cannot drift.
+    ///
+    /// The moves stay, above it: they are the board's own verb and have no
+    /// menu-bar home (`⌘←`/`⌘→` are the Board's key handler, deliberately not
+    /// menu items — see `AppShortcut`).
     @ViewBuilder
     private func menu(for task: TrackerTask) -> some View {
-        ForEach(TaskStatus.boardColumns, id: \.rawValue) { target in
+        // `.done` is **not** in this loop any more. A Done drop and
+        // `TaskAction.markDone` are literally the same call — both land on
+        // `Store.beginClose` — so listing both put two identically-behaved items
+        // in one menu under two names.
+        ForEach(TaskStatus.boardColumns.filter { $0 != .done }, id: \.rawValue) { target in
             let payload = TaskDragPayload(taskId: task.id,
                                           sourceStatus: store.effectiveStatus(of: task))
             if case .rejected = BoardDropRules.decide(payload, to: target) {
                 EmptyView()
             } else {
-                Button(target == .done ? "Close Task…" : "Move to \(target.displayName)") {
+                Button("Move to \(target.displayName)") {
                     _Concurrency.Task { await store.perform(drop: payload, on: target) }
                 }
             }
         }
+        Divider()
+        TaskActionMenu(task: task)
+    }
+
+    /// The context menu as VoiceOver custom actions — the same items, in the
+    /// same order, so a keyboard-and-speech user is not offered a smaller app.
+    private func accessibilityActions(for task: TrackerTask)
+        -> [(name: String, perform: () -> Void)] {
+        let payload = TaskDragPayload(taskId: task.id,
+                                      sourceStatus: store.effectiveStatus(of: task))
+        var out: [(String, () -> Void)] = TaskStatus.boardColumns
+            .filter { $0 != .done }
+            .compactMap { target in
+                if case .rejected = BoardDropRules.decide(payload, to: target) { return nil }
+                return ("Move to \(target.displayName)", {
+                    _Concurrency.Task { await store.perform(drop: payload, on: target) }
+                })
+            }
+        out += TaskAction.menu(for: task).compactMap { action in
+            guard action.availability(for: task,
+                                      isTimerRunning: store.isTimerRunning(on: task))
+                .isAvailable else { return nil }
+            return (action.title, {
+                _Concurrency.Task { await store.perform(action, on: task) }
+            })
+        }
+        return out.map { (name: $0.0, perform: $0.1) }
     }
 
     /// Spring-loaded scrolling: hovering near a column's top or bottom edge

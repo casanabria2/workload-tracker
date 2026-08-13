@@ -121,6 +121,43 @@ plutil -lint "$CONTENTS/Info.plist" >/dev/null || die "copied Info.plist failed 
 # Legacy, tiny, and still what a few Finder/LaunchServices paths look at first.
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 
+# ------------------------------------------------------------ localization
+#
+# Plan §11: "String catalog from day one even though only `en` ships."
+#
+# The catalog cannot be a SwiftPM resource. SwiftPM **copies** an `.xcstrings`
+# verbatim (measured: the build log says "Copying Localizable.xcstrings") rather
+# than compiling it, and it lands in `WorkloadClient_WorkloadClient.bundle` —
+# whereas SwiftUI's `Text("…")` looks its key up in **`Bundle.main`**, which for
+# a packaged app is `Contents/Resources`. So the catalog is compiled here, by
+# the same tool Xcode uses, straight into the app bundle.
+#
+# `swift run` (unbundled) therefore has no catalog and falls back to the literal
+# keys, which for `en` is byte-identical output. That is the point: the fallback
+# is the source language, so a missing catalog can never change what is on
+# screen — only an added *translation* could.
+readonly CATALOG="$SCRIPT_DIR/Resources/Localizable.xcstrings"
+readonly XCSTRINGSTOOL="$(xcrun --find xcstringstool 2>/dev/null || true)"
+if [[ -f "$CATALOG" ]]; then
+    if [[ -x "$XCSTRINGSTOOL" ]]; then
+        step "Compiling the string catalog"
+        "$XCSTRINGSTOOL" compile "$CATALOG" \
+            --output-directory "$CONTENTS/Resources" \
+            || die "xcstringstool failed on $CATALOG"
+        # `en.lproj/Localizable.strings` is the only artefact this catalog can
+        # produce; asserting it means a silently-empty compile fails here rather
+        # than shipping a bundle whose strings table is missing.
+        [[ -f "$CONTENTS/Resources/en.lproj/Localizable.strings" ]] \
+            || die "the catalog compiled but produced no en.lproj/Localizable.strings"
+        printf '    %s strings\n' \
+            "$(plutil -convert json -o - "$CONTENTS/Resources/en.lproj/Localizable.strings" \
+               | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?')"
+    else
+        printf '    warning: xcstringstool not found; shipping without a compiled catalog\n'
+        printf '             (en falls back to the source strings, so nothing breaks)\n'
+    fi
+fi
+
 # Assert the declaration that this whole phase exists to add, so a future edit
 # that drops it fails here instead of silently re-breaking the board drag.
 plutil -extract UTExportedTypeDeclarations.0.UTTypeIdentifier raw -o - "$CONTENTS/Info.plist" \

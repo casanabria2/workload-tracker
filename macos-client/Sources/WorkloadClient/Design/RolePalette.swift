@@ -85,6 +85,15 @@ enum RolePalette {
     static func colors(for roles: [Role]) -> [Color] {
         roles.enumerated().map { color(for: $1, index: $0) }
     }
+
+    /// Whether a stored color name got a **position-assigned** color rather
+    /// than a named one. Settings ▸ Appearance says which is which, so a role
+    /// showing teal when the data file says `white` is explained rather than
+    /// mysterious.
+    static func isAssigned(_ colorName: String?) -> Bool {
+        let key = (colorName ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        return unspecified.contains(key) || named[key] == nil
+    }
 }
 
 // MARK: - Chip

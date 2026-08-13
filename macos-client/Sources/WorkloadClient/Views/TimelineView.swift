@@ -239,6 +239,11 @@ struct TimelineView: View {
         .chartScrollableAxes(.vertical)
         .chartYVisibleDomain(length: visibleRows)
         .chartLegend(.hidden)
+        // Plan §11: "`.accessibilityChartDescriptor` on the Gantt so VoiceOver
+        // can read the timeline." Built from the same `TimelineData` the marks
+        // above are built from — see `TimelineChartDescriptor`.
+        .accessibilityChartDescriptor(TimelineChartDescriptor(data: data))
+        .accessibilityLabel("Gantt chart of logged time")
         .chartOverlay { proxy in
             GeometryReader { geometry in
                 Rectangle()

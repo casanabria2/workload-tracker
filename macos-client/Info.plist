@@ -37,6 +37,15 @@
     <key>CFBundleDisplayName</key>
     <string>Workload Tracker</string>
 
+    <!--
+      The source language of Resources/Localizable.xcstrings, which make-app.sh
+      compiles into Contents/Resources/en.lproj (plan §11, "String catalog from
+      day one"). Without this key the bundle has no development region and a
+      lookup that misses falls through to the key rather than to `en`.
+    -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundlePackageType</key>

@@ -95,6 +95,10 @@ extension View {
 
 private struct FilterSearchField: ViewModifier {
     @Bindable var store: Store
+    /// Driven by **Edit ▸ Find** (`⌘F`). `.searchFocused` is the only supported
+    /// way to move focus into a `.searchable` field from outside it; a menu
+    /// command cannot reach the field directly.
+    @FocusState private var searchFocused: Bool
 
     func body(content: Content) -> some View {
         content.searchable(
@@ -130,6 +134,10 @@ private struct FilterSearchField: ViewModifier {
             Text(token.label)
                 .accessibilityLabel(token.display)
         }
+        .searchFocused($searchFocused)
+        // A counter, not a flag: pressing ⌘F twice must focus twice, and a
+        // `Bool` already `true` produces no `onChange`.
+        .onChange(of: store.searchFocusRequests) { _, _ in searchFocused = true }
     }
 }
 

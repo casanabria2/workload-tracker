@@ -176,12 +176,78 @@ would not be. To add it later: author `AppIcon.icns` in Icon Composer, drop it i
 `Contents/Resources/` from `make-app.sh`, and add `CFBundleIconFile` /
 `CFBundleIconName` to `Info.plist`.
 
-## Not done in Phase 9
+Phase 8 did not change this. There is still no icon, for the same reason.
+
+## Native polish (Phase 8, plan §11)
+
+### The keyboard shortcut table is code
+
+`Design/AppShortcuts.swift` is the single source of every shortcut the app
+registers, and the menus read from it — `View.shortcut(_:)` is the only way one
+gets attached. Two things fall out of that and are asserted in
+`AppShortcutTests`: **no two entries collide**, and `Help ▸ Keyboard Shortcuts`
+(rendered from the same table) cannot disagree with the bindings.
+
+The table includes `⌘←`/`⌘→`, which no menu binds — they are the Board's own
+`onKeyPress` handlers. They are listed anyway because a menu-bar shortcut *wins*
+over a view's key handler, so a new `⌘←` menu item would silently retire the
+board's keyboard card-move with nothing going red. That is exactly why the
+Timeline's timeframe navigation is `⌥←`/`⌥→`.
+
+`⌘Z`/`⇧⌘Z` are deliberately **not** in the table. They stay AppKit's, routed
+through the responder chain, so a text field undoes its own typing; `RootView`
+registers filter changes with the window's `UndoManager` so Edit ▸ Undo picks
+them up. Only local-only mutations are undoable — no write is, and deliberately:
+there is no un-close and no un-`gh issue close`.
+
+### The inspector is a pane, not `.inspector`
+
+Plan §11 says "trailing `.inspector`". It was written that way twice — on the
+`NavigationSplitView`, then on the detail column — and neither worked. Measured
+on a freshly-cleared profile at the app's own default window size:
+
+* the panel did not appear at all (menu item present and enabled, zero pixels
+  changed); dragged out to 2200pt by hand it appeared instantly;
+* with *some* room it drew clipped to a 97–130pt strip of its content.
+  `.inspectorColumnWidth(min: 300, …)` did not move it, and nor did an explicit
+  `.frame(minWidth: 300)`. The board's three columns are `maxWidth: .infinity`
+  and take everything the split proposes;
+* toggling the recurrent shelf while it was open **killed the app** in
+  `_NSViewLayout` with an AppKit exception — three reproductions, same stack.
+
+So it is a fixed-width trailing pane in an `HStack` (`RootView.inspectorWidth`).
+The plan's intent — "a panel, not a modal, because it's inspection of a
+selection" — is intact; what it gives up is `.inspector`'s toolbar affordance
+and its draggable divider. `⌥⌘I` replaces the first.
+
+Two sizes moved to make room, both recorded at their call sites: the window's
+`.defaultSize` (1240 → 1440 wide) and `BoardColumn`'s `minWidth` (260 → 220).
+
+### The string catalog is compiled by `make-app.sh`, not by SwiftPM
+
+`Resources/Localizable.xcstrings` (92 strings, `en` only) is **not** a SwiftPM
+resource. SwiftPM *copies* an `.xcstrings` verbatim rather than compiling it, and
+it lands in `WorkloadClient_WorkloadClient.bundle` — while SwiftUI's `Text("…")`
+looks its key up in `Bundle.main`, which for a packaged app is
+`Contents/Resources`. `make-app.sh` therefore runs `xcstringstool compile`
+straight into the bundle and asserts that `en.lproj/Localizable.strings` came
+out.
+
+`swift run` has no catalog and falls back to the literal keys, which for the
+source language is byte-identical output. That is the point: a missing catalog
+can never change what is on screen, only an added *translation* could.
+
+### Not done
 
 * The plan's optional `SMAppService` login-item toggle for the daemon. The
   LaunchAgent in `launchd/` already covers "daemon up without a terminal".
-* Anything from plan §11 (Phase 8). *(§10, Phase 7 — the Gantt — landed after
-  this file was written; see below.)*
+* **File ▸ New Task `⌘N` / New from Issue `⇧⌘N`, Task ▸ Manage Logs `⇧⌘L`, Task
+  ▸ Open iTerm `⌘I`.** The daemon has no endpoint behind any of them — its write
+  surface is `setStatus`, `close/plan`, `close`, `reconcile/plan`, `reconcile`,
+  `timer/start`, `timer/stop`, `logs` (append only) and `issue/open`. Task
+  creation, log editing and the iTerm integration are CLI/MCP only. They are
+  omitted rather than shipped permanently disabled; a menu full of dead items is
+  worse than a shorter menu.
 
 ## The Timeline (Phase 7, plan §10)
 
@@ -266,7 +332,7 @@ re-derived for the new zoom rather than snapping back to today.
 
 ```bash
 swift build            # debug
-swift test             # 265 tests, 4 skipped (the skips need a live daemon)
+swift test             # 324 tests, 4 skipped (the skips need a live daemon)
 ```
 
 `swift test` never touches `~/.workload_tracker.json` and makes no GitHub calls.

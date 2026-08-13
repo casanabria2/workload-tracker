@@ -12,66 +12,44 @@ import AppKit
 struct WorkloadClientApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var store = Store()
+    /// The sidebar selection, hoisted out of `RootView` so the View menu's
+    /// `⌘1`/`⌘2`/`⌘3` can drive the same value the sidebar's `List` binds.
+    @State private var selection: SidebarSelection? = .board
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(selection: $selection)
                 .environment(store)
                 .onAppear { delegate.store = store }
         }
-        .defaultSize(width: 1240, height: 800)
+        // Wider than Phase 3's 1240: the trailing inspector is a third column,
+        // and a default size that cannot show all three makes it invisible
+        // rather than merely cramped. 1440 leaves the board its three columns
+        // *and* the inspector without the user resizing anything.
+        .defaultSize(width: 1440, height: 860)
         .windowResizability(.contentMinSize)
         .commands {
+            // Every shortcut below comes from `AppShortcut`, the one table the
+            // collision check reads. See Design/AppShortcuts.swift.
             CommandGroup(after: .toolbar) {
-                Button("Refresh Snapshot") {
-                    _Concurrency.Task { await store.refresh() }
-                }
-                .keyboardShortcut("r", modifiers: .command)
+                ViewCommands(selection: $selection).environment(store)
+            }
 
-                // Plan §8.4. Owned by the menu bar rather than by the funnel
-                // menu's own row, so the shortcut is registered exactly once.
-                Button("Clear All Filters") { store.clearFilters() }
-                    .keyboardShortcut("k", modifiers: [.shift, .command])
-                    .disabled(!store.isFiltering)
-
-                Divider()
-
-                // Plan §10's `⌘+`/`⌘-`. In the menu bar rather than on the
-                // Timeline's segmented control, because a shortcut attached to a
-                // view only fires while that view is on screen *and* focused,
-                // and the picker takes focus away from the chart.
-                Button("Zoom In") { store.zoomTimeline(in: true) }
-                    .keyboardShortcut("+", modifiers: .command)
-                    .disabled(store.selection != .timeline || !store.canZoomTimelineIn)
-                Button("Zoom Out") { store.zoomTimeline(in: false) }
-                    .keyboardShortcut("-", modifiers: .command)
-                    .disabled(store.selection != .timeline || !store.canZoomTimelineOut)
-
-                Divider()
-
-                // Timeframe navigation. **`⌥←`/`⌥→`, deliberately not `⌘←`/`⌘→`**
-                // — the Board binds those to *moving the selected card* between
-                // columns (`BoardView.handle(_:)`), and a menu-bar shortcut wins
-                // over a view's `onKeyPress`, so reusing them would silently
-                // retire the board's keyboard move. Every item here is also
-                // gated on the Timeline being the visible pane, so these do
-                // nothing at all while the Board is showing.
-                Button("Previous Period") { store.stepTimeline(.previous) }
-                    .keyboardShortcut(.leftArrow, modifiers: .option)
-                    .disabled(store.selection != .timeline
-                              || !store.canStepTimeline(.previous))
-                Button("Next Period") { store.stepTimeline(.next) }
-                    .keyboardShortcut(.rightArrow, modifiers: .option)
-                    .disabled(store.selection != .timeline
-                              || !store.canStepTimeline(.next))
-                Button("Today") { store.timelineToToday() }
-                    .keyboardShortcut("t", modifiers: [.option, .command])
-                    .disabled(store.selection != .timeline || !store.canReturnToToday)
+            // `⌘F`. Placed *after* the standard text-editing group rather than
+            // replacing it, so AppKit keeps Undo/Redo and Cut/Copy/Paste.
+            CommandGroup(after: .textEditing) {
+                FindCommands().environment(store)
             }
 
             // Plan §9: "Row actions via context menu **and the Task menu**."
+            // Phase 8 widened it from the recurrent shelf to whichever card or
+            // row was selected last.
             CommandMenu("Task") {
                 TaskMenuCommands().environment(store)
+            }
+
+            CommandGroup(replacing: .help) {
+                Button("Keyboard Shortcuts") { store.showsShortcutHelp = true }
             }
         }
 
