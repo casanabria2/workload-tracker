@@ -56,13 +56,20 @@ chmod +x tracker.py wt.py
 
 # Add wt CLI to PATH (symlink to ~/.local/bin)
 mkdir -p ~/.local/bin
-ln -sf "$(pwd)/wt.py" ~/.local/bin/wt
+ln -sf "$(pwd)/wt" ~/.local/bin/wt
 ```
+
+Symlink the **`wt` wrapper**, not `wt.py`. The wrapper picks `venv/bin/python`
+(falling back to `python3`), so the CLI works from any directory; `wt.py` run
+under a bare `python3` fails on the venv-only dependencies.
 
 Make sure `~/.local/bin` is in your PATH. Add to `~/.zshrc` if needed:
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+If `wt` ever reports `command not found` while `~/.local/bin` *is* on PATH, the
+symlink has gone missing — re-run the `ln -sf` above.
 
 ### Zsh autocompletion
 
