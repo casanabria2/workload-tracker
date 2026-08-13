@@ -155,3 +155,52 @@ final class TaskInspectorTests: XCTestCase {
         XCTAssertTrue(text.contains("1 sprint binding"), text)
     }
 }
+
+// MARK: - Quarter-hour rounding is not "out of sync"
+
+/// The tracker reports hours to GitHub through `wt.round_to_quarter_hours`,
+/// which rounds **up** to the next 15 minutes. Comparing that against raw
+/// logged minutes flagged almost every binding as out of sync — the owner saw
+/// it on real data — so these pin the reported figure against the Python side.
+final class BindingRoundingTests: XCTestCase {
+    private func binding(logged: Double, synced: Double?) -> TaskInspectorModel.Binding {
+        TaskInspectorModel.Binding(sprintId: "s", sprint: "Sprint 105", issue: "o/r#1",
+                              isClosed: true, hoursSynced: synced,
+                              loggedMins: logged, startDate: "2026-07-27")
+    }
+
+    /// Values measured from the owner's own data on 2026-08-13, with the figure
+    /// `wt.mins_to_quarter_hours` produced for each.
+    func testReportedMinutesMatchesThePythonRounding() {
+        let cases: [(hoursLogged: Double, reportedHours: Double)] = [
+            (23.74, 23.75), (20.82, 21.0), (15.32, 15.5),
+            (1.13, 1.25), (1.64, 1.75), (2.83, 3.0),
+            (3.25, 3.25),   // already on a quarter — must not round up a full step
+            (0.0, 0.0),     // nothing logged reports nothing
+        ]
+        for (logged, expected) in cases {
+            XCTAssertEqual(TaskInspectorModel.Binding.reportedMinutes(logged * 60),
+                           expected * 60, accuracy: 0.001,
+                           "\(logged)h should report as \(expected)h")
+        }
+    }
+
+    func testRoundingAloneIsNotOutOfSync() {
+        // 15h 19m logged, GitHub told 15.5h — exactly what syncing would send.
+        XCTAssertFalse(binding(logged: 15.32 * 60, synced: 15.5).isOutOfSync)
+        XCTAssertFalse(binding(logged: 1.13 * 60, synced: 1.25).isOutOfSync)
+        XCTAssertFalse(binding(logged: 23.74 * 60, synced: 23.75).isOutOfSync)
+    }
+
+    func testARealGapIsStillFlagged() {
+        // The appenv#1413 case: GitHub carried 12.5h for a sprint with no work.
+        XCTAssertTrue(binding(logged: 0, synced: 12.5).isOutOfSync)
+        // A whole quarter-hour step out is a real difference, not rounding.
+        XCTAssertTrue(binding(logged: 15.32 * 60, synced: 15.25).isOutOfSync)
+        XCTAssertTrue(binding(logged: 15.32 * 60, synced: 15.75).isOutOfSync)
+        // Never synced, but time logged.
+        XCTAssertTrue(binding(logged: 60, synced: nil).isOutOfSync)
+        // Never synced and nothing logged is fine.
+        XCTAssertFalse(binding(logged: 0, synced: nil).isOutOfSync)
+    }
+}

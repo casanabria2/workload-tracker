@@ -44,11 +44,29 @@ struct TaskInspectorModel: Equatable, Sendable {
 
         var id: String { (sprintId ?? "") + "|" + (issue ?? "") + "|" + sprint }
 
+        /// What the tracker *would* report to GitHub for these minutes.
+        ///
+        /// The Python side never sends raw minutes: `sync_project_hours` puts
+        /// them through `wt.round_to_quarter_hours`, which rounds **up** to the
+        /// next 15 minutes (`math.ceil(mins / 15) * 15`). So 15h 19m is reported
+        /// as 15.5h, and 1h 8m as 1.25h.
+        ///
+        /// Mirrored here rather than approximated: comparing a rounded figure
+        /// against raw minutes made every binding look out of sync by up to 14
+        /// minutes, which is what this type used to do.
+        static func reportedMinutes(_ mins: Double) -> Double {
+            (mins / 15).rounded(.up) * 15
+        }
+
         /// True when GitHub carries a different figure from the logs — the
         /// thing a Sync Sprints run would fix.
+        ///
+        /// Compares like with like: what GitHub was told against what it *would*
+        /// be told now. A gap explainable by quarter-hour rounding is not a gap,
+        /// because syncing would not change the number.
         var isOutOfSync: Bool {
             guard let hoursSynced else { return loggedMins > 0 }
-            return abs(hoursSynced * 60 - loggedMins) > 1
+            return abs(hoursSynced * 60 - Self.reportedMinutes(loggedMins)) > 1
         }
     }
 
