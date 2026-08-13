@@ -291,6 +291,24 @@ def test_all_creates_nothing(wt, migrated, scratch):
     env = Env(wt, migrated, scratch / "all.json")
     answers = Answers("y")
 
+    # Construct the precondition instead of hoping the fixture still has it: the
+    # sprint-start ritual runs `sync-sprints --all --create-issues`, so on a
+    # freshly-copied live file every past sprint is already bound and there is
+    # nothing for --create-issues to mint — "SKIP … re-run with --create-issues"
+    # never appears and both halves of the requirement become unobservable.
+    # Rolling the cross-sprint tasks back to the one-issue shape re-creates the
+    # unbound past sprints on any fixture. `logs` are untouched.
+    rolled = [t for t, _ in multi_sprint_tasks(wt, env.data, env.sprints)]
+    for t in rolled:
+        unreconcile(wt, t, env.sprints)
+    if not rolled:
+        raise SystemExit("fixture has no cross-sprint task to un-reconcile — "
+                         "requirement (a) cannot be exercised")
+    wt.save(env.data)
+    before_disk = env.on_disk()
+    print(f"    un-reconciled {len(rolled)} cross-sprint task(s) so past sprints "
+          "need issues again")
+
     with CliStubs(wt, mode="record", sprints=env.sprints) as st:
         out, code = run_cmd(wt, wt.cmd_sync_sprints, ["--all", "--yes"], answers)
         creates = st.count("create_github_issue")
@@ -318,7 +336,7 @@ def test_all_creates_nothing(wt, migrated, scratch):
         return {(t["id"], b.get("sprint_id")) for t in d["tasks"]
                 for b in (t.get("sprint_issues") or []) if not b.get("issue")}
 
-    pre = issueless(json.loads(Path(migrated).read_text()))
+    pre = issueless(before_disk)
     post = issueless(env.reload())
     check(post <= pre,
           "--all added no issue-less 'placeholder' binding (would block a later "
@@ -507,21 +525,41 @@ def test_idempotent(wt, migrated, scratch):
 def test_set_sprint(wt, migrated, scratch):
     section("7. wt set-sprint now corrects the START sprint")
     env = Env(wt, migrated, scratch / "setsprint.json")
-    task = find(env.data, "Assist on Banco Galicia")
+
+    # Subject and sprints are both derived. `wt sprint` only lists **non-done**
+    # tasks, and the carry-over marker only renders when the start sprint is
+    # *strictly earlier* than the group sprint — so pin a task that is still open
+    # today and whose group sprint is later than the oldest sprint in the cache.
+    # The previous hard-coded title went done in the live data and took three
+    # assertions with it.
+    current = wt.find_sprint_for_date(env.sprints, datetime.now().date())
+    oldest, newest = env.sprints[0], env.sprints[-1]
+
+    def group_of(t):
+        return wt._task_group_sprint(t, env.sprints, current)
+
+    task = next((t for t in env.data["tasks"]
+                 if t.get("status") not in ("done", "recurrent")
+                 and t.get("sprint_id")
+                 and (group_of(t) or {}).get("start_date", oldest["start_date"])
+                 > oldest["start_date"]), None)
+    if task is None:
+        raise SystemExit("fixture has no open task grouped later than the oldest "
+                         "cached sprint — the carry-over marker cannot be shown")
     tid = task["id"]
     before = {k: task.get(k) for k in ("sprint", "sprint_id",
                                        "start_sprint", "start_sprint_id")}
+    print(f"    subject: {task['title'][:44]!r}")
     print(f"    before: {before}")
 
     with CliStubs(wt, mode="strict", sprints=env.sprints) as st:
-        out, code = run_cmd(wt, wt.cmd_set_sprint, [tid, "Sprint 99"])
+        out, code = run_cmd(wt, wt.cmd_set_sprint, [tid, oldest["title"]])
         check(st.calls == [], "set-sprint makes no GitHub call")
     check(code in (None, 0), f"exits cleanly (code={code})", out)
     t = next(x for x in env.reload()["tasks"] if x["id"] == tid)
-    check(t.get("start_sprint") == "Sprint 99", "start_sprint written",
+    check(t.get("start_sprint") == oldest["title"], "start_sprint written",
           str(t.get("start_sprint")))
-    check(t.get("start_sprint_id") == next(s["id"] for s in env.sprints
-                                           if s["title"] == "Sprint 99"),
+    check(t.get("start_sprint_id") == oldest["id"],
           "start_sprint_id written", str(t.get("start_sprint_id")))
     check(t.get("sprint") == before["sprint"] and t.get("sprint_id") == before["sprint_id"],
           "the reconcile-owned sprint/sprint_id pointer is left alone",
@@ -538,24 +576,24 @@ def test_set_sprint(wt, migrated, scratch):
           f"code={code2} keys={[k for k in t if 'start' in k]}\n{out2}")
     check("Cleared start sprint" in out2, "…and says so", out2)
 
-    # wt sprint surfaces the carry-over marker. Needs an *open* task, since
-    # cmd_sprint only lists non-done tasks.
-    open_task = find(env.data, "CI Check to read Demo Blocks content and verify if "
-                               "the change would break the demo block")
-    otid = open_task["id"]
+    # wt sprint surfaces the carry-over marker. Rows print title[:50], so match
+    # the row on that same truncation rather than on a hand-picked substring.
+    otid = tid
+    stub = task["title"][:50]
     with CliStubs(wt, mode="strict", sprints=env.sprints):
-        run_cmd(wt, wt.cmd_set_sprint, [otid, "Sprint 90"])
+        run_cmd(wt, wt.cmd_set_sprint, [otid, oldest["title"]])
         out3, _ = run_cmd(wt, wt.cmd_sprint, [])
-    line = next((l for l in out3.splitlines() if "CI Check" in l), "")
-    check("started Sprint 90" in line,
+    line = next((l for l in out3.splitlines() if stub in l), "")
+    check(f"started {oldest['title']}" in line,
           "wt sprint shows 'started Sprint N' for a carry-over", repr(line))
     print("   " + line.strip())
 
-    # A start sprint *later* than the group sprint is not a carry-over.
+    # A start sprint *later* than the group sprint is not a carry-over. The
+    # newest sprint in the cache is by construction >= any group sprint.
     with CliStubs(wt, mode="strict", sprints=env.sprints):
-        run_cmd(wt, wt.cmd_set_sprint, [otid, "Sprint 111"])
+        run_cmd(wt, wt.cmd_set_sprint, [otid, newest["title"]])
         out4, _ = run_cmd(wt, wt.cmd_sprint, [])
-    line4 = next((l for l in out4.splitlines() if "CI Check" in l), "")
+    line4 = next((l for l in out4.splitlines() if stub in l), "")
     check("started" not in line4,
           "…and not for a start sprint that is later than the group sprint",
           repr(line4))
@@ -565,10 +603,22 @@ def test_set_sprint(wt, migrated, scratch):
 def test_done(wt, migrated, scratch):
     section("8. wt done renders the reconcile result (fully stubbed)")
     env = Env(wt, migrated, scratch / "done.json")
-    task = find(env.data, "CI Check to read Demo Blocks content and verify if the "
-                          "change would break the demo block")
+
+    # Derived + constructed: an *open* cross-sprint task with a repo and an
+    # issue, rolled back to the one-issue shape so the close really has past
+    # sprints to reconcile. Closing an already-done, already-reconciled task
+    # renders no outcome lines at all, which is how the hard-coded subject
+    # stopped testing anything the day the owner closed it.
+    open_multi = [t for t, _ in multi_sprint_tasks(wt, env.data, env.sprints)
+                  if t.get("status") != "done"]
+    if not open_multi:
+        raise SystemExit("fixture has no open cross-sprint task with an issue — "
+                         "wt done's reconcile rendering cannot be exercised")
+    task = open_multi[0]
+    unreconcile(wt, task, env.sprints)
+    wt.save(env.data)
     tid, issue = task["id"], wt.task_current_issue(task, env.data)
-    print(f"    task status={task['status']}  issue={issue}")
+    print(f"    task {task['title'][:44]!r} status={task['status']}  issue={issue}")
     print(f"    sprints with time: "
           + ", ".join(f"{e['sprint_title']}={e['total_mins']:.0f}m"
                       for e in wt.task_sprints_with_time(task, env.sprints)))
@@ -597,7 +647,16 @@ def test_done(wt, migrated, scratch):
 
     # close_task's documented return keys must survive.
     env2 = Env(wt, migrated, scratch / "done2.json")
-    t2 = find(env2.data, "Move demo block scripts to the new field-eng-demo-blocks repo")
+    open_multi2 = [t for t, _ in multi_sprint_tasks(wt, env2.data, env2.sprints)
+                   if t.get("status") != "done"]
+    if not open_multi2:
+        raise SystemExit("fixture has no open cross-sprint task — close_task's "
+                         "return-key check has nothing to close")
+    # A second subject when the fixture has one, otherwise the same task on its
+    # own fresh copy (env2 is an independent file, so nothing is carried over).
+    t2 = open_multi2[1] if len(open_multi2) > 1 else open_multi2[0]
+    unreconcile(wt, t2, env2.sprints)
+    print(f"    close_task subject: {t2['title'][:44]!r}")
     with CliStubs(wt, mode="record", sprints=env2.sprints):
         res = wt.close_task(t2, env2.data, wt.save)
     required = {"success", "issue_created", "issue_closed", "project_updated",

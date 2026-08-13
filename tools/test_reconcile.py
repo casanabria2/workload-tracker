@@ -1077,11 +1077,25 @@ def test_project_info_cache(wt, migrated, scratch):
         # The regression that mattered: a whole-run reconcile must not scale its
         # metadata fetches with the task count. `wt sync-sprints --all` doing so
         # exhausted the 5000-point GraphQL budget mid-run.
+        #
+        # The precondition is *constructed*, not hoped for: metadata is only
+        # fetched by a task that actually has an operation to perform, so on a
+        # fully-reconciled fixture (which the live file is, the morning after the
+        # sprint ritual) both runs fetch once and the memoisation claim is
+        # unobservable — "2 vs 2" passed the cached check and failed the
+        # comparison. Rolling several cross-sprint tasks back to the one-issue
+        # shape guarantees several metadata users on any fixture.
         sprints = wt.get_cached_sprints(data)
         tasks = [t for t in data["tasks"] if t.get("status") != "recurrent"]
         counts = {}
+        n_rolled = 0
         for mode, ttl in (("cached", real_ttl), ("uncached", -1)):
             fresh = load_copy(wt, migrated, scratch / f"pinfo_{mode}.json")
+            rolled = 0
+            for t, _per in multi_sprint_tasks(wt, fresh, sprints):
+                unreconcile(wt, t, sprints)
+                rolled += 1
+            n_rolled = rolled
             log2 = []
             wt.subprocess = fake_gh(log2)
             wt.PROJECT_INFO_TTL_SECONDS = ttl
@@ -1095,7 +1109,11 @@ def test_project_info_cache(wt, migrated, scratch):
             counts[mode] = sum(1 for c in log2
                                if c in ("gh project view", "gh project field-list"))
         wt.PROJECT_INFO_TTL_SECONDS = real_ttl
-        print(f"    {len(tasks)} tasks: metadata gh calls "
+        if n_rolled < 2:
+            raise SystemExit(
+                "fixture has fewer than 2 cross-sprint tasks to un-reconcile — "
+                "the metadata-memoisation comparison would be vacuous")
+        print(f"    {len(tasks)} tasks ({n_rolled} un-reconciled): metadata gh calls "
               f"uncached={counts['uncached']} cached={counts['cached']}")
         check(counts["cached"] == 2,
               "a full-run reconcile fetches project metadata exactly once",

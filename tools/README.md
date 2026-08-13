@@ -380,6 +380,42 @@ Two sections deliberately restore state afterwards: `test_mcp_phase3.py` section
 comparison asserts the *migration's* shadow→binding mapping and would otherwise
 fail on freshly-minted stub issue refs.
 
+### The second round of rot, and where it actually was (plan §13.5 item 1g)
+
+The same failure returned in August 2026 by a different route. A/B on identical
+code, two fixtures — the live file and a backup from a week earlier — gave
+different results, and the difference was **`check_invariants.py`**, not the
+tests that call it. Invariant 6 asserted that every binding traceable to a
+baseline shadow is `state: "closed"` with a numeric `hours_synced`. Both halves
+were wrong as written:
+
+* `wt._shadow_binding()` writes `hours_synced: None` when the shadow has no
+  marker minutes — the checker expected `0.0`;
+* a binding on a sprint that has **not ended** is legitimately `open` and
+  unsynced, and `make_fixtures.py`'s de-migration cannot recover a binding's
+  real state anyway (the migration always writes `"closed"`). Both expectations
+  are now derived: hours mirror `_shadow_binding` exactly, and `"closed"` is only
+  required once the sprint's `end_date` has passed.
+
+The audit that went with it turned six more day-dependent assertions into
+constructed ones. All of them had the same shape — *the fixture happened to
+contain the precondition* — and all of them are now built:
+
+| Harness | Was | Now |
+|---|---|---|
+| `test_reconcile` §12 | metadata memoisation measured on whatever tasks had work; a fully-reconciled fixture reads `2 vs 2` | un-reconciles every cross-sprint task first, so there are always several metadata users |
+| `test_phase3` §3 | needed unbound past sprints to exist | un-reconciles first, so `SKIP … --create-issues` and the mint are always exercised |
+| `test_phase3` §7/§8 | two hard-coded task titles; one went `done` and took three assertions with it | subject and sprints derived from the fixture, subject un-reconciled so `wt done` renders real outcome lines |
+| `test_mcp_phase3` §4/§6/§9 | one check per binding (count grew with the data); needed unbound sprints; needed a repo-having task with no issue | one check for all bindings; un-reconciles; builds the issue-less subject when none exists |
+| `test_wt_api` §5/§6/§7/§8/§9 | `log["id"][:8]` is just today's date, so it matched another log; `no_active_timer` assumed no timer; `status_overview` ignored the running timer; push subject could have 0 sprint hours | shortest *unique* prefix; timer explicitly cleared; expectation includes the live term (and the no-double-count claim asserted on a timer-less copy); subject must have non-zero sprint hours |
+| `test_daemon` §6/§9 | a fixture copied mid-timer made `stop` answer 200 | `fresh_idle()` drops the inherited timer; failure detail now shows the invariant lines instead of swallowing them |
+| `test_tracker_phase3` | `S` on an already-synced task mounts no modal, and §8 then crashed dismissing a screen that was never pushed | subject un-reconciled; a closed cross-sprint task is re-opened on the scratch copy when none is in progress |
+
+The acceptance test for that work is worth keeping: build fixtures from **two**
+data files a week or more apart and run all nine harnesses against both. The
+pass/fail output must be identical. If it is not, the harness is measuring the
+day, not the code.
+
 ---
 
 ## Known gaps worth knowing before you lean on these

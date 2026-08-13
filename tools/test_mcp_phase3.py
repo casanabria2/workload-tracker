@@ -42,7 +42,8 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
 
 from test_reconcile import (  # noqa: E402
-    Stubs, SubprocessGuard, sig, pick_multi_sprint, unreconcile,
+    Stubs, SubprocessGuard, sig, multi_sprint_tasks, pick_multi_sprint,
+    unreconcile,
 )
 from test_phase3 import new_sprint_boundary  # noqa: E402
 
@@ -332,9 +333,13 @@ def test_get_task(wt, mcp_server, migrated, scratch):
     check("Sprint issues (" in out, "get_task reports the sprint_issues list")
     check("← current" in out, "get_task marks the current binding")
     check("Logged time by sprint:" in out, "get_task reports per-sprint minutes")
-    for b in multi["sprint_issues"]:
-        if b.get("issue"):
-            check(b["issue"] in out, f"binding issue {b['issue']} shown")
+    # One check, not one per binding: how many bindings the most-bound task has
+    # grows by one every sprint, so a per-binding loop made the harness's own
+    # check *count* a function of the day's data.
+    refs = [b["issue"] for b in multi["sprint_issues"] if b.get("issue")]
+    missing = [r for r in refs if r not in out]
+    check(not missing, f"every binding issue is shown ({len(refs)} of them)",
+          str(missing))
     cur = wt.task_current_issue(multi, data)
     check(f"GitHub Issue: {cur}" in out, "GitHub Issue line uses task_current_issue",
           cur or "None")
@@ -385,7 +390,23 @@ def test_requirement_a(wt, mcp_server, migrated, scratch):
     dst = point_at(wt, mcp_server, migrated, scratch / "alldry.json")
     data = mcp_server.load()
     sprints = sprints_of(data, wt)
+
+    # Construct the unbound past sprints this section is about. The sprint-start
+    # ritual (`sync-sprints --all --create-issues`) binds every past sprint, so a
+    # freshly-copied live file plans nothing either way and both halves of the
+    # requirement — "reports what it did not bind" and "the opt-in would mint" —
+    # pass or fail on the day rather than on the code. `logs` are untouched.
+    rolled = 0
+    for t, _per in multi_sprint_tasks(wt, data, sprints):
+        unreconcile(wt, t, sprints)
+        rolled += 1
+    if not rolled:
+        raise SystemExit("fixture has no cross-sprint task to un-reconcile — "
+                         "requirement (a) cannot be exercised")
+    mcp_server.save(data)
+    data = mcp_server.load()
     disk_before = dst.read_text()
+    print(f"       un-reconciled {rolled} cross-sprint task(s)")
 
     with McpStubs(wt, mcp_server, mode="strict", sprints=sprints):
         fake = FakeSubprocess()
@@ -667,10 +688,26 @@ def test_close_end_to_end(wt, mcp_server, migrated, scratch):
     check("Closed issue:" in out, "current issue close reported")
 
     # (b) create_issue=False on a repo-having task with no issue must refuse.
+    #     Whether such a task exists is a property of the day's data (almost
+    #     everything the owner tracks gets linked), so when the fixture has none
+    #     the subject is *built*: an open task with a repo and its issue
+    #     bindings cleared. `logs` are untouched, and it is a scratch copy.
     d3 = mcp_server.load()
-    victim = next(t for t in d3["tasks"]
-                  if t.get("github_repo") and t.get("status") != "done"
-                  and not wt.task_current_issue(t, d3))
+    victim = next((t for t in d3["tasks"]
+                   if t.get("github_repo") and t.get("status") != "done"
+                   and not wt.task_current_issue(t, d3)), None)
+    if victim is None:
+        victim = next((t for t in d3["tasks"]
+                       if t.get("github_repo") and t.get("status") != "done"), None)
+        if victim is None:
+            raise SystemExit("fixture has no open task with a github_repo — the "
+                             "create_issue refusal path cannot be exercised")
+        victim["sprint_issues"] = []
+        victim.pop("github_issue", None)
+        mcp_server.save(d3)
+        d3 = mcp_server.load()
+        victim = next(t for t in d3["tasks"] if t["id"] == victim["id"])
+        assert not wt.task_current_issue(victim, d3)
     print(f"       (no-issue task: {victim['title']!r})")
     with McpStubs(wt, mcp_server, mode="record", sprints=sprints) as st2:
         fake = FakeSubprocess()

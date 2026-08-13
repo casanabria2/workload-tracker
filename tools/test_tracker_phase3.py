@@ -246,8 +246,17 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
 
     # Far-out-of-window start sprint → the old InvalidSelectValueError crash.
     old_start = pick(lambda t: gap(t) > 4)
-    # A cross-sprint task with something for a reconcile to do.
-    multi = pick(lambda t: len(wt.task_sprints_with_time(t, sprints)) > 1)
+    # A cross-sprint task with something for a reconcile to do. "Something to do"
+    # is *constructed*, not assumed: the owner's sprint-start ritual reconciles
+    # every task, so on a freshly-copied live file `S` answers "already in sync",
+    # no SyncSprintsModal mounts, and section 8 then crashes dismissing a screen
+    # that was never pushed. `unreconcile` rolls the bookkeeping — never the
+    # logs — back to the one-issue shape reconcile exists to fix.
+    multi = pick(lambda t: len(wt.task_sprints_with_time(t, sprints)) > 1
+                 and t.get("github_issue"))
+    if multi is not None:
+        from test_reconcile import unreconcile
+        unreconcile(wt, multi, sprints)
     # An in-progress cross-sprint task with an issue, for the close workflow. It
     # may be one of the tasks above (the dataset only has a couple), just not the
     # one the reconcile test already brought in sync.
@@ -257,6 +266,21 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
          and len(wt.task_sprints_with_time(t, sprints)) > 1
          and t is not multi),
         None)
+    if close_target is None:
+        # How many cross-sprint tasks happen to be open on any given day is a
+        # property of the owner's week, not of the code. Re-open a closed one on
+        # the scratch copy rather than let the whole close-workflow section fall
+        # over — nothing but `status` is touched, and the file is a throwaway.
+        close_target = next(
+            (t for t in data["tasks"]
+             if t.get("status") == "done" and wt.task_current_issue(t, data)
+             and len(wt.task_sprints_with_time(t, sprints)) > 1
+             and t is not multi),
+            None)
+        if close_target is not None:
+            close_target["status"] = "inprogress"
+            print(f"    (re-opened {close_target['title'][:40]!r} on the scratch "
+                  "copy: no cross-sprint task was in progress today)")
 
     async with app.run_test() as pilot:
         await pilot.pause()

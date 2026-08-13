@@ -50,7 +50,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
 
-from test_reconcile import Stubs, sig  # noqa: E402
+from test_reconcile import Stubs, multi_sprint_tasks, sig, unreconcile  # noqa: E402
 from test_mcp_phase3 import FakeSubprocess, SwapSubprocess  # noqa: E402
 
 FAILURES = []
@@ -432,7 +432,20 @@ def test_log_errors_and_ops(wt, wt_api, migrated, scratch):
           and log["at"] == 3730.0,
           "…with minutes, note and both timestamps", str(log))
 
-    wt_api.edit_log(data, tid, log["id"][:8], minutes=60.0, note="harness edited")
+    # The prefix has to be one that *only* this log answers to. `uid()` is
+    # yyyymmddHHMMSS + 4 letters, so a fixed [:8] slice is just today's date and
+    # collides with every log the owner recorded today — edit_log then silently
+    # edited a different entry and three checks downstream failed. Derive the
+    # shortest unique prefix instead, and assert it really is a prefix rather
+    # than the whole id.
+    other_ids = [l["id"] for t in data["tasks"] for l in t.get("logs", [])
+                 if l["id"] != log["id"]]
+    prefix = next((log["id"][:n] for n in range(4, len(log["id"]))
+                   if not any(o.startswith(log["id"][:n]) for o in other_ids)),
+                  log["id"])
+    check(len(prefix) < len(log["id"]),
+          "a strict id prefix is unambiguous in this fixture", prefix)
+    wt_api.edit_log(data, tid, prefix, minutes=60.0, note="harness edited")
     check(log["minutes"] == 60.0 and log["note"] == "harness edited",
           "edit_log accepts an id prefix and changes both fields", str(log))
 
@@ -472,6 +485,10 @@ def test_timers(wt, wt_api, migrated, scratch):
     a, b = data["tasks"][0], data["tasks"][1]
     n_a = len(a.get("logs", []))
 
+    # The idle precondition is constructed: a fixture copied while the owner had
+    # a timer running carries it, and stop_timer then legitimately succeeds. Drop
+    # the timer *without* committing it, so no log is invented on a fixture task.
+    data["active_timer"] = None
     expect("no_active_timer", wt_api.stop_timer, data)
 
     # browser=False everywhere: the Safari integration is AppleScript, and a
@@ -557,12 +574,24 @@ def test_task_commands(wt, wt_api, migrated, scratch):
     check(wt_api.list_tasks(data, role="no-such-role") == [],
           "an unknown role filters everything out")
 
+    # status_overview totals logged minutes *plus* the running timer's elapsed
+    # time, so the expectation has to include the live term — a fixture copied
+    # while a timer was running otherwise reads as a double-count that is not
+    # one. The no-double-count claim itself is asserted on a timer-less copy,
+    # where the total must equal the logged sum to the microminute.
     ov = wt_api.status_overview(data)
     check(ov["n_tasks"] == len(data["tasks"]), "status_overview counts every task")
-    want = sum(wt.task_logged_mins(t) for t in data["tasks"])
-    check(abs(ov["total_mins"] - want) < 1e-6,
-          "…and totals the logged minutes exactly once (no shadow double-count)",
-          f"{ov['total_mins']} vs {want}")
+    logged = sum(wt.task_logged_mins(t) for t in data["tasks"])
+    live = sum(wt_api.task_live_mins(t, data.get("active_timer"))
+               for t in data["tasks"])
+    check(abs(ov["total_mins"] - (logged + live)) < 1e-3,
+          "…and totals logged + running-timer minutes",
+          f"{ov['total_mins']} vs {logged} + {live}")
+    idle = copy.deepcopy(data)
+    idle["active_timer"] = None
+    check(abs(wt_api.status_overview(idle)["total_mins"] - logged) < 1e-6,
+          "…counting each task's logs exactly once (no shadow double-count)",
+          f"{wt_api.status_overview(idle)['total_mins']} vs {logged}")
     check({r["role_id"] for r in ov["by_role"]}
           == {r["id"] for r in data["roles"]}, "…broken down by every role")
 
@@ -642,15 +671,24 @@ def test_github_paths(wt, wt_api, migrated, scratch):
     check(wt.task_current_issue(task, data) is None, "…and clears it")
 
     # push: the subject must be a task whose sprint-filtered hours really differ
-    # from its total, or "not the total" is not an assertion.
+    # from its total, or "not the total" is not an assertion. They must also be
+    # **non-zero**: wt.sync_project_hours only writes Hours when the sprint has
+    # minutes in it, so a subject whose current sprint is empty (a perpetual task
+    # on the first day of a new sprint, say) sends nothing at all and the
+    # "value actually sent" check has no value to compare.
+    def sprint_h(t):
+        return wt.mins_to_quarter_hours(wt.task_reportable_mins(t, sprints))
+
     pushable = [t for t in data["tasks"]
                 if wt.task_current_issue(t, data)
                 and len(wt.task_sprints_with_time(t, sprints)) > 1
-                and abs(wt.mins_to_quarter_hours(wt.task_reportable_mins(t, sprints))
+                and sprint_h(t) > 0
+                and abs(sprint_h(t)
                         - wt.mins_to_quarter_hours(wt.task_logged_mins(t))) > 1e-9]
     if not pushable:
-        raise SystemExit("no linked cross-sprint task whose sprint hours differ "
-                         "from its total — the push assertion would be vacuous")
+        raise SystemExit("no linked cross-sprint task with non-zero sprint hours "
+                         "differing from its total — the push assertion would be "
+                         "vacuous")
     ptask = max(pushable, key=lambda t: len(wt.task_sprints_with_time(t, sprints)))
     want_h = wt.mins_to_quarter_hours(wt.task_reportable_mins(ptask, sprints))
     total_h = wt.mins_to_quarter_hours(wt.task_logged_mins(ptask))
@@ -774,8 +812,20 @@ def test_close_and_reconcile(wt, wt_api, migrated, scratch):
           "…and passes a success through")
 
     # plan_reconcile: the all_tasks default must not plan any issue creation.
+    # A fully-reconciled fixture plans nothing either way, which would make the
+    # opt-in half of the comparison pass for the wrong reason, so the work is
+    # constructed: roll the cross-sprint tasks back to the one-issue shape
+    # (in memory only — the disk copy stays pristine for the "writes nothing"
+    # assertions below).
     data2 = fresh(wt, migrated, scratch / "recon.json")
     sprints2 = sprints_of(wt, data2)
+    rolled = 0
+    for t, _per in multi_sprint_tasks(wt, data2, sprints2):
+        unreconcile(wt, t, sprints2)
+        rolled += 1
+    if not rolled:
+        raise SystemExit("fixture has no cross-sprint task to un-reconcile — "
+                         "the create_issues opt-in comparison would be vacuous")
     disk = Path(scratch / "recon.json").read_text()
     with ApiStubs(wt, mode="strict", sprints=sprints2):
         blanket = wt_api.plan_reconcile(data2, all_tasks=True)

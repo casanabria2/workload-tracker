@@ -23,7 +23,9 @@ Invariants:
   5. Against the baseline: task/log/minute totals for surviving tasks are
      byte-identical (all relative to the baseline — never hardcoded).
   6. Every shadow recorded in the baseline now exists as a binding, with the
-     right issue and hours, on the right parent task.
+     right issue and hours, on the right parent task. The expected hours and
+     state are *derived* from the shadow snapshot the way ``wt._shadow_binding``
+     derives them, never assumed — see ``check_against_baseline``.
 """
 import json
 import math
@@ -161,6 +163,29 @@ def check_data(data: dict, rep: Report) -> None:
                          f"unbound sprint(s): {detail}")
 
 
+def _shadow_expected_hours(marker_minutes: float):
+    """What ``wt._shadow_binding`` writes as ``hours_synced`` for this shadow.
+
+    Mirrored exactly, including the ``if marker_mins else None`` tail: a shadow
+    with no marker minutes yields ``None``, **not** ``0.0``. Assuming ``0.0``
+    made this check depend on whether the day's data happened to contain a
+    zero-hour binding.
+    """
+    return _round_up_quarter_hours(marker_minutes) if marker_minutes else None
+
+
+def _unended_sprint_ids(data: dict) -> set:
+    """Sprint ids whose window has not closed yet (today < end_date).
+
+    A binding for one of those is *live*: reconcile only closes a sprint's issue
+    once the sprint has ended, so ``state: "open"`` (with ``hours_synced: None``
+    until something is synced) is the correct state for it, not a violation.
+    """
+    from datetime import date
+    today = date.today()
+    return {s["id"] for s in _cached_sprints(data) if today < s["end_date"]}
+
+
 def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
     tasks = data.get("tasks", [])
     by_id = {t["id"]: t for t in tasks if t.get("id")}
@@ -233,6 +258,18 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
                      f"task {task.get('title')!r} ({tid}) is not in the baseline")
 
     # 6. Each baseline shadow now lives as a binding on its parent.
+    #
+    # Both expectations below are derived, never assumed:
+    #   * hours  — exactly what wt._shadow_binding() computes from the shadow's
+    #              marker minutes, None included;
+    #   * state  — "closed" only for a sprint that has *ended*. The baseline may
+    #              have been reconstructed by tools/make_fixtures.py, whose
+    #              de-migration cannot recover a binding's real state (the
+    #              migration always writes "closed"), and a binding on a sprint
+    #              that is still running is legitimately open and unsynced. Hard-
+    #              coding "closed" made this check fail for two weeks out of
+    #              every two the moment a new sprint started.
+    unended = _unended_sprint_ids(data)
     for sid, snap in base_shadows.items():
         parent = by_id.get(snap["parent"])
         if parent is None:
@@ -250,14 +287,20 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
         rep.check(match.get("issue") == snap["github_issue"], "6/shadow-binding-issue",
                   f"parent {parent.get('title')!r} binding for {snap['sprint']} has issue "
                   f"{match.get('issue')!r}, shadow had {snap['github_issue']!r}")
-        expected_hours = _round_up_quarter_hours(snap["marker_minutes"])
+        expected_hours = _shadow_expected_hours(snap["marker_minutes"])
         rep.check(match.get("hours_synced") == expected_hours, "6/shadow-binding-hours",
                   f"parent {parent.get('title')!r} binding for {snap['sprint']} has "
                   f"hours_synced {match.get('hours_synced')!r}, expected "
                   f"{expected_hours} (from {snap['marker_minutes']}m)")
-        rep.check(match.get("state") == "closed", "6/shadow-binding-state",
-                  f"parent {parent.get('title')!r} binding for {snap['sprint']} state is "
-                  f"{match.get('state')!r}, expected 'closed'")
+        if snap["sprint_id"] in unended:
+            rep.check(match.get("state") in ("open", "closed"), "6/shadow-binding-state",
+                      f"parent {parent.get('title')!r} binding for {snap['sprint']} state "
+                      f"is {match.get('state')!r} — not a legal binding state")
+        else:
+            rep.check(match.get("state") == "closed", "6/shadow-binding-state",
+                      f"parent {parent.get('title')!r} binding for {snap['sprint']} state "
+                      f"is {match.get('state')!r}, expected 'closed' ({snap['sprint']} "
+                      "has ended)")
 
 
 def main() -> int:

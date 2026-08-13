@@ -392,13 +392,31 @@ def run_invariants(path, baseline=None):
     proc = real_subprocess.run(args, capture_output=True, text=True)
     if proc.returncode == 0:
         return True, ""
+    # check_invariants prints its failures as "  x [invariant] …" — matching only
+    # "FAIL" reported the count line and swallowed every reason.
     return False, "\n      " + "\n      ".join(
-        l for l in proc.stdout.splitlines() if "FAIL" in l)[:800]
+        l.strip() for l in proc.stdout.splitlines()
+        if l.lstrip().startswith("x [") or "FAILURE" in l)[:800]
 
 
 def invariants(path, label, baseline=None):
     ok, detail = run_invariants(path, baseline)
     return check(ok, f"check_invariants holds after {label}", detail)
+
+
+def fresh_idle(wt, src, dst):
+    """``fresh``, with any timer the fixture inherited stopped first.
+
+    A data file copied while the owner had a timer running carries it, and then
+    ``POST /v1/timer/stop`` legitimately answers 200 instead of the 409 the
+    no-timer assertions are about. Dropping the timer *without* committing it
+    keeps the fixture's logs untouched.
+    """
+    data = fresh(wt, src, dst)
+    if data.get("active_timer"):
+        data["active_timer"] = None
+        wt.save(data)
+    return data
 
 
 def digest(path):
@@ -604,7 +622,7 @@ def test_task_and_log_endpoints(wt, wt_api, wt_daemon, migrated, baseline,
                                 scratch):
     section("6. task + log + timer endpoints, invariants after each mutation")
     work = scratch / "crud.json"
-    data = fresh(wt, migrated, work)
+    data = fresh_idle(wt, migrated, work)
     sprints = wt.get_cached_sprints(data)
 
     with ApiStubs(wt, mode="record", sprints=sprints), \
@@ -1064,7 +1082,7 @@ def test_long_operations(wt, wt_api, wt_daemon, migrated, scratch):
 
 def test_transport_errors(wt, wt_daemon, migrated, scratch):
     section("9. transport-level errors (routing, method, body)")
-    fresh(wt, migrated, scratch / "errors.json")
+    fresh_idle(wt, migrated, scratch / "errors.json")
     with DaemonHarness(wt_daemon) as h:
         status, body, _ = h.get("/v1/nope")
         check(status == 404 and code_of(body) == "not_found",
