@@ -348,7 +348,32 @@ wt presence 20           # Set timeout to 20 minutes and enable
 Implementation:
 - `idle_detector.py` queries macOS `ioreg -c IOHIDSystem` for HIDIdleTime (nanoseconds since last input)
 - `tracker.py` checks idle time in the `_tick()` loop (runs every 1 second when timer active)
+- `wt_daemon.py` runs the same check from `Daemon._presence_loop` every **20s**
+  (`--presence-interval`; each poll forks `ioreg`, so it is deliberately not
+  1 Hz). `--no-presence` turns the thread off.
 - When idle exceeds threshold, timer auto-stops and logs time (optionally subtracting idle time)
+
+**Exactly one detector runs at a time.** The daemon's loop stands down whenever
+`tracker.py` answers on :7373 (`Daemon.tui_bridge_running()`), because the TUI is
+already detecting idle and `tracker.save_data()` rewrites `tasks` +
+`active_timer` wholesale from memory — a concurrent daemon stop would be
+silently reverted or logged twice. Presence detection used to live *only* in the
+TUI, which meant that with the TUI closed (the normal case now) a timer started
+by `wt start`, either daemon port, the macOS app or MCP never stopped at all.
+
+**The undo contract.** A daemon auto-stop leaves a pending record at
+`config.pending_idle_stop` (`{id, task_id, task_title, log_id, logged_minutes,
+elapsed_minutes, idle_minutes, idle_timeout_minutes, note, started_at, ended_at,
+at, expires_at, resolved}`), publishes an SSE `idle_stop` event, and serves it
+from `GET /idle-stop` (unauthenticated :7375, the port the menu-bar monitor is
+pointed at) and `GET /v1/idle-stop`. `POST /idle-stop/ack` accepts the removal;
+`POST /idle-stop/undo` puts the subtracted minutes back on the log entry and
+reverts its note. **Undo does not restart the timer.** Both are idempotent, both
+answer 200 with a `detail` rather than an error when there is nothing to do or
+the entry was edited/deleted since, and the record expires after 45 minutes.
+Resolution publishes `idle_stop_resolved`. `wt_api.stop_timer` /
+`_commit_timer` grew additive, defaulted `note=` / `subtract_minutes=` /
+`min_minutes=` keywords for this; every pre-existing caller is unchanged.
 
 ### Google Calendar Integration
 
