@@ -101,30 +101,171 @@ log = logging.getLogger("wt_daemon")
 #: without launching a browser.
 OPEN_COMMAND = "/usr/bin/open"
 
+#: The cmux CLI. cmux is the owner's terminal-and-browser; GitHub issues open
+#: there rather than in the default browser.
+CMUX_COMMAND = "cmux"
+CMUX_BUNDLE_ID = "com.cmuxterm.app"
+#: Where cmux keeps `automation.socketPassword`. Read at call time, never cached:
+#: it is the owner's secret and rotating it should not need a daemon restart.
+CMUX_SETTINGS_PATH = Path.home() / ".config" / "cmux" / "cmux.json"
+#: How much of the task title goes into a new workspace name.
+CMUX_TITLE_CHARS = 15
 
-def _open_url(url: str) -> bool:
-    """Open *url* in the user's default browser. True when the OS accepted it.
 
-    Uses ``/usr/bin/open`` — Launch Services — and **not** ``webbrowser``.
-    On macOS ``webbrowser.get()`` resolves to ``MacOSXOSAScript``, which drives
-    the browser through ``osascript``; that needs an Automation (TCC) grant, and
-    this daemon runs as a launchd agent which can never be given one
-    interactively. So ``webbrowser.open()`` returned False on every call and the
-    client faithfully reported "Could not open … in a browser" while no window
-    ever appeared. Launch Services needs no such grant.
+def cmux_workspace_name(issue_number: str, task_title: str) -> str:
+    """`"316 - Teams integrat"` — the name for a freshly created workspace.
+
+    Only the first :data:`CMUX_TITLE_CHARS` characters of the title, so a long
+    task does not produce an unreadable workspace tab.
+    """
+    head = (task_title or "").strip()[:CMUX_TITLE_CHARS].rstrip()
+    return f"{issue_number} - {head}" if head else issue_number
+
+
+def cmux_workspace_ref_for_issue(issue_number: str,
+                                 workspaces: list[dict]) -> str | None:
+    """The ref of the first workspace whose title begins with *issue_number*.
+
+    The digit-boundary check is the point: a bare ``startswith`` would let issue
+    ``31`` adopt the workspace for ``316``, and silently file work under the
+    wrong issue. A separator or end-of-string must follow the number.
+    """
+    for ws in workspaces:
+        for key in ("title", "custom_title"):
+            title = (ws.get(key) or "").strip()
+            if not title.startswith(issue_number):
+                continue
+            rest = title[len(issue_number):]
+            if rest == "" or not rest[0].isdigit():
+                return ws.get("ref") or ws.get("id")
+    return None
+
+
+def _cmux_password() -> str | None:
+    """`automation.socketPassword` from cmux's JSONC settings, or None.
+
+    cmux refuses outside processes unless ``automation.socketControlMode`` is
+    ``"password"`` and this is set — the daemon is a launchd agent, so it is
+    always an outside process. The file is JSONC (comments, trailing commas), so
+    strip those before parsing rather than reaching for a JSON5 dependency.
+    """
+    try:
+        raw = CMUX_SETTINGS_PATH.read_text()
+    except OSError:
+        return None
+    stripped = re.sub(r"(?m)^\s*//.*$", "", raw)
+    match = re.search(r'"socketPassword"\s*:\s*"([^"]+)"', stripped)
+    return match.group(1) if match else None
+
+
+def _cmux(args: list[str], *, timeout: float = 20.0):
+    """Run the cmux CLI with socket auth. Returns the CompletedProcess or None."""
+    import subprocess
+    password = _cmux_password()
+    if not password:
+        log.warning("no cmux automation.socketPassword in %s", CMUX_SETTINGS_PATH)
+        return None
+    env = dict(os.environ, CMUX_QUIET="1")
+    try:
+        return subprocess.run([CMUX_COMMAND, "--password", password, *args],
+                              capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except FileNotFoundError:
+        log.warning("cmux CLI (%s) not found", CMUX_COMMAND)
+        return None
+    except Exception:  # noqa: BLE001 - opening an issue must never kill the daemon
+        log.warning("cmux %s failed", args, exc_info=True)
+        return None
+
+
+def _cmux_workspaces() -> list[dict] | None:
+    """Every workspace cmux knows about, or None when cmux can't be reached."""
+    proc = _cmux(["--json", "workspace", "list"])
+    if proc is None or proc.returncode != 0:
+        if proc is not None:
+            log.warning("cmux workspace list rc=%s: %s",
+                        proc.returncode, (proc.stderr or "").strip()[:200])
+        return None
+    try:
+        return json.loads(proc.stdout).get("workspaces") or []
+    except ValueError:
+        log.warning("cmux workspace list returned non-JSON: %r", proc.stdout[:200])
+        return None
+
+
+def _cmux_launch_and_wait(timeout: float = 25.0) -> bool:
+    """Start cmux if it is not running, and wait for its socket to answer."""
+    ok, detail = _launch_via_open(["-b", CMUX_BUNDLE_ID])
+    if not ok:
+        log.warning("could not launch cmux: %s", detail)
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _cmux_workspaces() is not None:
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _open_issue_in_cmux(url: str, issue_number: str, task_title: str) -> dict:
+    """Open *url* in the cmux workspace for *issue_number*, creating it if absent.
+
+    Returns the fields the endpoint reports: ``opened``, ``workspace``,
+    ``workspace_created`` and, on failure, ``detail``.
+    """
+    workspaces = _cmux_workspaces()
+    if workspaces is None:
+        # Chosen fallback: start cmux and retry, rather than quietly diverting
+        # the issue to the default browser.
+        if not _cmux_launch_and_wait():
+            return {"opened": False, "workspace": None, "workspace_created": False,
+                    "detail": "cmux is not reachable (socket denied or not running)"}
+        workspaces = _cmux_workspaces() or []
+
+    ref = cmux_workspace_ref_for_issue(issue_number, workspaces)
+    created = False
+    if ref is None:
+        name = cmux_workspace_name(issue_number, task_title)
+        proc = _cmux(["new-workspace", "--name", name])
+        if proc is None or proc.returncode != 0:
+            return {"opened": False, "workspace": None, "workspace_created": False,
+                    "detail": f"could not create cmux workspace {name!r}"}
+        # `new-workspace` answers "OK workspace:11".
+        ref = (proc.stdout or "").split()[-1].strip() or None
+        created = True
+        if ref is None:
+            return {"opened": False, "workspace": None, "workspace_created": True,
+                    "detail": "cmux created a workspace but returned no ref"}
+
+    proc = _cmux(["open", url, "--workspace", ref])
+    if proc is None or proc.returncode != 0:
+        detail = (proc.stderr or "").strip()[:200] if proc else "cmux unavailable"
+        return {"opened": False, "workspace": ref, "workspace_created": created,
+                "detail": f"could not open the issue in {ref}: {detail}"}
+    return {"opened": True, "workspace": ref, "workspace_created": created}
+
+
+def _launch_via_open(args: list[str]) -> tuple[bool, str]:
+    """Run ``/usr/bin/open`` with *args*. Returns (ok, detail).
+
+    Launch Services, and **never** ``webbrowser``. On macOS ``webbrowser.get()``
+    resolves to ``MacOSXOSAScript``, which drives the target app through
+    ``osascript`` — an Apple Event, so it needs an Automation (TCC) grant. This
+    daemon is a launchd agent and can never be given one interactively, so
+    ``webbrowser.open()`` returned False on every call while no window appeared.
+    Launch Services needs no such grant.
+
+    Used to start cmux by bundle id when its socket is not answering.
     """
     import subprocess
     try:
-        proc = subprocess.run([OPEN_COMMAND, url],
+        proc = subprocess.run([OPEN_COMMAND, *args],
                               capture_output=True, text=True, timeout=15)
-    except Exception:  # noqa: BLE001 - a browser launch must never take the daemon down
-        log.warning("could not run %s for %s", OPEN_COMMAND, url, exc_info=True)
-        return False
+    except Exception as exc:  # noqa: BLE001 - never take the daemon down
+        return False, f"{type(exc).__name__}: {exc}"
     if proc.returncode != 0:
-        log.warning("%s %s failed rc=%s: %s", OPEN_COMMAND, url,
-                    proc.returncode, (proc.stderr or "").strip())
-        return False
-    return True
+        return False, f"rc={proc.returncode} {(proc.stderr or '').strip()[:200]}"
+    return True, ""
 
 
 # ============================================================ error mapping ===
@@ -1199,8 +1340,9 @@ class ApiHandler(_BaseHandler):
 
         Builds the URL locally rather than shelling to ``gh issue view --web``,
         so it costs no API budget and works when ``gh`` is unauthenticated.
-        Handing it to the OS is :func:`_open_url` — read its docstring before
-        changing it back to ``webbrowser``.
+        The issue opens in **cmux**, not the default browser: see
+        :func:`_open_issue_in_cmux`, which finds or creates the workspace whose
+        name begins with the issue number.
         """
         # Drain the request body before doing anything else, or keep-alive
         # desyncs on the next request over the same connection.
@@ -1214,15 +1356,15 @@ class ApiHandler(_BaseHandler):
                     "not_linked",
                     f"Task '{task.get('title')}' has no linked GitHub issue",
                     task_id=task.get("id"))
-            return task["id"], ref
+            return task["id"], ref, task.get("title") or ""
 
-        task_id, ref = self.daemon.read(resolve)
+        task_id, ref, title = self.daemon.read(resolve)
         url = f"https://github.com/{ref.replace('#', '/issues/')}"
-        opened = False
+        result = {"opened": False, "workspace": None, "workspace_created": False}
         if _flag(body.get("open"), True):
-            opened = _open_url(url)
-        return 200, {"task_id": task_id, "issue": ref, "url": url,
-                     "opened": opened}, None
+            number = ref.rsplit("#", 1)[-1]
+            result = _open_issue_in_cmux(url, number, title)
+        return 200, {"task_id": task_id, "issue": ref, "url": url, **result}, None
 
     @route("POST", rf"^{API_PREFIX}/tasks/(?P<tid>[^/]+)/github/push$")
     def h_gh_push(self, tid):
