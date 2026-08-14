@@ -129,8 +129,14 @@ printf 'APPL????' > "$CONTENTS/PkgInfo"
 # The rasterised `.icns` is what ships. The layered `AppIcon.icon` next to it is
 # the Icon Composer source for the macOS 26 treatment Plan §11 wants; compiling
 # it needs `actool`, which is currently broken on this machine (see the comment
-# in Info.plist). Neither `AppIcon.icon` nor the master SVG is copied into the
-# bundle — they are build inputs, not runtime resources.
+# in Info.plist). None of `AppIcon.icon`, `AppIcon.iconset` or the master SVG is
+# copied into the bundle — they are build inputs, not runtime resources.
+#
+# `AppIcon.icns` is committed built rather than generated here, because
+# regenerating it on every build would make the bundle depend on the PNG ladder
+# staying byte-stable. To rebuild it deliberately:
+#
+#     iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns
 #
 # Missing icon is fatal rather than a warning: the plist names one, and a bundle
 # whose CFBundleIconFile points at nothing renders the generic icon while
