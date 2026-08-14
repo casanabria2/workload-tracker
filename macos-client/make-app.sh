@@ -121,6 +121,30 @@ plutil -lint "$CONTENTS/Info.plist" >/dev/null || die "copied Info.plist failed 
 # Legacy, tiny, and still what a few Finder/LaunchServices paths look at first.
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 
+# ------------------------------------------------------------------- icon
+#
+# `CFBundleIconFile` names the file *without* its extension, and the file must
+# sit at the top level of Contents/Resources — not in a subdirectory.
+#
+# The rasterised `.icns` is what ships. The layered `AppIcon.icon` next to it is
+# the Icon Composer source for the macOS 26 treatment Plan §11 wants; compiling
+# it needs `actool`, which is currently broken on this machine (see the comment
+# in Info.plist). Neither `AppIcon.icon` nor the master SVG is copied into the
+# bundle — they are build inputs, not runtime resources.
+#
+# Missing icon is fatal rather than a warning: the plist names one, and a bundle
+# whose CFBundleIconFile points at nothing renders the generic icon while
+# looking, from the plist alone, like it should be fine.
+readonly ICON_NAME="$(plutil -extract CFBundleIconFile raw -o - "$CONTENTS/Info.plist" 2>/dev/null || true)"
+if [[ -n "$ICON_NAME" ]]; then
+    readonly ICON_SRC="$SCRIPT_DIR/Resources/$ICON_NAME.icns"
+    step "Adding the app icon"
+    [[ -f "$ICON_SRC" ]] \
+        || die "Info.plist sets CFBundleIconFile=$ICON_NAME but $ICON_SRC does not exist"
+    cp "$ICON_SRC" "$CONTENTS/Resources/$ICON_NAME.icns"
+    printf '    %s.icns (%s bytes)\n' "$ICON_NAME" "$(stat -f%z "$CONTENTS/Resources/$ICON_NAME.icns")"
+fi
+
 # ------------------------------------------------------------ localization
 #
 # Plan §11: "String catalog from day one even though only `en` ships."
@@ -162,6 +186,14 @@ fi
 # that drops it fails here instead of silently re-breaking the board drag.
 plutil -extract UTExportedTypeDeclarations.0.UTTypeIdentifier raw -o - "$CONTENTS/Info.plist" \
     >/dev/null || die "Info.plist declares no UTExportedTypeDeclarations — see Models/BoardDrop.swift"
+
+# Same shape of assertion for the icon: the plist naming one and the bundle
+# containing one are two different facts, and only the second is what Finder
+# reads.
+if [[ -n "$ICON_NAME" ]]; then
+    [[ -f "$CONTENTS/Resources/$ICON_NAME.icns" ]] \
+        || die "CFBundleIconFile=$ICON_NAME but Contents/Resources/$ICON_NAME.icns is missing"
+fi
 
 # ------------------------------------------------------------ sign
 

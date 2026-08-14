@@ -83,10 +83,26 @@
     <string>public.app-category.productivity</string>
 
     <!--
-      No CFBundleIconFile. Plan §11 wants the icon authored in Icon Composer,
-      which is a GUI tool; shipping a fabricated placeholder would be worse than
-      the generic icon, which reads honestly as "not done yet". See README.
+      The icon is the "Board" direction: three columns with a done badge, on a
+      warm gradient ground. Source artwork lives beside the build in
+      Resources/ — `AppIcon.icon` (the layered Icon Composer package, two
+      groups: Background + Foreground) and `AppIcon-master-1024.svg` (the
+      unmasked full-bleed original).
+
+      This ships the *rasterised* `.icns`, not the layered `.icon`, on purpose.
+      Plan §11 wants the layered macOS 26 icon, and `AppIcon.icon` is committed
+      ready for it — but compiling a `.icon` into a bundle needs `actool`, and
+      `actool` is broken on this machine ("A required plugin failed to load …
+      ibtoold failed IDE initialization", a test compile emits an empty output
+      directory). `xcodebuild -runFirstLaunch` is the fix, and it needs admin
+      rights. Until then `iconutil` gets us a correct, complete icon with no
+      Xcode dependency at all — it just doesn't get the Liquid Glass treatment.
+
+      Upgrading later is a two-line change: swap CFBundleIconFile for
+      CFBundleIconName and compile AppIcon.icon in make-app.sh.
     -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 
     <!--
       The drag type Phase 4 could not use.
