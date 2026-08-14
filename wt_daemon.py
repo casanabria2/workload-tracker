@@ -97,6 +97,36 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 log = logging.getLogger("wt_daemon")
 
 
+#: How a URL is handed to the OS. A module attribute so a test can replace it
+#: without launching a browser.
+OPEN_COMMAND = "/usr/bin/open"
+
+
+def _open_url(url: str) -> bool:
+    """Open *url* in the user's default browser. True when the OS accepted it.
+
+    Uses ``/usr/bin/open`` — Launch Services — and **not** ``webbrowser``.
+    On macOS ``webbrowser.get()`` resolves to ``MacOSXOSAScript``, which drives
+    the browser through ``osascript``; that needs an Automation (TCC) grant, and
+    this daemon runs as a launchd agent which can never be given one
+    interactively. So ``webbrowser.open()`` returned False on every call and the
+    client faithfully reported "Could not open … in a browser" while no window
+    ever appeared. Launch Services needs no such grant.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run([OPEN_COMMAND, url],
+                              capture_output=True, text=True, timeout=15)
+    except Exception:  # noqa: BLE001 - a browser launch must never take the daemon down
+        log.warning("could not run %s for %s", OPEN_COMMAND, url, exc_info=True)
+        return False
+    if proc.returncode != 0:
+        log.warning("%s %s failed rc=%s: %s", OPEN_COMMAND, url,
+                    proc.returncode, (proc.stderr or "").strip())
+        return False
+    return True
+
+
 # ============================================================ error mapping ===
 #
 # ``wt_api.ERROR_CODES`` is API surface — the Swift client switches on the code,
@@ -1167,8 +1197,10 @@ class ApiHandler(_BaseHandler):
     def h_gh_open(self, tid):
         """Open the task's current issue in the default browser.
 
-        Uses ``webbrowser`` rather than ``gh issue view --web`` so it costs no
-        API budget and works when ``gh`` is unauthenticated.
+        Builds the URL locally rather than shelling to ``gh issue view --web``,
+        so it costs no API budget and works when ``gh`` is unauthenticated.
+        Handing it to the OS is :func:`_open_url` — read its docstring before
+        changing it back to ``webbrowser``.
         """
         # Drain the request body before doing anything else, or keep-alive
         # desyncs on the next request over the same connection.
@@ -1188,11 +1220,7 @@ class ApiHandler(_BaseHandler):
         url = f"https://github.com/{ref.replace('#', '/issues/')}"
         opened = False
         if _flag(body.get("open"), True):
-            try:
-                import webbrowser
-                opened = bool(webbrowser.open(url))
-            except Exception:  # noqa: BLE001 - never fail on a browser launch
-                log.warning("could not open %s", url, exc_info=True)
+            opened = _open_url(url)
         return 200, {"task_id": task_id, "issue": ref, "url": url,
                      "opened": opened}, None
 

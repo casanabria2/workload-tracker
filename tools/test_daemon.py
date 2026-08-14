@@ -865,6 +865,48 @@ def test_github_and_integrations(wt, wt_api, wt_daemon, migrated, scratch):
               "POST …/github/open -> 200 with the issue URL "
               "(open=false: no browser launched)", f"{status} {body}")
 
+        # …and with open=true, which is the path the app actually uses and the
+        # one that shipped broken: `webbrowser.open()` returns False under a
+        # launchd agent (it needs an Automation grant), so the endpoint reported
+        # opened=false and the client said "could not open in a browser" while
+        # nothing appeared. Only open=false was ever tested. `OPEN_COMMAND` is
+        # swapped for a recorder so this asserts the wiring without a browser.
+        import wt_daemon as _wtd
+        recorder = scratch / "opened-urls.txt"
+        stub = scratch / "fake-open"
+        stub.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" >> " + str(recorder) + "\nexit 0\n")
+        stub.chmod(0o755)
+        real_open_cmd = _wtd.OPEN_COMMAND
+        _wtd.OPEN_COMMAND = str(stub)
+        try:
+            status, body, _ = h.post(f"/v1/tasks/{subject_id}/github/open",
+                                     {"open": True})
+            check(status == 200 and body["opened"] is True,
+                  "POST …/github/open with open=true reports opened=true",
+                  f"{status} {body}")
+            handed = recorder.read_text().split() if recorder.exists() else []
+            check(handed == [f"https://github.com/{repo}/issues/4321"],
+                  "…and hands exactly that URL to the OS opener", str(handed))
+
+            # A non-zero opener must surface as opened=false, not a 500.
+            stub.write_text("#!/bin/sh\nexit 1\n"); stub.chmod(0o755)
+            status, body, _ = h.post(f"/v1/tasks/{subject_id}/github/open",
+                                     {"open": True})
+            check(status == 200 and body["opened"] is False,
+                  "…and a failing opener reports opened=false, still 200",
+                  f"{status} {body}")
+        finally:
+            _wtd.OPEN_COMMAND = real_open_cmd
+
+        # The docstring *mentions* webbrowser on purpose, to explain why it is
+        # not used — so assert on the code, not the prose.
+        daemon_src = (REPO / "wt_daemon.py").read_text()
+        check("import webbrowser" not in daemon_src,
+              "wt_daemon never imports webbrowser (it needs a TCC grant "
+              "a launchd agent cannot have)")
+        check("_open_url(url)" in daemon_src,
+              "…the open endpoint goes through _open_url")
+
         status, body, _ = h.post(f"/v1/tasks/{subject_id}/github/unlink")
         check(status == 200 and body["old_issue"] == f"{repo}#4321",
               "POST …/github/unlink -> 200", f"{status} {body}")
