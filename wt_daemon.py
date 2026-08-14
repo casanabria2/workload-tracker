@@ -42,6 +42,12 @@ loses the owner's work history:
    config; the legacy stop path deliberately omits the TUI's Arc tab cleanup.
    Safari task windows (``browser_window.py``) *are* wired, because the monitor
    draws its window border from ``active_window_id``.
+4. **Only one presence detector runs at a time.** The daemon's ``_presence_loop``
+   auto-stops an idle timer — the thing that was missing entirely while the TUI
+   was closed, which is most of the day now — but it stands down whenever
+   ``tracker.py`` answers on :7373, because the TUI is already doing it and
+   ``save_data()`` rewrites ``tasks``/``active_timer`` wholesale from memory. A
+   concurrent stop would be silently reverted or double-logged.
 
 Run it::
 
@@ -75,6 +81,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 import wt
 import wt_api
 
+try:  # macOS-only, stdlib-only. A module attribute so a test can monkeypatch it.
+    from idle_detector import get_idle_seconds
+except ImportError:  # pragma: no cover - only off a Mac
+    def get_idle_seconds() -> float:
+        """No idle detector available: never report the user as away."""
+        return 0.0
+
 DAEMON_VERSION = "1.0.0"
 API_PREFIX = "/v1"
 
@@ -93,6 +106,23 @@ WATCH_INTERVAL_SECONDS = 1.0
 TUI_PROBE_CACHE_SECONDS = 2.0
 MAX_OPERATIONS_KEPT = 50
 MAX_BODY_BYTES = 4 * 1024 * 1024
+
+#: Presence poll interval. Deliberately **not** the TUI's 1 Hz:
+#: ``get_idle_seconds()`` forks ``ioreg``, and a 20-second granularity on a
+#: 15-to-20-*minute* threshold costs nothing but 180 forks an hour instead of
+#: 3600.
+PRESENCE_INTERVAL_SECONDS = 20.0
+#: The floor the *logged* (post-subtraction) minutes must clear on the auto-stop
+#: path, matching ``tracker._auto_stop_timer``'s ``logged_minutes > 0.1``.
+IDLE_STOP_MIN_MINUTES = 0.1
+#: How long a pending idle-stop stays actionable. Long enough to survive lunch,
+#: short enough that yesterday's auto-stop is never offered for undo today.
+IDLE_STOP_TTL_SECONDS = 45 * 60
+#: Where the pending record lives inside ``data["config"]``. Config is the right
+#: home rather than daemon memory: the monitor may be down when the auto-stop
+#: happens, and ``tracker.save_data()`` shallow-merges config from disk, so a key
+#: the TUI has never heard of survives a TUI save.
+PENDING_IDLE_STOP_KEY = "pending_idle_stop"
 
 log = logging.getLogger("wt_daemon")
 
@@ -449,6 +479,132 @@ def probe_data_file(path: Path | None = None) -> dict:
     return out
 
 
+# =========================================================== idle-stop record ==
+#
+# When the presence loop stops a timer it leaves a **pending idle-stop** behind:
+# everything the menu-bar monitor needs to show its green panel ("we removed 20m
+# of idle time from 'Task X'") and to undo that removal on one click.
+#
+# Undo semantics, decided deliberately:
+#
+#   * undo puts the subtracted minutes **back on the log entry** (minutes ->
+#     the full elapsed session, note back to a plain ``"Timer session"``);
+#   * undo does **not** restart the timer — the user was away, and silently
+#     resuming a clock they cannot see is how the 5.5-hour bogus entry happened
+#     in the first place;
+#   * acknowledge (the default) leaves the entry as written, with idle removed.
+#
+# Both are idempotent, and both degrade to a reported no-op if the entry was
+# edited or deleted in the meantime rather than clobbering the owner's edit.
+
+
+def pending_idle_stop(data: dict, *, now: float | None = None) -> dict | None:
+    """The still-actionable pending idle-stop in *data*, or None.
+
+    Resolved and expired records read as absent, so no consumer has to know
+    about the TTL. The record is *kept* rather than deleted once resolved: an
+    older ``tracker.py`` holding a stale config in memory would otherwise
+    resurrect the unresolved copy on its next ``save_data()``.
+    """
+    record = (data.get("config") or {}).get(PENDING_IDLE_STOP_KEY)
+    if not isinstance(record, dict) or not record.get("id"):
+        return None
+    if record.get("resolved"):
+        return None
+    now = time.time() if now is None else now
+    if float(record.get("expires_at") or 0) <= now:
+        return None
+    return record
+
+
+def expired_idle_stop_id(data: dict, *, now: float | None = None) -> str | None:
+    """The id of an unresolved-but-expired record, so the loop can retire it."""
+    record = (data.get("config") or {}).get(PENDING_IDLE_STOP_KEY)
+    if not isinstance(record, dict) or not record.get("id"):
+        return None
+    if record.get("resolved"):
+        return None
+    now = time.time() if now is None else now
+    if float(record.get("expires_at") or 0) <= now:
+        return record["id"]
+    return None
+
+
+def mark_idle_stop_resolved(data: dict, record: dict, action: str) -> dict:
+    """Stamp *record* as handled. ``action`` is acknowledged/undone/expired."""
+    record["resolved"] = action
+    record["resolved_at"] = time.time()
+    data.setdefault("config", {})[PENDING_IDLE_STOP_KEY] = record
+    return record
+
+
+def _presence_state(data: dict) -> dict:
+    """Everything one presence pass needs, read in a single transaction.
+
+    Defaults match ``tracker._check_presence`` exactly, including
+    ``presence_detection_enabled`` defaulting to **False**: an absent key means
+    the owner never turned this on, and the daemon must not be the surface that
+    starts stopping their timers.
+    """
+    config = data.get("config") or {}
+    active = data.get("active_timer") or {}
+    try:
+        timeout = float(config.get("idle_timeout_minutes", 15) or 15)
+    except (TypeError, ValueError):
+        timeout = 15.0
+    return {
+        "enabled": bool(config.get("presence_detection_enabled", False)),
+        "timeout_minutes": timeout,
+        "subtract": bool(config.get("subtract_idle_time", True)),
+        "task_id": active.get("task_id"),
+        "started_at": active.get("started_at"),
+        "expired_id": expired_idle_stop_id(data),
+    }
+
+
+def _undo_idle_stop(data: dict, record: dict) -> dict:
+    """Put the subtracted idle minutes back. Never clobbers a later edit.
+
+    Three graceful misses, each reported rather than raised: the task is gone,
+    the log entry was deleted, or its minutes no longer match what the auto-stop
+    wrote (i.e. the owner already adjusted it by hand, and their number wins).
+    The fourth case is not a miss: when the idle tail swallowed the whole
+    session no entry was written at all, and undo *creates* one.
+    """
+    full = round(float(record.get("elapsed_minutes") or 0.0), 2)
+    written = float(record.get("logged_minutes") or 0.0)
+    task = next((t for t in data.get("tasks", [])
+                 if t.get("id") == record.get("task_id")), None)
+    if task is None:
+        return {"restored": False, "detail": "the task no longer exists"}
+
+    logs = task.setdefault("logs", [])
+    log_id = record.get("log_id")
+    entry = next((l for l in logs if l.get("id") == log_id), None) if log_id \
+        else None
+    if log_id and entry is None:
+        return {"restored": False,
+                "detail": "the log entry was deleted since the auto-stop"}
+    if entry is not None and \
+            abs(float(entry.get("minutes") or 0.0) - written) > 0.01:
+        return {"restored": False,
+                "detail": "the log entry was edited since the auto-stop"}
+    if full <= 0.0:
+        return {"restored": False, "detail": "there is nothing to restore"}
+
+    if entry is None:
+        entry = {"id": wt_api.uid(),
+                 "at": record.get("ended_at") or time.time()}
+        for key in ("started_at", "ended_at"):
+            if record.get(key) is not None:
+                entry[key] = record[key]
+        logs.append(entry)
+    entry["minutes"] = full
+    entry["note"] = "Timer session"
+    return {"restored": True, "minutes": full, "log_id": entry["id"],
+            "detail": None}
+
+
 # ================================================================ SSE broker ===
 
 class EventBroker:
@@ -508,7 +664,10 @@ class Daemon:
                  port: int = DEFAULT_PORT, legacy_port: int | None = None,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS,
                  watch_interval: float = WATCH_INTERVAL_SECONDS,
-                 github_sync_on_stop: bool = True):
+                 github_sync_on_stop: bool = True,
+                 presence: bool = True,
+                 presence_interval: float = PRESENCE_INTERVAL_SECONDS,
+                 idle_stop_ttl: float = IDLE_STOP_TTL_SECONDS):
         self.token = token
         self.allow_empty = allow_empty
         self.port = port
@@ -516,6 +675,9 @@ class Daemon:
         self.heartbeat_seconds = heartbeat_seconds
         self.watch_interval = watch_interval
         self.github_sync_on_stop = github_sync_on_stop
+        self.presence = presence
+        self.presence_interval = presence_interval
+        self.idle_stop_ttl = idle_stop_ttl
 
         self.broker = EventBroker()
         self.started_at = time.time()
@@ -533,6 +695,12 @@ class Daemon:
         self._tui_probe = (0.0, False)
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
+        self._presence: threading.Thread | None = None
+        # Ids resolved during *this* daemon's lifetime. Belt and braces against
+        # a running tracker.py resurrecting a pre-resolve config from memory:
+        # the record would come back unresolved on disk, but the monitor asks
+        # us, and we remember. Bounded by one record per auto-stop.
+        self._resolved_idle_stops: set[str] = set()
 
     # ---------------------------------------------------------- lifecycle ----
 
@@ -540,11 +708,17 @@ class Daemon:
         self._watcher = threading.Thread(target=self._watch_loop,
                                          name="wt-daemon-watch", daemon=True)
         self._watcher.start()
+        if self.presence:
+            self._presence = threading.Thread(target=self._presence_loop,
+                                              name="wt-daemon-presence",
+                                              daemon=True)
+            self._presence.start()
 
     def stop(self):
         self._stop.set()
-        if self._watcher is not None:
-            self._watcher.join(timeout=2.0)
+        for thread in (self._watcher, self._presence):
+            if thread is not None:
+                thread.join(timeout=2.0)
 
     def join_background(self, timeout: float = 10.0):
         """Wait for spawned worker threads (hours sync, long operations).
@@ -616,6 +790,192 @@ class Daemon:
                     self.emit_changed("external", "file_mtime")
             except Exception:  # noqa: BLE001 - the watcher must never die
                 log.exception("watcher iteration failed")
+
+    # ------------------------------------------------------ presence/idle ----
+
+    def _presence_loop(self):
+        """Stop a forgotten timer when the user has been away long enough.
+
+        Presence detection used to live **only** in ``tracker.py``'s 1 Hz tick,
+        but there are five headless ways to start a timer (``wt start``, both
+        daemon ports, the macOS app, MCP) and the daemon is what actually runs
+        all day as a LaunchAgent. With the TUI closed — the normal case now — an
+        idle timer simply never stopped; that is how a 5.5-hour bogus entry got
+        written.
+        """
+        while not self._stop.wait(self.presence_interval):
+            try:
+                self._presence_pass()
+            except Exception:  # noqa: BLE001 - the loop must never die
+                log.exception("presence iteration failed")
+
+    def _presence_pass(self):
+        """One poll. Returns the reason it did nothing, for tests and logs.
+
+        **The 7373 gate is the correctness requirement here.** When the TUI is
+        up it is already running its own presence check, and
+        ``tracker.save_data()`` rewrites ``tasks`` and ``active_timer``
+        wholesale from memory — so a concurrent daemon stop is either silently
+        reverted or duplicated as a second log entry. Exactly one detector runs
+        at a time, and while the TUI is open it is the TUI's.
+        """
+        if self.tui_bridge_running():
+            return "tui_running"
+
+        state = self.read(_presence_state)
+        if state["expired_id"]:
+            self._retire_pending_idle_stop(state["expired_id"])
+        if not state["enabled"]:
+            return "disabled"
+        if not state["task_id"]:
+            return "no_timer"
+
+        idle_seconds = get_idle_seconds()
+        if idle_seconds / 60 < state["timeout_minutes"]:
+            return "not_idle"
+
+        # Re-probe: an ioreg fork is not instant, and the TUI coming up during
+        # it would make this the second detector.
+        if self.tui_bridge_running():
+            return "tui_running"
+        self.auto_stop_idle_timer(idle_seconds, timeout_minutes=state["timeout_minutes"])
+        return "stopped"
+
+    def auto_stop_idle_timer(self, idle_seconds: float, *,
+                             timeout_minutes: float | None = None) -> dict | None:
+        """Commit the running session minus the idle tail; leave an undo record.
+
+        The stop goes through the daemon's existing trio —
+        ``wt_api.stop_timer`` inside :meth:`write`, then
+        :meth:`sync_hours_async` — exactly as ``_legacy_stop`` and
+        ``h_timer_stop`` do, rather than re-implementing the TUI's version.
+        Safari task windows are **not** touched (``browser=False``): that
+        integration is deprecated and an auto-stop is not the place to reach out
+        and rearrange the desktop.
+        """
+        idle_minutes = idle_seconds / 60
+
+        def run(data):
+            config = data.setdefault("config", {})
+            active_timer = data.get("active_timer") or {}
+            started_at = active_timer.get("started_at")
+            if config.get("subtract_idle_time", True):
+                note = ("Timer session (auto-stopped, "
+                        f"{int(idle_minutes)}m idle subtracted)")
+                subtract = idle_minutes
+            else:
+                note = "Timer session (auto-stopped due to inactivity)"
+                subtract = 0.0
+            result = wt_api.stop_timer(data, browser=False, note=note,
+                                       subtract_minutes=subtract,
+                                       min_minutes=IDLE_STOP_MIN_MINUTES)
+            entry = result.get("log")
+            now = time.time()
+            record = {
+                "id": wt_api.uid(),
+                "task_id": result.get("task_id"),
+                "task_title": result.get("title"),
+                "log_id": (entry or {}).get("id"),
+                # What the entry says now, what the clock actually ran for, and
+                # the difference the undo hands back.
+                "logged_minutes": round(result.get("logged_minutes") or 0.0, 2),
+                "elapsed_minutes": round(result.get("minutes") or 0.0, 2),
+                "idle_minutes": round(result.get("subtracted_minutes") or 0.0, 2),
+                "idle_timeout_minutes": timeout_minutes,
+                "note": note,
+                "started_at": started_at,
+                "ended_at": now,
+                "at": now,
+                "expires_at": now + self.idle_stop_ttl,
+                "resolved": None,
+                "resolved_at": None,
+            }
+            config[PENDING_IDLE_STOP_KEY] = record
+            return record
+
+        try:
+            record = self.write(run, reason="timer_auto_stopped")
+        except wt_api.WtError as exc:
+            # Another writer stopped it between the read and the write.
+            if exc.code == "no_active_timer":
+                return None
+            raise
+        log.info("auto-stopped '%s' after %.1fm idle: logged %.2fm of %.2fm",
+                 record.get("task_title"), idle_minutes,
+                 record.get("logged_minutes"), record.get("elapsed_minutes"))
+        self.sync_hours_async(record.get("task_id"))
+        self.publish("idle_stop", dict(record))
+        return record
+
+    def pending_idle_stop(self) -> dict | None:
+        """The record the monitor should be showing, or None."""
+        record = self.read(pending_idle_stop)
+        if record and record.get("id") in self._resolved_idle_stops:
+            return None
+        return record
+
+    def _retire_pending_idle_stop(self, record_id: str):
+        """Expire a record nobody acted on, so the file does not carry it."""
+        def run(data):
+            record = (data.get("config") or {}).get(PENDING_IDLE_STOP_KEY)
+            if not isinstance(record, dict) or record.get("id") != record_id \
+                    or record.get("resolved"):
+                return None
+            return dict(mark_idle_stop_resolved(data, record, "expired"))
+
+        record = self.write(run, reason="idle_stop_expired")
+        if record is not None:
+            self._resolved_idle_stops.add(record_id)
+            self.publish("idle_stop_resolved",
+                         {"id": record_id, "action": "expired",
+                          "task_id": record.get("task_id"), "at": time.time()})
+        return record
+
+    def resolve_idle_stop(self, action: str,
+                          record_id: str | None = None) -> dict:
+        """Acknowledge or undo the pending idle-stop. Idempotent either way.
+
+        ``acknowledged`` keeps the entry as written (idle removed);
+        ``undone`` restores the subtracted minutes onto the log entry and
+        reverts its note. Neither restarts the timer. A record that is already
+        resolved, expired, or whose log entry has since been edited or deleted
+        answers 200 with ``restored``/``cleared`` false and a ``detail`` — never
+        an error, and never a clobbered edit.
+        """
+        if action not in ("acknowledge", "undo"):
+            raise DaemonError("bad_request",
+                              "'action' must be acknowledge or undo",
+                              action=action)
+        resolved_as = "acknowledged" if action == "acknowledge" else "undone"
+        miss = {"action": resolved_as, "cleared": False, "restored": False,
+                "id": record_id, "detail": "no pending idle-stop"}
+
+        current = self.pending_idle_stop()
+        if current is None or (record_id and current.get("id") != record_id):
+            return miss
+
+        def run(data):
+            record = pending_idle_stop(data)
+            if record is None or (record_id and record.get("id") != record_id):
+                return dict(miss)
+            out = {"action": resolved_as, "cleared": True, "restored": False,
+                   "id": record["id"], "task_id": record.get("task_id"),
+                   "task_title": record.get("task_title"), "detail": None,
+                   "minutes": record.get("logged_minutes")}
+            if action == "undo":
+                out.update(_undo_idle_stop(data, record))
+            mark_idle_stop_resolved(data, record, resolved_as)
+            return out
+
+        out = self.write(run, reason=f"idle_stop_{resolved_as}")
+        if out.get("cleared"):
+            self._resolved_idle_stops.add(out["id"])
+            self.publish("idle_stop_resolved",
+                         {"id": out["id"], "action": resolved_as,
+                          "task_id": out.get("task_id"),
+                          "restored": out.get("restored"),
+                          "minutes": out.get("minutes"), "at": time.time()})
+        return out
 
     # -------------------------------------------------------- transactions ---
 
@@ -843,6 +1203,11 @@ class Daemon:
             # clobber the daemon's writes. The client shows a banner on this.
             "tui_bridge": {"port": TUI_BRIDGE_PORT,
                            "running": self.tui_bridge_running()},
+            # Same risk, other direction: while the TUI is up *it* owns idle
+            # detection, so `active` is False even when the loop is running.
+            "presence": {"enabled": self.presence,
+                         "interval_seconds": self.presence_interval,
+                         "active": self.presence and not self.tui_bridge_running()},
             "subscribers": self.broker.subscribers,
             "allow_empty": self.allow_empty,
             "python": sys.version.split()[0],
@@ -1180,6 +1545,19 @@ class ApiHandler(_BaseHandler):
                      "logged": result.get("logged"),
                      "log": result.get("log")}, None
 
+    # ---------------------------------------------------------- idle stop ----
+
+    @route("GET", rf"^{API_PREFIX}/idle-stop$")
+    def h_idle_stop(self):
+        return 200, {"pending_idle_stop": self.daemon.pending_idle_stop()}, None
+
+    @route("POST", rf"^{API_PREFIX}/idle-stop/(?P<action>ack|undo)$")
+    def h_idle_stop_resolve(self, action):
+        body = self.read_json()
+        return 200, self.daemon.resolve_idle_stop(
+            "acknowledge" if action == "ack" else "undo",
+            body.get("id")), None
+
     # --------------------------------------------------------------- logs ----
 
     @route("POST", rf"^{API_PREFIX}/tasks/(?P<tid>[^/]+)/logs$")
@@ -1462,6 +1840,18 @@ def _safari_manager():
 #   POST /timer/start  -> {"action","task"}          body {"task_id": ...}
 #   POST /timer/stop   -> {"action","task","logged_minutes"}
 #
+# Three endpoints are *additive* to that contract, for the idle-stop panel. They
+# live here rather than only on the authenticated :7374 because this is the port
+# the monitor is actually pointed at (`defaults read WorkloadMonitor` ->
+# trackerBaseURL = http://127.0.0.1:7375), and the whole premise of §5.4 is that
+# the monitor sends no Authorization header:
+#
+#   GET  /idle-stop      -> {"pending_idle_stop": {...} | null}
+#   POST /idle-stop/ack  -> {"action":"acknowledged","cleared",...}  body {"id"?}
+#   POST /idle-stop/undo -> {"action":"undone","restored","minutes",...}
+#
+# They are mirrored at /v1/idle-stop{,/ack,/undo} for a token-bearing client.
+#
 # `role` and `started_at` are **non-optional** in the monitor's Codable structs,
 # so emitting null for either is a decode failure, not a graceful degradation.
 # `active_window_id` and `last_logged_at` are optional there but load-bearing
@@ -1493,6 +1883,12 @@ class LegacyHandler(_BaseHandler):
                 body = self.legacy_status()
             elif action == "tasks":
                 body = self.legacy_tasks()
+            elif action == "idle-stop" and not parts[1:]:
+                # Additive to the contract, and deliberately *not* folded into
+                # /status: `tools/test_legacy_contract.py` asserts /status has
+                # exactly tracker._bridge_status()'s top-level keys, and that
+                # oracle is worth more than saving the monitor one poll.
+                body = {"pending_idle_stop": self.daemon.pending_idle_stop()}
             elif action == "timer" and parts[1:2] == ["toggle"]:
                 body = self.legacy_toggle()
             elif action == "log" and len(parts) > 1:
@@ -1532,6 +1928,10 @@ class LegacyHandler(_BaseHandler):
                 body = self.legacy_start(task_id)
             elif parts[:2] == ["timer", "stop"]:
                 body = self.legacy_stop()
+            elif parts[:2] in (["idle-stop", "ack"], ["idle-stop", "undo"]):
+                body = self.daemon.resolve_idle_stop(
+                    "acknowledge" if parts[1] == "ack" else "undo",
+                    self.read_json().get("id"))
             else:
                 self.send_json({"error": f"Unknown action: {path}"}, 404)
                 return
@@ -1830,6 +2230,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "over an unreadable (Full Disk Access) file")
     parser.add_argument("--no-github-sync-on-stop", action="store_true",
                         help="do not push hours to GitHub after a timer stop")
+    parser.add_argument("--no-presence", action="store_true",
+                        help="do not run the idle/presence loop. The loop is "
+                             "already inert while tracker.py holds :7373 (the "
+                             "TUI is then the sole detector) and while "
+                             "config.presence_detection_enabled is false; this "
+                             "turns the thread off outright")
+    parser.add_argument("--presence-interval", type=float,
+                        default=PRESENCE_INTERVAL_SECONDS,
+                        help=f"idle poll interval in seconds "
+                             f"(default {PRESENCE_INTERVAL_SECONDS:g}); each "
+                             f"poll forks ioreg, so this is not 1 Hz")
     parser.add_argument("--heartbeat-seconds", type=float,
                         default=HEARTBEAT_SECONDS)
     parser.add_argument("--watch-interval", type=float,
@@ -1868,7 +2279,9 @@ def main(argv=None) -> int:
                     legacy_port=args.legacy_port,
                     heartbeat_seconds=args.heartbeat_seconds,
                     watch_interval=args.watch_interval,
-                    github_sync_on_stop=not args.no_github_sync_on_stop)
+                    github_sync_on_stop=not args.no_github_sync_on_stop,
+                    presence=not args.no_presence,
+                    presence_interval=args.presence_interval)
     try:
         api, legacy = make_servers(daemon, args.host)
     except OSError as exc:

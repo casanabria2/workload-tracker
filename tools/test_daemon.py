@@ -294,14 +294,25 @@ class DaemonHarness:
 
     def __init__(self, wt_daemon, token="test-token-not-a-secret", *,
                  legacy=True, watch_interval=0.15, heartbeat_seconds=1.0,
-                 github_sync_on_stop=False, allow_empty=False):
+                 github_sync_on_stop=False, allow_empty=False,
+                 presence=False, presence_interval=0.05,
+                 idle_stop_ttl=None):
         self.wt_daemon = wt_daemon
         self.token = token
         self.legacy = legacy
+        # ``presence`` defaults **off** here on purpose. The fixture is a copy of
+        # the live file, which has presence_detection_enabled=true and may carry
+        # a running timer; a loop left on would auto-stop it out from under an
+        # unrelated section the moment the machine went idle.
         self.kwargs = dict(watch_interval=watch_interval,
                            heartbeat_seconds=heartbeat_seconds,
                            github_sync_on_stop=github_sync_on_stop,
-                           allow_empty=allow_empty)
+                           allow_empty=allow_empty,
+                           presence=presence,
+                           presence_interval=presence_interval,
+                           idle_stop_ttl=(wt_daemon.IDLE_STOP_TTL_SECONDS
+                                          if idle_stop_ttl is None
+                                          else idle_stop_ttl))
         self.daemon = None
         self.api = None
         self.legacy_server = None
@@ -1516,8 +1527,291 @@ def test_lifecycle(wt, wt_daemon, migrated, scratch):
           f"rc={rc}")
 
 
+class FakeIdle:
+    """Swap ``wt_daemon.get_idle_seconds`` for a value the test controls.
+
+    A context manager rather than a bare assignment so a failing check can never
+    leave the real ``ioreg``-forking detector replaced for later sections.
+    """
+
+    def __init__(self, wt_daemon, seconds=0.0):
+        self.wt_daemon = wt_daemon
+        self.seconds = seconds
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = self.wt_daemon.get_idle_seconds
+        self.wt_daemon.get_idle_seconds = lambda: self.seconds
+        return self
+
+    def __exit__(self, *exc):
+        self.wt_daemon.get_idle_seconds = self._saved
+        return False
+
+
+def arm_timer(wt, path, *, elapsed_minutes, enabled=True, timeout=20,
+              subtract=True):
+    """Point wt at *path* and give it a timer that started *elapsed* ago.
+
+    Returns ``(data, task)``. The task is the first non-done one, so the log
+    assertions below have a stable subject.
+    """
+    data = wt.load()
+    task = next(t for t in data["tasks"] if t.get("status") != "done")
+    config = data.setdefault("config", {})
+    config["presence_detection_enabled"] = enabled
+    config["idle_timeout_minutes"] = timeout
+    config["subtract_idle_time"] = subtract
+    config.pop(wt_daemon_module().PENDING_IDLE_STOP_KEY, None)
+    data["active_timer"] = {"task_id": task["id"],
+                            "started_at": time.time() - elapsed_minutes * 60}
+    wt.save(data)
+    return data, task
+
+
+def wt_daemon_module():
+    import wt_daemon
+    return wt_daemon
+
+
+def logs_of(wt, task_id):
+    data = wt.load()
+    task = next(t for t in data["tasks"] if t["id"] == task_id)
+    return list(task.get("logs") or [])
+
+
+def test_presence(wt, wt_api, wt_daemon, migrated, scratch):
+    section("14. presence: the daemon auto-stops an idle timer (and the TUI wins)")
+    work = scratch / "presence.json"
+    fresh(wt, migrated, work)
+
+    # `strict` is the point of the section: an auto-stop is a *local* operation.
+    # Any gh call at all — including the hours sync, which the harness disables —
+    # hard-fails here rather than being noticed later by the fake-gh log.
+    fixture_sprints = wt.get_cached_sprints(json.loads(Path(migrated).read_text()))
+    with ApiStubs(wt, mode="strict", sprints=fixture_sprints) as stubs:
+
+        # -- (i) presence_detection_enabled = false -> never stops -------------
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, enabled=False)
+        before = len(logs_of(wt, task["id"]))
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 30 * 60):
+            reason = h.daemon._presence_pass()
+            check(reason == "disabled",
+                  "presence_detection_enabled=false -> the pass declines",
+                  f"reason={reason}")
+        after = wt.load()
+        check(after.get("active_timer") is not None
+              and len(logs_of(wt, task["id"])) == before,
+              "…and the timer is still running, with no log written",
+              f"timer={bool(after.get('active_timer'))} "
+              f"logs {before}->{len(logs_of(wt, task['id']))}")
+
+        # -- (ii) the TUI is up -> the daemon stands down ----------------------
+        # THE correctness gate: tracker.py is already detecting idle, and its
+        # save_data() rewrites tasks+active_timer wholesale from memory, so a
+        # concurrent daemon stop is silently reverted or double-logged.
+        _data, task = arm_timer(wt, work, elapsed_minutes=60)
+        before = len(logs_of(wt, task["id"]))
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 30 * 60):
+            # Prime the cached :7373 probe rather than replacing the method, so
+            # the real tui_bridge_running() is what the pass consults.
+            h.daemon._tui_probe = (time.monotonic(), True)
+            check(h.daemon.tui_bridge_running() is True,
+                  "the :7373 probe reads as 'TUI running'")
+            reason = h.daemon._presence_pass()
+            check(reason == "tui_running",
+                  "…so the presence pass stands down (the TUI is the detector)",
+                  f"reason={reason}")
+        check(wt.load().get("active_timer") is not None
+              and len(logs_of(wt, task["id"])) == before,
+              "…and it wrote nothing at all",
+              f"logs {before}->{len(logs_of(wt, task['id']))}")
+
+        # -- (iii) the real thing: one log, subtracted, with the TUI's note ----
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
+        before = logs_of(wt, task["id"])
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 20 * 60):
+            h.daemon._tui_probe = (time.monotonic(), False)
+            events = SSEClient(h.port, h.token)
+            time.sleep(0.2)
+            reason = h.daemon._presence_pass()
+            check(reason == "stopped", "20m idle past a 20m threshold -> stopped",
+                  f"reason={reason}")
+
+            after = logs_of(wt, task["id"])
+            check(len(after) == len(before) + 1,
+                  "exactly ONE log entry was written",
+                  f"{len(before)} -> {len(after)}")
+            entry = after[-1] if after else {}
+            check(abs(float(entry.get("minutes") or 0) - 40.0) < 0.5,
+                  "…carrying elapsed minus idle (60 - 20 = 40)",
+                  str(entry.get("minutes")))
+            check(entry.get("note") == "Timer session (auto-stopped, "
+                                       "20m idle subtracted)",
+                  "…and tracker.py's auto-stop note verbatim",
+                  repr(entry.get("note")))
+            check(wt.load().get("active_timer") is None,
+                  "…and the timer is cleared")
+
+            # -- (iv) the pending record, on both contracts --------------------
+            status, body, _ = h.get("/v1/idle-stop")
+            record = (body or {}).get("pending_idle_stop") or {}
+            check(status == 200 and record.get("task_id") == task["id"]
+                  and record.get("log_id") == entry.get("id"),
+                  "GET /v1/idle-stop returns the pending record",
+                  f"{status} {json.dumps(record, default=str)[:200]}")
+            for key in ("id", "task_id", "task_title", "log_id",
+                        "logged_minutes", "elapsed_minutes", "idle_minutes",
+                        "at", "expires_at"):
+                check(key in record, f"…the record carries {key!r}",
+                      str(sorted(record)))
+            check(abs(record["elapsed_minutes"] - 60) < 0.5
+                  and abs(record["idle_minutes"] - 20) < 0.5,
+                  "…with the full elapsed and the subtracted idle",
+                  f"{record.get('elapsed_minutes')} / "
+                  f"{record.get('idle_minutes')}")
+
+            legacy_status, legacy_body, _ = request(
+                h.legacy_port, "GET", "/idle-stop")
+            check(legacy_status == 200
+                  and (legacy_body or {}).get("pending_idle_stop", {})
+                  .get("id") == record["id"],
+                  "…and the unauthenticated :7375 contract serves the same one "
+                  "(that is the port the monitor is pointed at)",
+                  f"{legacy_status}")
+
+            seen = events.wait("idle_stop", timeout=5)
+            check(seen is not None and seen.get("task_id") == task["id"],
+                  "an SSE idle_stop event carried the record",
+                  json.dumps(seen, default=str)[:200])
+
+            # /status must NOT have grown a key — the legacy oracle depends on it.
+            _s, status_body, _ = request(h.legacy_port, "GET", "/status")
+            check(set(status_body) == {"active_timer", "tasks", "time_by_role"},
+                  "…while GET /status keeps exactly tracker's top-level keys",
+                  str(sorted(status_body)))
+
+            # -- (v) undo restores the full minutes, and is idempotent ---------
+            u_status, undo, _ = request(h.legacy_port, "POST", "/idle-stop/undo",
+                                        body={"id": record["id"]})
+            check(u_status == 200 and undo.get("restored") is True
+                  and abs(float(undo.get("minutes") or 0) - 60) < 0.5,
+                  "POST /idle-stop/undo restores the subtracted minutes",
+                  f"{u_status} {json.dumps(undo, default=str)[:200]}")
+            restored = logs_of(wt, task["id"])
+            check(len(restored) == len(after),
+                  "…without adding a second entry",
+                  f"{len(after)} -> {len(restored)}")
+            back = next((l for l in restored if l["id"] == entry["id"]), {})
+            check(abs(float(back.get("minutes") or 0) - 60) < 0.5
+                  and back.get("note") == "Timer session",
+                  "…the entry now reads the full session, noted plainly",
+                  f"{back.get('minutes')} {back.get('note')!r}")
+            check(wt.load().get("active_timer") is None,
+                  "…and undo did NOT restart the timer")
+
+            u2_status, undo2, _ = request(h.legacy_port, "POST",
+                                          "/idle-stop/undo",
+                                          body={"id": record["id"]})
+            check(u2_status == 200 and undo2.get("restored") is False,
+                  "a second undo is a reported no-op, not an error or a "
+                  "double-restore", f"{u2_status} {undo2}")
+            check(abs(float(logs_of(wt, task["id"])[-1].get("minutes") or 0)
+                      - 60) < 0.5,
+                  "…and the entry is untouched by it")
+            _s, body_after, _ = request(h.legacy_port, "GET", "/idle-stop")
+            check((body_after or {}).get("pending_idle_stop") is None,
+                  "…and nothing is pending any more", str(body_after))
+
+            done = events.wait("idle_stop_resolved", timeout=5)
+            check(done is not None and done.get("action") == "undone",
+                  "…and an idle_stop_resolved/undone event was published",
+                  json.dumps(done, default=str)[:200])
+            events.close()
+        invariants(work, "the presence auto-stop + undo")
+
+        # -- acknowledge, and a log edited out from under the undo -------------
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 20 * 60):
+            h.daemon._tui_probe = (time.monotonic(), False)
+            h.daemon._presence_pass()
+            record = h.get("/v1/idle-stop")[1]["pending_idle_stop"]
+            a_status, ack, _ = request(h.legacy_port, "POST", "/idle-stop/ack")
+            check(a_status == 200 and ack.get("cleared") is True
+                  and ack.get("action") == "acknowledged",
+                  "POST /idle-stop/ack clears the record", f"{a_status} {ack}")
+            kept = next(l for l in logs_of(wt, task["id"])
+                        if l["id"] == record["log_id"])
+            check(abs(float(kept["minutes"]) - 40) < 0.5,
+                  "…leaving the entry as written, idle removed",
+                  str(kept["minutes"]))
+            check(request(h.legacy_port, "POST", "/idle-stop/ack")[1]
+                  .get("cleared") is False,
+                  "…and a second ack is an idempotent no-op")
+
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 20 * 60):
+            h.daemon._tui_probe = (time.monotonic(), False)
+            h.daemon._presence_pass()
+            record = h.get("/v1/idle-stop")[1]["pending_idle_stop"]
+            # The owner adjusts the entry by hand before deciding. Their number
+            # must win over the undo's.
+            status, _b, _ = h.patch(
+                f"/v1/tasks/{task['id']}/logs/{record['log_id']}",
+                {"minutes": 12.5})
+            check(status == 200, "the owner edits the entry to 12.5m", str(status))
+            _s, undo, _ = request(h.legacy_port, "POST", "/idle-stop/undo")
+            check(undo.get("restored") is False and "edited" in
+                  (undo.get("detail") or ""),
+                  "undo refuses to clobber a hand-edited entry",
+                  json.dumps(undo, default=str))
+            edited = next(l for l in logs_of(wt, task["id"])
+                          if l["id"] == record["log_id"])
+            check(abs(float(edited["minutes"]) - 12.5) < 0.01,
+                  "…and the owner's 12.5m stands", str(edited["minutes"]))
+
+        # -- the record expires rather than lingering -------------------------
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
+        with DaemonHarness(wt_daemon, idle_stop_ttl=0.4) as h, \
+                FakeIdle(wt_daemon, 20 * 60):
+            h.daemon._tui_probe = (time.monotonic(), False)
+            h.daemon._presence_pass()
+            check(h.get("/v1/idle-stop")[1]["pending_idle_stop"] is not None,
+                  "a fresh record is pending")
+            time.sleep(0.6)
+            check(h.get("/v1/idle-stop")[1]["pending_idle_stop"] is None,
+                  "…and reads as absent once its TTL lapses")
+
+        # -- the loop thread actually runs, and stops ------------------------
+        fresh_idle(wt, migrated, scratch / "presence-thread.json")
+        with DaemonHarness(wt_daemon, presence=True, presence_interval=0.05) as h, \
+                FakeIdle(wt_daemon, 0.0):
+            time.sleep(0.3)
+            thread = h.daemon._presence
+            check(thread is not None and thread.is_alive(),
+                  "--presence (the default) runs a wt-daemon-presence thread",
+                  str(thread))
+        check(thread is not None and not thread.is_alive(),
+              "…and Daemon.stop() joins it")
+
+        daemon = wt_daemon.Daemon("t", port=0, presence=False)
+        daemon.start()
+        daemon.stop()
+        check(daemon._presence is None,
+              "--no-presence starts no thread at all")
+        args = wt_daemon.build_parser().parse_args(["--no-presence"])
+        check(args.no_presence is True,
+              "…and the CLI flag exists, mirroring --no-github-sync-on-stop")
+
+        # -- (vi) not one GitHub call in the whole section --------------------
+        check(not stubs.calls,
+              "no gh-touching wt function was called anywhere above",
+              str(stubs.names()))
+    invariants(work, "the presence section")
+
+
 def test_no_gh_escaped():
-    section("14. belt and braces: no real gh invocation")
+    section("15. belt and braces: no real gh invocation")
     fake_log = os.environ.get("WT_FAKE_GH_LOG")
     if not fake_log:
         print("       (WT_FAKE_GH_LOG unset — skipping; every gh path above is "
@@ -1581,6 +1875,7 @@ def main():
             test_lock_timeout(wt, wt_daemon, migrated, scratch)
             test_sse(wt, wt_daemon, migrated, scratch)
             test_lifecycle(wt, wt_daemon, migrated, scratch)
+            test_presence(wt, wt_api, wt_daemon, migrated, scratch)
         test_no_gh_escaped()
     finally:
         for name, module in saved_modules.items():

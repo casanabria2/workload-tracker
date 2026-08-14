@@ -748,11 +748,32 @@ def start_timer(data: dict, task_id: str, *, browser: bool = False) -> dict:
             "stopped": stopped}
 
 
-def stop_timer(data: dict, *, browser: bool = False) -> dict:
+#: The shortest session ``_commit_timer`` will record, in minutes. A stop three
+#: seconds after a start is a misclick, not work.
+MIN_LOGGED_MINUTES = 0.05
+
+
+def stop_timer(data: dict, *, browser: bool = False, note: str | None = None,
+               subtract_minutes: float = 0.0,
+               min_minutes: float = MIN_LOGGED_MINUTES) -> dict:
     """Stop the running timer and log the elapsed session.
 
     Raises ``no_active_timer`` when nothing is running, so a caller can tell
     "stopped nothing" from "stopped something of zero length".
+
+    The three keyword-only extras are **additive and defaulted**, so every
+    existing caller keeps its exact behaviour; they exist for the daemon's
+    presence loop (:meth:`wt_daemon.Daemon._auto_stop_idle_timer`), which needs
+    the TUI's auto-stop log shape:
+
+    * *note* replaces the ``"Timer session"`` note (the TUI writes
+      ``"Timer session (auto-stopped, 20m idle subtracted)"``).
+    * *subtract_minutes* is removed from the logged minutes — the idle tail the
+      user was away for. ``minutes`` in the result stays the **full** elapsed
+      time either way, so a caller can still report what the clock ran for.
+    * *min_minutes* is the floor the *logged* (post-subtraction) minutes must
+      clear to be written at all. The TUI uses 0.1 on this path; the ordinary
+      stop keeps the historical 0.05 on the raw elapsed.
     """
     active_timer = data.get("active_timer")
     if not active_timer:
@@ -760,35 +781,53 @@ def stop_timer(data: dict, *, browser: bool = False) -> dict:
 
     task = next((t for t in data.get("tasks", [])
                  if t.get("id") == active_timer.get("task_id")), None)
-    stopped = _commit_timer(task, active_timer) if task is not None else {
-        "task_id": active_timer.get("task_id"), "title": None,
-        "minutes": (time.time() - active_timer["started_at"]) / 60,
-        "logged": False, "log": None,
-    }
+    if task is not None:
+        stopped = _commit_timer(task, active_timer, note=note,
+                                subtract_minutes=subtract_minutes,
+                                min_minutes=min_minutes)
+    else:
+        elapsed = (time.time() - active_timer["started_at"]) / 60
+        stopped = {
+            "task_id": active_timer.get("task_id"), "title": None,
+            "minutes": elapsed, "logged": False, "log": None,
+            "logged_minutes": max(0.0, elapsed - max(0.0, subtract_minutes or 0.0)),
+            "subtracted_minutes": max(0.0, subtract_minutes or 0.0),
+        }
     data["active_timer"] = None
     if browser and task is not None:
         wt._browser_switch(data, task, None)
     return {"task": task, **stopped}
 
 
-def _commit_timer(task: dict, active_timer: dict) -> dict:
-    """Append the ``"Timer session"`` log for *active_timer*, if long enough."""
+def _commit_timer(task: dict, active_timer: dict, *, note: str | None = None,
+                  subtract_minutes: float = 0.0,
+                  min_minutes: float = MIN_LOGGED_MINUTES) -> dict:
+    """Append the ``"Timer session"`` log for *active_timer*, if long enough.
+
+    With the defaults this is exactly what it has always been: the whole elapsed
+    session, noted ``"Timer session"``, written when it exceeds 0.05 min. See
+    :func:`stop_timer` for what the keyword-only arguments are for.
+    """
     started_at = active_timer["started_at"]
     ended_at = time.time()
     elapsed = (ended_at - started_at) / 60
+    subtracted = max(0.0, subtract_minutes or 0.0)
+    logged_minutes = max(0.0, elapsed - subtracted)
     log = None
-    if elapsed > 0.05:
+    if logged_minutes > min_minutes:
         log = {
             "id": uid(),
-            "minutes": round(elapsed, 2),
-            "note": "Timer session",
+            "minutes": round(logged_minutes, 2),
+            "note": note or "Timer session",
             "at": ended_at,
             "started_at": started_at,
             "ended_at": ended_at,
         }
         task.setdefault("logs", []).append(log)
     return {"task_id": task.get("id"), "title": task.get("title"),
-            "minutes": elapsed, "logged": log is not None, "log": log}
+            "minutes": elapsed, "logged": log is not None, "log": log,
+            "logged_minutes": logged_minutes,
+            "subtracted_minutes": subtracted}
 
 
 # ------------------------------------------------------------------- logs -----
