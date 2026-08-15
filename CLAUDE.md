@@ -366,14 +366,42 @@ by `wt start`, either daemon port, the macOS app or MCP never stopped at all.
 elapsed_minutes, idle_minutes, idle_timeout_minutes, note, started_at, ended_at,
 at, expires_at, resolved}`), publishes an SSE `idle_stop` event, and serves it
 from `GET /idle-stop` (unauthenticated :7375, the port the menu-bar monitor is
-pointed at) and `GET /v1/idle-stop`. `POST /idle-stop/ack` accepts the removal;
-`POST /idle-stop/undo` puts the subtracted minutes back on the log entry and
-reverts its note. **Undo does not restart the timer.** Both are idempotent, both
+pointed at) and `GET /v1/idle-stop`.
+
+The two resolutions are **deliberately asymmetric**, because they mean opposite
+things about whether the detection was right:
+
+- `POST /idle-stop/ack` — the detection was correct. The entry stays as written
+  with the idle removed, and **the timer stays stopped** (so the monitor's red
+  "no timer running" panel follows).
+- `POST /idle-stop/undo` — the detection was a false positive: the owner *was*
+  working, just not typing. So it is a true inverse — **the log entry the
+  auto-stop wrote is deleted and `active_timer` is restored with the record's
+  original `started_at`**, so the minutes keep accruing in the live timer and
+  land as one continuous session at the eventual real stop. It deliberately does
+  *not* keep the entry at full elapsed *and* start a timer (double-counts), and
+  does not start a fresh timer from `now` (splits one session in two at an
+  arbitrary idle boundary). A late undo therefore counts the whole idle stretch
+  as worked time — correct, given the undo asserts the detection was wrong.
+
+Undo falls back to the old behaviour (restore the minutes onto the entry, change
+nothing else) when it cannot safely resume: **another timer is already running**
+— never clobbered — or the original `started_at` was not recorded. The response
+carries `mode` (`timer_resumed` / `minutes_restored` / `none`) and `resumed`, so
+a client can word itself honestly instead of claiming a resume that did not
+happen. `Daemon._resumed_tasks` holds a `RESUME_GRACE_SECONDS` (60s,
+`resume_grace=`) window per task after a resume so the next poll cannot
+immediately re-stop the timer it was just asked to restore; clicking the panel
+button is HID input and resets `HIDIdleTime` anyway, but an API-driven undo
+(curl, a future client) gets no such side effect.
+
+Both are idempotent — a second call is a no-op, never a second resume — both
 answer 200 with a `detail` rather than an error when there is nothing to do or
 the entry was edited/deleted since, and the record expires after 45 minutes.
-Resolution publishes `idle_stop_resolved`. `wt_api.stop_timer` /
-`_commit_timer` grew additive, defaulted `note=` / `subtract_minutes=` /
-`min_minutes=` keywords for this; every pre-existing caller is unchanged.
+Resolution publishes `idle_stop_resolved` carrying `mode`/`resumed`.
+`wt_api.stop_timer` / `_commit_timer` grew additive, defaulted `note=` /
+`subtract_minutes=` / `min_minutes=` keywords for this; every pre-existing
+caller is unchanged.
 
 ### Google Calendar Integration
 

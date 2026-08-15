@@ -296,7 +296,7 @@ class DaemonHarness:
                  legacy=True, watch_interval=0.15, heartbeat_seconds=1.0,
                  github_sync_on_stop=False, allow_empty=False,
                  presence=False, presence_interval=0.05,
-                 idle_stop_ttl=None):
+                 idle_stop_ttl=None, resume_grace=None):
         self.wt_daemon = wt_daemon
         self.token = token
         self.legacy = legacy
@@ -312,7 +312,10 @@ class DaemonHarness:
                            presence_interval=presence_interval,
                            idle_stop_ttl=(wt_daemon.IDLE_STOP_TTL_SECONDS
                                           if idle_stop_ttl is None
-                                          else idle_stop_ttl))
+                                          else idle_stop_ttl),
+                           resume_grace=(wt_daemon.RESUME_GRACE_SECONDS
+                                         if resume_grace is None
+                                         else resume_grace))
         self.daemon = None
         self.api = None
         self.legacy_server = None
@@ -1691,37 +1694,65 @@ def test_presence(wt, wt_api, wt_daemon, migrated, scratch):
                   "…while GET /status keeps exactly tracker's top-level keys",
                   str(sorted(status_body)))
 
-            # -- (v) undo restores the full minutes, and is idempotent ---------
+            # -- (v) undo is a TRUE undo: entry deleted, timer resumed ---------
+            # Not "restore the minutes and start a fresh timer" — that would
+            # double-count — and not a timer from `now`, which would split one
+            # session in two at an arbitrary idle boundary. The minutes go back
+            # into the live timer and land as one entry at the real stop.
             u_status, undo, _ = request(h.legacy_port, "POST", "/idle-stop/undo",
                                         body={"id": record["id"]})
-            check(u_status == 200 and undo.get("restored") is True
-                  and abs(float(undo.get("minutes") or 0) - 60) < 0.5,
-                  "POST /idle-stop/undo restores the subtracted minutes",
-                  f"{u_status} {json.dumps(undo, default=str)[:200]}")
+            check(u_status == 200 and undo.get("resumed") is True
+                  and undo.get("mode") == "timer_resumed",
+                  "POST /idle-stop/undo resumes the timer",
+                  f"{u_status} {json.dumps(undo, default=str)[:240]}")
             restored = logs_of(wt, task["id"])
-            check(len(restored) == len(after),
-                  "…without adding a second entry",
-                  f"{len(after)} -> {len(restored)}")
-            back = next((l for l in restored if l["id"] == entry["id"]), {})
-            check(abs(float(back.get("minutes") or 0) - 60) < 0.5
-                  and back.get("note") == "Timer session",
-                  "…the entry now reads the full session, noted plainly",
-                  f"{back.get('minutes')} {back.get('note')!r}")
-            check(wt.load().get("active_timer") is None,
-                  "…and undo did NOT restart the timer")
+            check(len(restored) == len(before),
+                  "…deleting the log entry the auto-stop wrote",
+                  f"{len(after)} -> {len(restored)} (pre-stop {len(before)})")
+            check(not any(l["id"] == entry["id"] for l in restored),
+                  "…that exact entry specifically, not merely one of them")
+            resumed = wt.load().get("active_timer") or {}
+            check(resumed.get("task_id") == task["id"],
+                  "…and active_timer is back on the same task",
+                  json.dumps(resumed, default=str))
+            check(abs(float(resumed.get("started_at") or 0)
+                      - float(record["started_at"])) < 0.01,
+                  "…with the ORIGINAL started_at, not `now` — so the session "
+                  "stays continuous and the minutes are counted once",
+                  f"{resumed.get('started_at')} vs {record['started_at']}")
+            check(undo.get("counted_idle_minutes") is not None
+                  and "idle" in (undo.get("detail") or ""),
+                  "…and the body says out loud that the idle stretch now "
+                  "counts as worked time", json.dumps(undo, default=str)[:240])
 
+            # (2) No instant re-fire. The click is HID input in practice, but an
+            # API-driven undo gets no such side effect.
+            check(h.daemon._presence_pass() == "recently_resumed",
+                  "the very next presence pass leaves the resumed timer alone")
+            check((wt.load().get("active_timer") or {}).get("task_id")
+                  == task["id"],
+                  "…so the timer it was just asked to resume is still running")
+            # A grace window, not an exemption: once it lapses, a genuinely
+            # idle user is caught again.
+            h.daemon._resumed_tasks.clear()
+            check(h.daemon._presence_pass() == "stopped",
+                  "…but once the window lapses it can fire again")
+
+            # Re-arm for the idempotency check below: undo the second stop so
+            # the record under test is the one we have been tracking.
             u2_status, undo2, _ = request(h.legacy_port, "POST",
                                           "/idle-stop/undo",
                                           body={"id": record["id"]})
-            check(u2_status == 200 and undo2.get("restored") is False,
-                  "a second undo is a reported no-op, not an error or a "
-                  "double-restore", f"{u2_status} {undo2}")
-            check(abs(float(logs_of(wt, task["id"])[-1].get("minutes") or 0)
-                      - 60) < 0.5,
-                  "…and the entry is untouched by it")
+            check(u2_status == 200 and undo2.get("resumed") is False
+                  and undo2.get("cleared") is False,
+                  "a second undo of the SAME record is a no-op, not a "
+                  "second resume", f"{u2_status} {undo2}")
             _s, body_after, _ = request(h.legacy_port, "GET", "/idle-stop")
-            check((body_after or {}).get("pending_idle_stop") is None,
-                  "…and nothing is pending any more", str(body_after))
+            pending_now = (body_after or {}).get("pending_idle_stop")
+            check(pending_now is not None and pending_now["id"] != record["id"],
+                  "…and what is pending is the *new* stop, not the old record",
+                  str(pending_now and pending_now.get("id")))
+            request(h.legacy_port, "POST", "/idle-stop/ack")
 
             done = events.wait("idle_stop_resolved", timeout=5)
             check(done is not None and done.get("action") == "undone",
@@ -1749,6 +1780,43 @@ def test_presence(wt, wt_api, wt_daemon, migrated, scratch):
                   .get("cleared") is False,
                   "…and a second ack is an idempotent no-op")
 
+        # -- undo must never clobber a timer the owner started meanwhile -------
+        _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
+        with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 20 * 60):
+            h.daemon._tui_probe = (time.monotonic(), False)
+            h.daemon._presence_pass()
+            record = h.get("/v1/idle-stop")[1]["pending_idle_stop"]
+
+            # Carlos came back and started working on something else.
+            other = next(t for t in wt.load()["tasks"]
+                         if t.get("status") != "done" and t["id"] != task["id"])
+            status, _b, _ = h.post("/v1/timer/start", {"task_id": other["id"]})
+            check(status == 200, "a different task's timer is started",
+                  str(status))
+            other_started = (wt.load().get("active_timer") or {}).get("started_at")
+
+            _s, undo, _ = request(h.legacy_port, "POST", "/idle-stop/undo")
+            check(undo.get("resumed") is False
+                  and undo.get("mode") == "minutes_restored",
+                  "undo falls back to restoring minutes rather than resuming",
+                  json.dumps(undo, default=str)[:240])
+            live = wt.load().get("active_timer") or {}
+            check(live.get("task_id") == other["id"]
+                  and abs(float(live.get("started_at") or 0)
+                          - float(other_started)) < 0.01,
+                  "…leaving the OTHER timer completely untouched",
+                  json.dumps(live, default=str))
+            kept = next(l for l in logs_of(wt, task["id"])
+                        if l["id"] == record["log_id"])
+            check(abs(float(kept["minutes"]) - 60) < 0.5,
+                  "…and the auto-stopped task's entry holds the full session",
+                  str(kept["minutes"]))
+            check("another timer is running" in (undo.get("detail") or ""),
+                  "…and says which branch it took, so a panel can be honest",
+                  repr(undo.get("detail")))
+            # Leave nothing running for the next block.
+            request(h.legacy_port, "POST", "/timer/stop")
+
         _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)
         with DaemonHarness(wt_daemon) as h, FakeIdle(wt_daemon, 20 * 60):
             h.daemon._tui_probe = (time.monotonic(), False)
@@ -1769,6 +1837,10 @@ def test_presence(wt, wt_api, wt_daemon, migrated, scratch):
                           if l["id"] == record["log_id"])
             check(abs(float(edited["minutes"]) - 12.5) < 0.01,
                   "…and the owner's 12.5m stands", str(edited["minutes"]))
+            check(undo.get("resumed") is False
+                  and wt.load().get("active_timer") is None,
+                  "…and it resumes nothing either — the refusal is total",
+                  json.dumps(wt.load().get("active_timer"), default=str))
 
         # -- the record expires rather than lingering -------------------------
         _data, task = arm_timer(wt, work, elapsed_minutes=60, timeout=20)

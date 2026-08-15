@@ -118,6 +118,14 @@ IDLE_STOP_MIN_MINUTES = 0.1
 #: How long a pending idle-stop stays actionable. Long enough to survive lunch,
 #: short enough that yesterday's auto-stop is never offered for undo today.
 IDLE_STOP_TTL_SECONDS = 45 * 60
+#: How long the presence loop leaves a task alone after an undo resumed its
+#: timer. Clicking the panel's button is HID input, so ``HIDIdleTime`` resets and
+#: the loop would not re-fire anyway — but an undo driven through the API (curl,
+#: a future client, the SSE-driven app) gets no such side effect, and without
+#: this the very next poll would stop the timer it was just asked to resume.
+#: A grace window rather than a permanent exemption: a user who really is away
+#: is still caught, one window later.
+RESUME_GRACE_SECONDS = 60.0
 #: Where the pending record lives inside ``data["config"]``. Config is the right
 #: home rather than daemon memory: the monitor may be down when the auto-stop
 #: happens, and ``tracker.save_data()`` shallow-merges config from disk, so a key
@@ -563,34 +571,83 @@ def _presence_state(data: dict) -> dict:
 
 
 def _undo_idle_stop(data: dict, record: dict) -> dict:
-    """Put the subtracted idle minutes back. Never clobbers a later edit.
+    """Undo the auto-stop: delete its log entry and resume the original timer.
 
-    Three graceful misses, each reported rather than raised: the task is gone,
-    the log entry was deleted, or its minutes no longer match what the auto-stop
-    wrote (i.e. the owner already adjusted it by hand, and their number wins).
-    The fourth case is not a miss: when the idle tail swallowed the whole
-    session no entry was written at all, and undo *creates* one.
+    An undo means the detection was a **false positive** — the owner was
+    working, they were just not touching the keyboard. So the honest inverse is
+    to put the world back as it was: drop the entry the auto-stop wrote and
+    restore ``active_timer`` with the record's *original* ``started_at``, so the
+    minutes keep accruing in the live timer and land as **one continuous
+    session** whenever work really ends.
+
+    Two things this deliberately does not do. It does not keep the entry at full
+    elapsed *and* start a timer — that double-counts the same minutes. And it
+    does not start a fresh timer from ``now`` — that splits one session into two
+    entries at an arbitrary idle boundary.
+
+    ``mode`` says which branch ran, because they are materially different and a
+    UI must be able to word itself honestly:
+
+    ``timer_resumed``
+        The full undo above. Note that a *late* undo counts the whole idle
+        stretch as worked time; that is the point of calling the detection
+        wrong, but it is worth saying out loud.
+    ``minutes_restored``
+        The fallback. Something is in the way of resuming — most importantly
+        **another timer is already running**, and clobbering the owner's current
+        work is never acceptable — so the entry is instead restored to the full
+        elapsed session and left alone.
+
+    The graceful misses are unchanged and still reported rather than raised: the
+    task is gone, the entry was deleted, or its minutes no longer match what the
+    auto-stop wrote (the owner already adjusted it by hand, and their number
+    wins).
     """
     full = round(float(record.get("elapsed_minutes") or 0.0), 2)
     written = float(record.get("logged_minutes") or 0.0)
     task = next((t for t in data.get("tasks", [])
                  if t.get("id") == record.get("task_id")), None)
     if task is None:
-        return {"restored": False, "detail": "the task no longer exists"}
+        return {"restored": False, "resumed": False, "mode": "none",
+                "detail": "the task no longer exists"}
 
     logs = task.setdefault("logs", [])
     log_id = record.get("log_id")
     entry = next((l for l in logs if l.get("id") == log_id), None) if log_id \
         else None
     if log_id and entry is None:
-        return {"restored": False,
+        return {"restored": False, "resumed": False, "mode": "none",
                 "detail": "the log entry was deleted since the auto-stop"}
     if entry is not None and \
             abs(float(entry.get("minutes") or 0.0) - written) > 0.01:
-        return {"restored": False,
+        return {"restored": False, "resumed": False, "mode": "none",
                 "detail": "the log entry was edited since the auto-stop"}
     if full <= 0.0:
-        return {"restored": False, "detail": "there is nothing to restore"}
+        return {"restored": False, "resumed": False, "mode": "none",
+                "detail": "there is nothing to restore"}
+
+    started_at = record.get("started_at")
+    running = data.get("active_timer") or None
+    blocked = None
+    if running:
+        blocked = ("another timer is running, so the time was restored to the "
+                   "log entry instead of resuming this one")
+    elif started_at is None:
+        blocked = ("the original start time was not recorded, so the time was "
+                   "restored to the log entry instead of resuming the timer")
+
+    if blocked is None:
+        # The real undo. Removing the entry is what makes resuming safe: the
+        # minutes it held are back in the running timer, counted once.
+        if entry is not None:
+            task["logs"] = [l for l in logs if l.get("id") != entry.get("id")]
+        data["active_timer"] = {"task_id": task["id"], "started_at": started_at}
+        return {"restored": True, "resumed": True, "mode": "timer_resumed",
+                "minutes": None, "log_id": None,
+                "timer_started_at": started_at,
+                "counted_idle_minutes": record.get("idle_minutes"),
+                "detail": "timer resumed from its original start; the idle "
+                          "stretch now counts as worked time"}
 
     if entry is None:
         entry = {"id": wt_api.uid(),
@@ -601,8 +658,11 @@ def _undo_idle_stop(data: dict, record: dict) -> dict:
         logs.append(entry)
     entry["minutes"] = full
     entry["note"] = "Timer session"
-    return {"restored": True, "minutes": full, "log_id": entry["id"],
-            "detail": None}
+    return {"restored": True, "resumed": False, "mode": "minutes_restored",
+            "minutes": full, "log_id": entry["id"],
+            "timer_started_at": None,
+            "counted_idle_minutes": record.get("idle_minutes"),
+            "detail": blocked}
 
 
 # ================================================================ SSE broker ===
@@ -667,7 +727,8 @@ class Daemon:
                  github_sync_on_stop: bool = True,
                  presence: bool = True,
                  presence_interval: float = PRESENCE_INTERVAL_SECONDS,
-                 idle_stop_ttl: float = IDLE_STOP_TTL_SECONDS):
+                 idle_stop_ttl: float = IDLE_STOP_TTL_SECONDS,
+                 resume_grace: float = RESUME_GRACE_SECONDS):
         self.token = token
         self.allow_empty = allow_empty
         self.port = port
@@ -678,6 +739,7 @@ class Daemon:
         self.presence = presence
         self.presence_interval = presence_interval
         self.idle_stop_ttl = idle_stop_ttl
+        self.resume_grace = resume_grace
 
         self.broker = EventBroker()
         self.started_at = time.time()
@@ -701,6 +763,9 @@ class Daemon:
         # the record would come back unresolved on disk, but the monitor asks
         # us, and we remember. Bounded by one record per auto-stop.
         self._resolved_idle_stops: set[str] = set()
+        # task_id -> monotonic deadline before which the presence loop must not
+        # stop that task again. Written by an undo that resumed its timer.
+        self._resumed_tasks: dict[str, float] = {}
 
     # ---------------------------------------------------------- lifecycle ----
 
@@ -829,6 +894,10 @@ class Daemon:
             return "disabled"
         if not state["task_id"]:
             return "no_timer"
+        if self._within_resume_grace(state["task_id"]):
+            # An undo just asked us to resume this exact timer. Stopping it on
+            # the next poll would make the button look broken.
+            return "recently_resumed"
 
         idle_seconds = get_idle_seconds()
         if idle_seconds / 60 < state["timeout_minutes"]:
@@ -907,6 +976,17 @@ class Daemon:
         self.publish("idle_stop", dict(record))
         return record
 
+    def _within_resume_grace(self, task_id: str) -> bool:
+        """Was *task_id*'s timer resumed by an undo too recently to re-stop?
+
+        Prunes as it goes, so the map stays the size of "timers resumed in the
+        last grace window" rather than growing for the daemon's lifetime.
+        """
+        now = time.monotonic()
+        self._resumed_tasks = {tid: until for tid, until
+                               in self._resumed_tasks.items() if until > now}
+        return task_id in self._resumed_tasks
+
     def pending_idle_stop(self) -> dict | None:
         """The record the monitor should be showing, or None."""
         record = self.read(pending_idle_stop)
@@ -935,12 +1015,23 @@ class Daemon:
                           record_id: str | None = None) -> dict:
         """Acknowledge or undo the pending idle-stop. Idempotent either way.
 
-        ``acknowledged`` keeps the entry as written (idle removed);
-        ``undone`` restores the subtracted minutes onto the log entry and
-        reverts its note. Neither restarts the timer. A record that is already
-        resolved, expired, or whose log entry has since been edited or deleted
-        answers 200 with ``restored``/``cleared`` false and a ``detail`` — never
-        an error, and never a clobbered edit.
+        The two are deliberately asymmetric, because they mean opposite things
+        about whether the detection was right:
+
+        ``acknowledged``
+            The detection was correct — the user really was away. The entry
+            stays as written with the idle removed, and the timer stays stopped.
+        ``undone``
+            The detection was a false positive. See :func:`_undo_idle_stop`:
+            the entry is deleted and the original timer **resumes** from its own
+            ``started_at``, unless something is in the way (most importantly
+            another running timer), in which case it falls back to restoring the
+            minutes. ``mode`` in the result says which happened.
+
+        A record that is already resolved, expired, or whose log entry has since
+        been edited or deleted answers 200 with ``restored``/``cleared`` false
+        and a ``detail`` — never an error, never a clobbered edit, and never a
+        second resume.
         """
         if action not in ("acknowledge", "undo"):
             raise DaemonError("bad_request",
@@ -948,7 +1039,8 @@ class Daemon:
                               action=action)
         resolved_as = "acknowledged" if action == "acknowledge" else "undone"
         miss = {"action": resolved_as, "cleared": False, "restored": False,
-                "id": record_id, "detail": "no pending idle-stop"}
+                "resumed": False, "mode": "none", "id": record_id,
+                "detail": "no pending idle-stop"}
 
         current = self.pending_idle_stop()
         if current is None or (record_id and current.get("id") != record_id):
@@ -959,6 +1051,7 @@ class Daemon:
             if record is None or (record_id and record.get("id") != record_id):
                 return dict(miss)
             out = {"action": resolved_as, "cleared": True, "restored": False,
+                   "resumed": False, "mode": "none",
                    "id": record["id"], "task_id": record.get("task_id"),
                    "task_title": record.get("task_title"), "detail": None,
                    "minutes": record.get("logged_minutes")}
@@ -970,10 +1063,21 @@ class Daemon:
         out = self.write(run, reason=f"idle_stop_{resolved_as}")
         if out.get("cleared"):
             self._resolved_idle_stops.add(out["id"])
+            if out.get("resumed") and out.get("task_id"):
+                # Arm the grace window *before* the event goes out, so a
+                # subscriber that reacts instantly cannot race the next poll.
+                self._resumed_tasks[out["task_id"]] = \
+                    time.monotonic() + self.resume_grace
+                log.info("undo resumed the timer on '%s' from its original "
+                         "start; %s idle minutes now count as worked",
+                         out.get("task_title"), out.get("counted_idle_minutes"))
             self.publish("idle_stop_resolved",
                          {"id": out["id"], "action": resolved_as,
                           "task_id": out.get("task_id"),
                           "restored": out.get("restored"),
+                          "resumed": out.get("resumed"),
+                          "mode": out.get("mode"),
+                          "timer_started_at": out.get("timer_started_at"),
                           "minutes": out.get("minutes"), "at": time.time()})
         return out
 
@@ -1848,7 +1952,13 @@ def _safari_manager():
 #
 #   GET  /idle-stop      -> {"pending_idle_stop": {...} | null}
 #   POST /idle-stop/ack  -> {"action":"acknowledged","cleared",...}  body {"id"?}
-#   POST /idle-stop/undo -> {"action":"undone","restored","minutes",...}
+#   POST /idle-stop/undo -> {"action":"undone","restored","resumed","mode",
+#                            "timer_started_at","minutes","detail"}
+#
+# `mode` is "timer_resumed" (the entry was deleted and the original timer put
+# back) or "minutes_restored" (something blocked the resume — usually another
+# running timer — so the entry was restored instead). A client must not assume
+# the first: the wording on its button depends on which it got.
 #
 # They are mirrored at /v1/idle-stop{,/ack,/undo} for a token-bearing client.
 #
