@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs>
+  <linearGradient id="gTerra" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#d98a4e"></stop><stop offset="1" stop-color="#b25c28"></stop></linearGradient>
+  <linearGradient id="gSage" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8d9d6f"></stop><stop offset="1" stop-color="#68784c"></stop></linearGradient>
+  <linearGradient id="gCream" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fbf4e7"></stop><stop offset="1" stop-color="#efe0c6"></stop></linearGradient>
+</defs><rect x="150" y="232" width="212" height="560" rx="52" fill="#f7eddb" opacity="0.95"></rect>
+<rect x="406" y="232" width="212" height="560" rx="52" fill="#f7eddb" opacity="0.95"></rect>
+<rect x="662" y="232" width="212" height="560" rx="52" fill="#f7eddb" opacity="0.95"></rect>
+<rect x="186" y="286" width="140" height="72" rx="30" fill="#8f4a1f"></rect>
+<rect x="186" y="386" width="140" height="72" rx="30" fill="#8f4a1f" opacity="0.45"></rect>
+<rect x="442" y="286" width="140" height="72" rx="30" fill="#8f4a1f"></rect>
+<rect x="442" y="386" width="140" height="72" rx="30" fill="#68784c"></rect>
+<rect x="698" y="286" width="140" height="72" rx="30" fill="#68784c"></rect>
+<circle cx="768" cy="700" r="86" fill="#8f4a1f"></circle>
+<path d="M726 700 l30 30 l58 -62" fill="none" stroke="#f7eddb" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"></path></svg>
