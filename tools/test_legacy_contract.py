@@ -178,10 +178,9 @@ def shape(value, _depth=0):
 def relaxed(a, b):
     """Shapes equal, treating ``null`` as compatible with any scalar.
 
-    Used only for the two *documented-optional* fields (``active_window_id``,
-    ``last_logged_at``): both sides legitimately answer null for a task that has
-    no Safari window or no logs, and which task the fixture happens to put first
-    must not decide whether the harness passes.
+    Used only for the *documented-optional* field ``last_logged_at``: both sides
+    legitimately answer null for a task with no logs, and which task the fixture
+    happens to put first must not decide whether the harness passes.
     """
     if a == b:
         return True
@@ -207,7 +206,10 @@ MONITOR_REQUIRES = {
             "title": ("string", True),
             "role": ("string", True),
             "started_at": ("number", True),
-            "active_window_id": ("number", False),
+            # `active_window_id` used to live here. It went with the Safari
+            # task-window integration. The monitor's `ActiveTimer.activeWindowID`
+            # is an `Int?`, so its absence decodes as nil rather than failing —
+            # which is why the two repos did not need a coordinated release.
         },
     },
     "/tasks": {  # TrackerTask
@@ -249,19 +251,17 @@ def test_payload_parity(wt, tracker, wt_daemon, migrated, scratch):
     work = scratch / "legacy-parity.json"
     data = fresh(wt, migrated, work)
 
-    # Put a timer on a task that also has a Safari window id, so the two
-    # optional fields the monitor cares about are exercised with real values
-    # rather than nulls.
+    # Put a timer on a task that also has logs, so `last_logged_at` — the one
+    # remaining documented-optional field — is exercised with a real value
+    # rather than a null.
     subject = next(t for t in data["tasks"] if t.get("status") != "done")
-    subject["active_window_id"] = 9911
     subject.setdefault("logs", []).append({
         "id": wt.uid(), "minutes": 12.0, "note": "legacy fixture",
         "at": time.time() - 60})
     data["active_timer"] = {"task_id": subject["id"],
                             "started_at": time.time() - 300}
     wt.save(data)
-    print(f"       timer on {subject['title']!r} "
-          f"(active_window_id={subject['active_window_id']})")
+    print(f"       timer on {subject['title']!r}")
 
     oracle_status, _ = bridge(tracker, "_bridge_status", copy.deepcopy(wt.load()))
     oracle_tasks, _ = bridge(tracker, "_bridge_list_tasks",
@@ -299,11 +299,11 @@ def test_payload_parity(wt, tracker, wt_daemon, migrated, scratch):
               "…and the active timer's identity fields are equal, not just "
               "the same type",
               json.dumps(live_status["active_timer"], default=str))
-        check(live_status["active_timer"]["active_window_id"] == 9911
-              == oracle_status["active_timer"]["active_window_id"],
-              "…including active_window_id, which the monitor draws its "
-              "Safari border from",
-              str(live_status["active_timer"].get("active_window_id")))
+        check("active_window_id" not in live_status["active_timer"]
+              and "active_window_id" not in oracle_status["active_timer"],
+              "…and neither side still emits active_window_id, which went with "
+              "the Safari integration",
+              json.dumps(sorted(live_status["active_timer"])))
         assert_monitor_decodes(live_status["active_timer"],
                                MONITOR_REQUIRES["/status"]["active_timer"],
                                "/status.active_timer")
@@ -367,8 +367,11 @@ def test_timer_parity(wt, tracker, wt_daemon, migrated, scratch):
     work = scratch / "legacy-timer.json"
     data = fresh(wt, migrated, work)
     subject = next(t for t in data["tasks"] if t.get("status") != "done")
+    # Deliberately seeded with the removed feature's fields: a task synced from
+    # an older wt.py on another Mac can still carry them, and neither side may
+    # act on them any more.
     subject["tabs"] = ["https://example.invalid/legacy"]
-    subject.pop("active_window_id", None)
+    subject["active_window_id"] = 9911
     data["active_timer"] = None
     wt.save(data)
     pristine = copy.deepcopy(wt.load())
@@ -389,8 +392,9 @@ def test_timer_parity(wt, tracker, wt_daemon, migrated, scratch):
     finally:
         tracker.save_data = saved_save
 
-    check(("browser_start", subject["id"]) in start_stand_in.calls,
-          "oracle: the TUI bridge start opens the task's Safari window",
+    check(not any(c[0] == "browser_start" for c in start_stand_in.calls
+                  if isinstance(c, tuple)),
+          "oracle: the TUI bridge start opens no browser window at all",
           str(start_stand_in.calls))
     check(not any(c[0] == "arc_start" for c in start_stand_in.calls
                   if isinstance(c, tuple)),
@@ -416,13 +420,14 @@ def test_timer_parity(wt, tracker, wt_daemon, migrated, scratch):
                                "/timer/start")
         check((wt.load().get("active_timer") or {}).get("task_id")
               == subject["id"], "…and the timer is actually running on disk")
-        check(("open", subject["id"]) in FakeSafariWindowManager.calls,
-              "…and the daemon opened the task's Safari window too "
-              "(behaviour, not just shape)",
+        check(not FakeSafariWindowManager.calls,
+              "…and the daemon touched Safari not at all, even though the task "
+              "still carries saved tabs (behaviour, not just shape)",
               str(FakeSafariWindowManager.calls))
         check(next(t for t in wt.load()["tasks"] if t["id"] == subject["id"])
-              .get("active_window_id") == FakeSafariWindowManager.WINDOW_ID,
-              "…so /status will report an active_window_id, as the TUI's does")
+              .get("active_window_id") == 9911,
+              "…leaving a stale active_window_id exactly as it found it — "
+              "removal must not rewrite data it no longer understands")
 
         # A second start on the already-running task is a no-op success.
         before = Path(work).read_bytes()
@@ -458,12 +463,12 @@ def test_timer_parity(wt, tracker, wt_daemon, migrated, scratch):
         check(after.get("active_timer") is None,
               "…the timer is cleared on disk")
         stopped = next(t for t in after["tasks"] if t["id"] == subject["id"])
-        check(stopped.get("active_window_id") is None,
-              "…the Safari window was snapshotted and closed (window id cleared)",
-              str(stopped.get("active_window_id")))
-        check(("close", FakeSafariWindowManager.WINDOW_ID)
-              in FakeSafariWindowManager.calls,
-              "…via a real close_window call", str(FakeSafariWindowManager.calls))
+        check(stopped.get("active_window_id") == 9911,
+              "…the stale window id is still untouched after a full "
+              "start/stop cycle", str(stopped.get("active_window_id")))
+        check(not FakeSafariWindowManager.calls,
+              "…and no Safari call was made on the stop path either",
+              str(FakeSafariWindowManager.calls))
 
         # The commit semantics: an identical "Timer session" entry, as the TUI's
         # t-key stop and _commit_active_timer produce.

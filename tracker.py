@@ -423,8 +423,7 @@ class TaskModal(ModalScreen):
         if self._task_data:
             for key in ("github_issue", "sprint_issues", "arc_folder_id", "archived_tabs",
                         "iterm_session_name", "task_folder_path", "calendar_event_uid",
-                        "sprint", "sprint_id", "start_sprint", "start_sprint_id",
-                        "tabs", "active_window_id"):
+                        "sprint", "sprint_id", "start_sprint", "start_sprint_id"):
                 if key in self._task_data and key not in result:
                     result[key] = self._task_data[key]
             # Track if title changed for GitHub issue update
@@ -3042,7 +3041,6 @@ class WorkloadTracker(App):
         Binding("x",   "delete_github_issue", "Delete GH issue", show=False),
         Binding("c",   "import_calendar", "Calendar"),
         Binding("i",   "open_terminal", "iTerm"),
-        Binding("w",   "save_tabs",   "Save tabs"),
         Binding("a",   "toggle_show_done", "Show done"),
         Binding("r",   "refresh",     "Refresh"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
@@ -4096,10 +4094,6 @@ class WorkloadTracker(App):
         if task and task_current_issue(task, self._data):
             self._sync_task_hours_async(task)
 
-        # Safari window integration: snapshot+close the stopped task's window
-        if task:
-            self._browser_on_task_stopped(task)
-
         # Arc integration: tab cleanup
         if task:
             self._arc_tab_cleanup(task)
@@ -4137,11 +4131,6 @@ class WorkloadTracker(App):
             self._data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
             save_data(self._data)
 
-            # Safari window integration: snapshot+close prior window, open new one
-            if stopped_task:
-                self._browser_on_task_stopped(stopped_task)
-            self._browser_on_task_started(task)
-
             # Arc integration: focus space on start
             self._arc_on_task_started(task)
 
@@ -4152,70 +4141,6 @@ class WorkloadTracker(App):
         self._populate_table()
         self._refresh_sidebar()
         self._refresh_overview()
-
-    def action_save_tabs(self):
-        """Snapshot the current Safari window into the selected/active task."""
-        task = self._selected_task()
-        if not task:
-            at = self._data.get("active_timer")
-            if at:
-                task = next((t for t in self._data["tasks"] if t["id"] == at["task_id"]), None)
-        if not task:
-            self.notify("No task selected.", severity="warning")
-            return
-        try:
-            from browser_window import SafariWindowManager
-            mgr = SafariWindowManager()
-            urls = mgr.snapshot_task_tabs(task)
-            save_data(self._data)
-            if urls:
-                self.notify(f"Saved {len(urls)} tab(s) to '{task['title']}'")
-            else:
-                self.notify("No tabs found in the current Safari window.", severity="warning")
-        except ImportError:
-            self.notify("browser_window module unavailable.", severity="error")
-        except Exception:
-            logging.warning("save tabs failed", exc_info=True)
-            self.notify("Failed to save tabs.", severity="error")
-
-    def _browser_on_task_started(self, task: dict):
-        """Safari integration: open (or focus) the task's window on start.
-
-        Runs inline (open ≈ sub-second). Persists the window id via save_data.
-        Guarded so a missing module or gone window never disrupts the timer.
-        """
-        if not task.get("tabs"):
-            return
-        try:
-            from browser_window import SafariWindowManager
-            mgr = SafariWindowManager()
-            window_id = mgr.open_task_window(task)
-            if window_id is not None:
-                save_data(self._data)
-        except ImportError:
-            pass
-        except Exception:
-            logging.warning("browser open failed", exc_info=True)
-
-    def _browser_on_task_stopped(self, task: dict):
-        """Safari integration: snapshot+close the task's window on stop.
-
-        Persists the captured tabs and cleared window id via save_data.
-        Guarded so a missing module or gone window never disrupts the timer.
-        """
-        if task.get("active_window_id") is None:
-            return
-        try:
-            from browser_window import SafariWindowManager
-            mgr = SafariWindowManager()
-            mgr.snapshot_task_tabs(task)
-            mgr.close_window(task["active_window_id"])
-            task["active_window_id"] = None
-            save_data(self._data)
-        except ImportError:
-            pass
-        except Exception:
-            logging.warning("browser snapshot/close failed", exc_info=True)
 
     def _arc_on_task_started(self, task: dict):
         """Arc integration: focus space when starting a task."""
@@ -4702,10 +4627,6 @@ class WorkloadTracker(App):
                     "role": t.get("role_id"),
                     "started_at": at["started_at"],
                     "elapsed": fmt_mins((time.time() - at["started_at"]) / 60),
-                    # Safari window id of the task's dedicated tab window (or
-                    # null). The menu-bar monitor uses this to draw a focus-aware
-                    # frame around the window.
-                    "active_window_id": t.get("active_window_id"),
                 }
 
         return {
@@ -4752,11 +4673,6 @@ class WorkloadTracker(App):
         self._data["active_timer"] = {"task_id": target["id"], "started_at": time.time()}
         save_data(self._data)
 
-        # Safari window integration: open the task's dedicated window (no-op if
-        # the task has no saved tabs). A remote/menu-bar start should still get
-        # its browser window, unlike the Arc-space focus above.
-        self._browser_on_task_started(target)
-
         self._bridge_refresh_ui()
         return {"action": "started", "task": target["title"]}
 
@@ -4788,11 +4704,9 @@ class WorkloadTracker(App):
         if not inprogress:
             return {"error": "No in-progress tasks found", "_status": 404}
         target = inprogress[0]
-        # See _bridge_start_timer: no Arc focus on a bridge-initiated start,
-        # but the Safari task window does open (no-op without saved tabs).
+        # See _bridge_start_timer: no Arc focus on a bridge-initiated start.
         self._data["active_timer"] = {"task_id": target["id"], "started_at": time.time()}
         save_data(self._data)
-        self._browser_on_task_started(target)
         self._bridge_refresh_ui()
         return {"action": "started", "task": target["title"]}
 

@@ -38,10 +38,10 @@ loses the owner's work history:
    real, iCloud-synced file. So :func:`probe_data_file` runs **before every
    write**, and a failed probe refuses the write with **503 ``data_unreadable``**
    plus a machine-readable ``reason`` (plan risk #9).
-3. **Arc is not wired in at all.** It is deprecated and disabled in the live
+3. **No browser integration at all.** Arc is deprecated and disabled in the live
    config; the legacy stop path deliberately omits the TUI's Arc tab cleanup.
-   Safari task windows (``browser_window.py``) *are* wired, because the monitor
-   draws its window border from ``active_window_id``.
+   The Safari task-window integration is *gone* — module, routes, task fields
+   and the ``active_window_id`` the monitor once drew a border from.
 4. **Only one presence detector runs at a time.** The daemon's ``_presence_loop``
    auto-stops an idle timer — the thing that was missing entirely while the TUI
    was closed, which is most of the day now — but it stands down whenever
@@ -918,9 +918,6 @@ class Daemon:
         ``wt_api.stop_timer`` inside :meth:`write`, then
         :meth:`sync_hours_async` — exactly as ``_legacy_stop`` and
         ``h_timer_stop`` do, rather than re-implementing the TUI's version.
-        Safari task windows are **not** touched (``browser=False``): that
-        integration is deprecated and an auto-stop is not the place to reach out
-        and rearrange the desktop.
         """
         idle_minutes = idle_seconds / 60
 
@@ -935,7 +932,7 @@ class Daemon:
             else:
                 note = "Timer session (auto-stopped due to inactivity)"
                 subtract = 0.0
-            result = wt_api.stop_timer(data, browser=False, note=note,
+            result = wt_api.stop_timer(data, note=note,
                                        subtract_minutes=subtract,
                                        min_minutes=IDLE_STOP_MIN_MINUTES)
             entry = result.get("log")
@@ -1616,15 +1613,11 @@ class ApiHandler(_BaseHandler):
         task_id = body.get("task_id")
         if not task_id:
             raise DaemonError("bad_request", "'task_id' is required")
-        # Defaults to **False**: a v1 client starting a timer should not reach
-        # out and rearrange the user's desktop. The per-task Safari window is
-        # still a feature — the TUI and `wt start` open it, and the legacy
-        # :7375 endpoints below hard-code True to stay byte-compatible with
-        # tracker.py's bridge — but the app has to ask for it, by sending
-        # `{"browser": true}`, rather than get it by omission.
-        browser = _flag(body.get("browser"), False)
+        # A `browser` key in the body is accepted and ignored: the Safari
+        # task-window integration is gone, and a client sending the old flag
+        # should get a started timer rather than a 400.
         result = self.daemon.write(
-            lambda data: wt_api.start_timer(data, task_id, browser=browser),
+            lambda data: wt_api.start_timer(data, task_id),
             reason="timer_started", task_id=task_id)
         return 200, {"task_id": result["task"]["id"],
                      "title": result["task"]["title"],
@@ -1633,13 +1626,9 @@ class ApiHandler(_BaseHandler):
 
     @route("POST", rf"^{API_PREFIX}/timer/stop$")
     def h_timer_stop(self):
-        body = self.read_json()
-        # False for the same reason as start, and for a sharper one: with start
-        # no longer opening a window, a stop that defaulted to True would
-        # snapshot and close a Safari window the *user* opened by hand.
-        browser = _flag(body.get("browser"), False)
+        self.read_json()  # accepted and ignored; see h_timer_start
         result = self.daemon.write(
-            lambda data: wt_api.stop_timer(data, browser=browser),
+            lambda data: wt_api.stop_timer(data),
             reason="timer_stopped")
         task = result.get("task")
         self.daemon.sync_hours_async(task["id"] if task else None)
@@ -1862,33 +1851,6 @@ class ApiHandler(_BaseHandler):
 
     # ------------------------------------------- local desktop integrations --
 
-    @route("POST", rf"^{API_PREFIX}/tasks/(?P<tid>[^/]+)/tabs/"
-                  rf"(?P<action>save|open|clear|close)$")
-    def h_tabs(self, tid, action):
-        """Safari task-window actions, mirroring ``wt tabs`` (never Arc)."""
-        def run(data):
-            task = wt_api.require_task(data, tid)
-            if action == "clear":
-                task["tabs"] = []
-                return {"task_id": task["id"], "tabs": [],
-                        "active_window_id": task.get("active_window_id")}
-            mgr = _safari_manager()
-            if action == "save":
-                mgr.snapshot_task_tabs(task)
-            elif action == "open":
-                mgr.open_task_window(task)
-            elif action == "close":
-                mgr.snapshot_task_tabs(task)
-                window_id = task.get("active_window_id")
-                if window_id is not None:
-                    mgr.close_window(window_id)
-                task["active_window_id"] = None
-            return {"task_id": task["id"], "tabs": list(task.get("tabs") or []),
-                    "active_window_id": task.get("active_window_id")}
-
-        return 200, self.daemon.write(run, reason=f"tabs_{action}",
-                                      task_id=tid), None
-
     @route("POST", rf"^{API_PREFIX}/tasks/(?P<tid>[^/]+)/iterm$")
     def h_iterm(self, tid):
         """Open (or close) the task's iTerm2/tmux session."""
@@ -1915,31 +1877,13 @@ class ApiHandler(_BaseHandler):
         return 200, self.daemon.write(run, reason=f"iterm_{action}",
                                       task_id=tid), None
 
-    # ------------------------------------------------------------- helpers ---
-
-
-def _safari_manager():
-    """``SafariWindowManager``, as a coded error when the module is missing.
-
-    Imported inside the function (not at module scope) for the same reason
-    ``wt._browser_switch`` does it: the harnesses swap ``sys.modules`` entries,
-    and a top-level import would bind the real one before they get the chance.
-    """
-    try:
-        from browser_window import SafariWindowManager
-    except ImportError as exc:
-        raise DaemonError("unavailable",
-                          f"browser_window unavailable: {exc}") from exc
-    return SafariWindowManager()
-
-
 # ============================================================ legacy contract ==
 #
 # plan §5.4. These four endpoints exist to keep `workload-macos-monitor` working
 # with `tracker.py` closed. The monitor decodes:
 #
-#   GET  /status       -> {"active_timer": {task_id,title,role,started_at,
-#                                           active_window_id} | null, ...}
+#   GET  /status       -> {"active_timer": {task_id,title,role,started_at}
+#                          | null, ...}
 #   GET  /tasks        -> {"tasks": [{id,title,role,status,last_logged_at}]}
 #   POST /timer/start  -> {"action","task"}          body {"task_id": ...}
 #   POST /timer/stop   -> {"action","task","logged_minutes"}
@@ -1964,8 +1908,10 @@ def _safari_manager():
 #
 # `role` and `started_at` are **non-optional** in the monitor's Codable structs,
 # so emitting null for either is a decode failure, not a graceful degradation.
-# `active_window_id` and `last_logged_at` are optional there but load-bearing
-# (the Safari border overlay and the "recently logged" column).
+# `last_logged_at` is optional there but load-bearing (the "recently logged"
+# column). `active_window_id` is gone with the Safari integration; the monitor's
+# `ActiveTimer.activeWindowID` is an `Int?` and simply decodes as nil, which is
+# why dropping it needs no coordinated release of the two repos.
 #
 # `tools/test_legacy_contract.py` derives the expected key sets and types from
 # `tracker.py`'s own `_bridge_status()` / `_bridge_list_tasks()` at runtime
@@ -2133,8 +2079,6 @@ def legacy_status_payload(data: dict) -> dict:
                 "role": task.get("role_id"),
                 "started_at": at["started_at"],
                 "elapsed": wt.fmt_mins((time.time() - at["started_at"]) / 60),
-                # The monitor draws its focus-aware Safari border from this.
-                "active_window_id": task.get("active_window_id"),
             }
 
     return {
@@ -2180,11 +2124,10 @@ def _legacy_start(daemon: Daemon, task_id: str) -> dict:
         return {"action": "started", "task": title}
 
     def run(data):
-        # wt_api.start_timer commits the previous session and runs
-        # wt._browser_switch (snapshot+close the old window, open the new one) —
-        # the same pair the bridge gets from _browser_on_task_stopped +
-        # _browser_on_task_started. No Arc.
-        result = wt_api.start_timer(data, task_id, browser=True)
+        # Commits the previous session, same as the bridge. No browser side
+        # effects on either side any more — Arc was never wired here, and the
+        # Safari task window is gone.
+        result = wt_api.start_timer(data, task_id)
         return {"action": "started", "task": result["task"]["title"]}
 
     try:
@@ -2206,7 +2149,7 @@ def _legacy_stop(daemon: Daemon) -> dict:
         return {"error": "No timer running", "_status": 404}
 
     def run(data):
-        result = wt_api.stop_timer(data, browser=True)
+        result = wt_api.stop_timer(data)
         log_entry = result.get("log")
         return {
             "action": "stopped",

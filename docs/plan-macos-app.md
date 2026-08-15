@@ -811,7 +811,27 @@ harness at the live file — `cp ~/.workload_tracker.json /tmp/wt-work.json` and
 Deferred deliberately. None of these block a phase; all of them are things a
 future session would otherwise rediscover.
 
-### 1. Remove the Safari task-window integration entirely
+### 1. Remove the Safari task-window integration entirely — **DONE**
+
+> Done on `remove-safari`. `browser_window.py` deleted; `wt tabs`, the TUI `w`
+> binding, the four MCP tools (43 → 39), the daemon's `/v1/…/tabs/*` routes, the
+> `browser=` parameter on `wt_api.start_timer`/`stop_timer`, and
+> `active_window_id` in both `/status` payloads all gone. **1b is done with it.**
+>
+> Two decisions worth carrying forward. First, the per-task `tabs` /
+> `active_window_id` keys are **not** stripped from existing data: an older
+> `wt.py` on another Mac can sync them back, and rewriting data the code no
+> longer understands is a worse failure than leaving two dead keys. Second, the
+> deleted coverage was **replaced rather than dropped** — `test_daemon.py` and
+> `test_legacy_contract.py` now seed those stale fields and assert a full
+> start/stop cycle leaves them untouched and makes no Safari call, and the four
+> removed routes are asserted to 404. That is what stops the feature growing
+> back.
+>
+> No coordinated release was needed: the monitor's `ActiveTimer.activeWindowID`
+> is an `Int?`, so the field's absence decodes as nil.
+
+The original entry follows.
 
 **Owner's decision (2026-08-07): "an old idea that never worked — I would rather
 remove all Safari integration at some point."** So this is a removal, not a

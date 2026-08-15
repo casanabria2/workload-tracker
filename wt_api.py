@@ -41,8 +41,6 @@ else stays on its existing code path until it has regression coverage.
 **Left on their current code path (28 tools, no regression coverage):**
     * Arc — **deprecated, deliberately not ported**: setup_arc_space,
       get_arc_status, cleanup_task_tabs, sync_arc_folders
-    * Safari task windows: save_task_tabs, open_task_window, list_task_tabs,
-      clear_task_tabs
     * timers: start_timer, stop_timer  (wt_api equivalents exist below and are
       unit-tested, but the MCP tools still carry their own Arc side effects)
     * time logs: log_time, list_logs, edit_log, delete_log, split_log,
@@ -300,8 +298,6 @@ def task_view(task: dict, data: dict, sprints: list[dict] | None = None,
 
         # Integration state the editor / board affordances read.
         "local_folder": task.get("local_folder"),
-        "tabs": list(task.get("tabs") or []),
-        "active_window_id": task.get("active_window_id"),
     }
 
 
@@ -712,24 +708,13 @@ def status_overview(data: dict) -> dict:
 
 # ----------------------------------------------------------------- timers -----
 
-def start_timer(data: dict, task_id: str, *, browser: bool = False) -> dict:
+def start_timer(data: dict, task_id: str) -> dict:
     """Start the timer on a task, committing any running one first.
 
     A sub-3-second session is discarded rather than logged, matching every other
-    start path. When *browser* is true the task's dedicated Safari window is
-    opened and the previous task's is snapshotted+closed via
-    ``wt._browser_switch`` (itself fully guarded — a missing module or a zombie
-    window never aborts the timer flow). Arc space focus is deliberately **not**
-    performed here: per CLAUDE.md a remote start must not reshuffle the Arc
-    workspace, and Arc is deprecated.
-
-    **``browser`` defaults to False**: opening a Safari window is a visible side
-    effect on the user's desktop, so a caller has to ask for it rather than
-    inherit it. Both production callers pass the flag explicitly — the daemon's
-    v1 endpoint from its request body, and the legacy ``:7375`` endpoint as a
-    hard ``True`` to stay byte-compatible with ``tracker.py``'s bridge — so this
-    default governs only new callers and tests. That is the point: a test that
-    forgets the flag should do nothing to the desktop.
+    start path. Starting a timer has no effect on the desktop: the Safari
+    task-window integration this used to drive is gone, and Arc space focus was
+    never performed here.
     """
     task = require_task(data, task_id)
     prev, stopped = None, None
@@ -742,8 +727,6 @@ def start_timer(data: dict, task_id: str, *, browser: bool = False) -> dict:
             stopped = _commit_timer(prev, active_timer)
 
     data["active_timer"] = {"task_id": task["id"], "started_at": time.time()}
-    if browser:
-        wt._browser_switch(data, prev, task)
     return {"task": task, "started_at": data["active_timer"]["started_at"],
             "stopped": stopped}
 
@@ -753,7 +736,7 @@ def start_timer(data: dict, task_id: str, *, browser: bool = False) -> dict:
 MIN_LOGGED_MINUTES = 0.05
 
 
-def stop_timer(data: dict, *, browser: bool = False, note: str | None = None,
+def stop_timer(data: dict, *, note: str | None = None,
                subtract_minutes: float = 0.0,
                min_minutes: float = MIN_LOGGED_MINUTES) -> dict:
     """Stop the running timer and log the elapsed session.
@@ -794,8 +777,6 @@ def stop_timer(data: dict, *, browser: bool = False, note: str | None = None,
             "subtracted_minutes": max(0.0, subtract_minutes or 0.0),
         }
     data["active_timer"] = None
-    if browser and task is not None:
-        wt._browser_switch(data, task, None)
     return {"task": task, **stopped}
 
 

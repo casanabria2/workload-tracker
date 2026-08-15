@@ -234,11 +234,18 @@ def test_snapshot(wt, wt_api, migrated, scratch):
         "created_at", "activity", "github_repo", "type", "sprints_with_time",
         "start_sprint", "start_sprint_id", "sprint_issues", "current_issue",
         "logged_mins", "live_mins", "reportable_mins", "last_logged_at", "logs",
-        "local_folder", "tabs", "active_window_id",
+        "local_folder",
     }
     missing = [k for t in snap["tasks"] for k in want_task_keys if k not in t]
     check(not missing, "every task carries every documented field",
           str(sorted(set(missing))))
+
+    # The Safari task-window integration is gone: task_view must not resurrect
+    # its fields, or a client will render affordances for a feature that no
+    # longer has a code path behind it.
+    gone = [k for t in snap["tasks"] for k in ("tabs", "active_window_id") if k in t]
+    check(not gone, "…and none of the removed Safari fields",
+          str(sorted(set(gone))))
 
     # The raw legacy key must never appear: a task has one issue per sprint and
     # github_issue is a mirror of the current one.
@@ -491,14 +498,14 @@ def test_timers(wt, wt_api, migrated, scratch):
     data["active_timer"] = None
     expect("no_active_timer", wt_api.stop_timer, data)
 
-    # browser=False everywhere: the Safari integration is AppleScript, and a
-    # fixture task really can carry saved tabs.
-    res = wt_api.start_timer(data, a["id"], browser=False)
+    # No browser argument any more: starting or stopping a timer has no desktop
+    # side effects since the Safari task-window integration was removed.
+    res = wt_api.start_timer(data, a["id"])
     check(data["active_timer"]["task_id"] == a["id"], "start_timer sets the timer")
     check(res["stopped"] is None, "…with nothing stopped when idle")
 
     data["active_timer"]["started_at"] -= 600  # pretend 10 minutes elapsed
-    res2 = wt_api.start_timer(data, b["id"], browser=False)
+    res2 = wt_api.start_timer(data, b["id"])
     check(data["active_timer"]["task_id"] == b["id"], "switching re-points the timer")
     check(res2["stopped"] and res2["stopped"]["task_id"] == a["id"],
           "…and commits the previous task's session", str(res2["stopped"]))
@@ -510,13 +517,13 @@ def test_timers(wt, wt_api, migrated, scratch):
           "…carrying both wall-clock timestamps")
 
     n_b = len(b.get("logs", []))
-    stop = wt_api.stop_timer(data, browser=False)
+    stop = wt_api.stop_timer(data)
     check(data["active_timer"] is None, "stop_timer clears the timer")
     check(stop["logged"] is False and len(b.get("logs", [])) == n_b,
           "a sub-3-second session is discarded, not logged",
           f"logged={stop['logged']} logs={len(b.get('logs', []))}")
 
-    expect("task_not_found", wt_api.start_timer, data, "nope-xyz", browser=False)
+    expect("task_not_found", wt_api.start_timer, data, "nope-xyz")
 
 
 def test_task_commands(wt, wt_api, migrated, scratch):

@@ -772,42 +772,42 @@ def test_task_and_log_endpoints(wt, wt_api, wt_daemon, migrated, baseline,
               "POST /v1/timer/start -> 200", f"{status} {body}")
         check((wt.load().get("active_timer") or {}).get("task_id") == task_id,
               "…and the timer is on disk")
-        # CLAUDE.md: "A start with no saved tabs is a no-op." This task has none.
-        check(not [c for c in FakeSafariWindowManager.calls if c[0] == "open"],
-              "…and a start on a task with no saved tabs opens no window",
+        check(not FakeSafariWindowManager.calls,
+              "…and a start touches Safari not at all",
               str(FakeSafariWindowManager.calls))
         invariants(work, "POST /v1/timer/start")
 
-        # Now give it tabs. The v1 endpoint defaults to **browser=false**: a v1
-        # client must not rearrange the user's desktop by omission. The Safari
-        # window is still a feature — it opens when the client asks for it, and
-        # the legacy :7375 start hard-codes True to match tracker.py's bridge —
-        # so both halves are asserted here rather than just the new default.
+        # The Safari task-window integration is gone. The two things that could
+        # resurrect it by accident are a task that still carries the old fields
+        # (they sync in from an older wt.py on another Mac) and a client still
+        # sending the retired `browser` flag. Neither may do anything.
         h.post("/v1/timer/stop")
-        h.post(f"/v1/tasks/{task_id}/tabs/save")   # the fake writes two URLs
+
+        def _seed_stale_safari_fields():
+            data = wt.load()
+            t = next(t for t in data["tasks"] if t["id"] == task_id)
+            t["tabs"] = ["https://example.invalid/one"]
+            t["active_window_id"] = 4242
+            wt.save(data)
+
+        _seed_stale_safari_fields()
         FakeSafariWindowManager.calls.clear()
         status, body, _ = h.post("/v1/timer/start", {"task_id": task_id})
-        check(status == 200 and not [c for c in FakeSafariWindowManager.calls
-                                     if c[0] == "open"],
-              "…a start WITH saved tabs still opens no window by default",
+        check(status == 200 and not FakeSafariWindowManager.calls,
+              "…a start on a task that still carries saved tabs opens nothing",
               f"{status} {FakeSafariWindowManager.calls}")
-        check(next(t for t in wt.load()["tasks"]
-                   if t["id"] == task_id).get("active_window_id") is None,
-              "…and no active_window_id is recorded")
 
-        # …but the capability is intact when asked for explicitly.
         h.post("/v1/timer/stop")
         FakeSafariWindowManager.calls.clear()
         status, body, _ = h.post("/v1/timer/start",
                                  {"task_id": task_id, "browser": True})
-        check(status == 200 and ("open", task_id) in
-              FakeSafariWindowManager.calls,
-              "…while browser=true opens its Safari window",
+        check(status == 200 and not FakeSafariWindowManager.calls,
+              "…and the retired `browser` flag is accepted but inert, not a 400",
               f"{status} {FakeSafariWindowManager.calls}")
         check(next(t for t in wt.load()["tasks"]
-                   if t["id"] == task_id).get("active_window_id")
-              == FakeSafariWindowManager.WINDOW_ID,
-              "…and active_window_id is persisted (the monitor's border)")
+                   if t["id"] == task_id).get("active_window_id") == 4242,
+              "…leaving the stale window id untouched rather than rewriting "
+              "data the code no longer understands")
 
         status, body, _ = h.post("/v1/timer/start", {})
         check(status == 400 and code_of(body) == "bad_request",
@@ -842,7 +842,7 @@ def test_task_and_log_endpoints(wt, wt_api, wt_daemon, migrated, baseline,
 
 
 def test_github_and_integrations(wt, wt_api, wt_daemon, migrated, scratch):
-    section("7. GitHub, Safari-tabs and iTerm endpoints")
+    section("7. GitHub and iTerm endpoints (and the removed tabs routes)")
     work = scratch / "github.json"
     data = fresh(wt, migrated, work)
     sprints = wt.get_cached_sprints(data)
@@ -981,29 +981,21 @@ def test_github_and_integrations(wt, wt_api, wt_daemon, migrated, scratch):
               json.dumps(settled, default=str)[:300] if settled else "timeout")
         invariants(work, "POST …/github/push")
 
-        # -- Safari task windows (never Arc) --------------------------------
+        # -- the removed Safari task-window endpoints ------------------------
+        #
+        # These four routes are gone. Asserting the 404s is what stops them
+        # being quietly re-added: a route table is easy to grow back, and the
+        # module they called into no longer exists.
         FakeSafariWindowManager.calls.clear()
-        status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/save")
-        check(status == 200 and len(body["tabs"]) == 2,
-              "POST …/tabs/save -> 200 with the snapshotted URLs",
-              f"{status} {body}")
-        status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/open")
-        check(status == 200
-              and body["active_window_id"] == FakeSafariWindowManager.WINDOW_ID,
-              "POST …/tabs/open -> 200 and records active_window_id",
-              f"{status} {body}")
-        status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/close")
-        check(status == 200 and body["active_window_id"] is None,
-              "POST …/tabs/close -> 200 and clears active_window_id",
-              f"{status} {body}")
-        status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/clear")
-        check(status == 200 and body["tabs"] == [],
-              "POST …/tabs/clear -> 200", f"{status} {body}")
-        status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/nonsense")
-        check(status == 404 and code_of(body) == "not_found",
-              "…an unknown tabs action -> 404 not_found",
-              f"{status} {code_of(body)}")
-        invariants(work, "the tabs endpoints")
+        for action in ("save", "open", "close", "clear"):
+            status, body, _ = h.post(f"/v1/tasks/{subject_id}/tabs/{action}")
+            check(status == 404 and code_of(body) == "not_found",
+                  f"POST …/tabs/{action} -> 404 not_found (route removed)",
+                  f"{status} {code_of(body)}")
+        check(not FakeSafariWindowManager.calls,
+              "…and none of them reached Safari on the way to the 404",
+              str(FakeSafariWindowManager.calls))
+        invariants(work, "the removed tabs endpoints")
 
         # Arc must not be reachable from the daemon at all. Checked against the
         # AST, not the text: the module documents *why* Arc is unwired, so the

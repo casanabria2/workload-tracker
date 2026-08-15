@@ -625,7 +625,7 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         # feature off for this copy (the timer path is what's under test).
         app._data.setdefault("config", {})["tab_cleanup_enabled"] = False
         timed = next(t for t in app._data["tasks"]
-                     if t.get("status") == "inprogress" and not t.get("tabs")
+                     if t.get("status") == "inprogress"
                      and wt.task_current_issue(t, app._data))
         select(main_tbl, timed["id"])
         main_tbl.focus()

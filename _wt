@@ -67,7 +67,6 @@ _wt() {
         'cal:Import tasks from Google Calendar'
         'arc:Arc browser integration'
         'iterm:iTerm2/tmux integration'
-        'tabs:Manage task tabs'
         'presence:Presence detection settings'
         'rename:Rename a task'
         'mv:Rename a task'
@@ -393,13 +392,6 @@ for t in data.get('tasks', []):
                         _files -/
                         ;;
                 esac
-            fi
-            ;;
-        tabs)
-            if (( CURRENT == 3 )); then
-                local -a subcommands
-                subcommands=('save:Snapshot current Safari window into task' 'open:Open or focus the task window' 'list:List saved tab URLs' 'clear:Clear saved tabs' 'close:Snapshot then close the task window')
-                _describe -t subcommands 'tabs subcommand' subcommands
             fi
             ;;
         presence)

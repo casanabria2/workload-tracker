@@ -9,7 +9,6 @@ workload_tracker/
 ├── tracker.py          — Full TUI (Textual), keyboard-driven; also hosts the HTTP bridge
 ├── wt.py               — CLI for quick terminal commands
 ├── mcp_server.py       — MCP server for Claude integration
-├── browser_window.py   — Safari per-task tab windows (the supported browser integration)
 ├── iterm_manager.py    — iTerm2/tmux per-task terminal sessions
 ├── idle_detector.py    — macOS idle detection for presence-based auto-stop
 ├── arc_browser.py      — DEPRECATED Arc browser integration (see below)
@@ -17,13 +16,17 @@ workload_tracker/
 └── requirements.txt
 ```
 
-### Arc browser integration is deprecated
+### There is no browser integration
+
+The Safari per-task window feature (`browser_window.py`, `wt tabs`, the four
+Safari MCP tools, the daemon's `/tabs/*` routes and the per-task `tabs` /
+`active_window_id` fields) has been **removed**. It was an old idea that never
+worked well, and by the end exactly one task in the live data still used it.
 
 `arc_browser.py`, the `wt arc` command and the four Arc MCP tools
 (`setup_arc_space`, `get_arc_status`, `cleanup_task_tabs`, `sync_arc_folders`) are
-**deprecated and should not be used or extended.** Per-task browser tabs are handled
-by `browser_window.py`, which opens a dedicated **Safari** window per task
-(`wt tabs save|open|list|clear|close`).
+**deprecated and should not be used or extended.** Nothing replaces either of
+them: starting or stopping a timer no longer touches a browser at all.
 
 The Arc code still ships, but it is dormant: every entry point is gated on
 `config.arc_space_id`, which is empty. The one exception is
