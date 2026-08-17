@@ -965,6 +965,28 @@ latent correctness bug, not current damage.
 
 ### 1g. The harnesses have rotted again — this time in the *checker*
 
+> **Follow-up, 2026-08-17.** A later session read two harness failures as fresh
+> rot of this kind and was wrong: `test_daemon`'s "check_invariants holds after
+> DELETE" and `test_tracker_phase3`'s "fixture really has 0 shadow task(s)" were
+> both caused by passing a **copy of the live data file into the
+> `<pre-migration.json>` slot** (and into `baseline`). With fixtures built by
+> `tools/make_fixtures.py`, every harness is green: reconcile 126/126, phase3
+> 150/150, mcp 164/164, tracker 68/68, daemon 292/292, wt_api 160/160,
+> legacy-contract 90/90, atomic-save 37/37.
+>
+> An A/B against `main` "confirmed" the failures only because the same wrong
+> arguments were used on both sides — a reminder that A/B proves *a difference*,
+> not *a cause*, when the invocation is the variable.
+>
+> Two real gaps came out of it, now closed. `CLAUDE.md` documented the
+> four-argument form without ever mentioning `make_fixtures.py`, so the file
+> loaded into every session's context described an invocation that cannot work;
+> it now leads with fixture generation. And `test_reconcile`, `test_phase3` and
+> `test_mcp_phase3` accepted a migrated file silently and **passed vacuously**
+> ("0 shadows became 0 bindings") — they now refuse to start, naming the
+> remedy. `test_tracker_phase3` already failed rather than passing, but with a
+> bare count; its message now says what to do.
+
 Phase 0.5 fixed characterisation tests pinned to one afternoon's data by deriving
 expectations from the fixture at runtime. The same rot has returned by a
 different route, and it will keep returning until this is fixed.

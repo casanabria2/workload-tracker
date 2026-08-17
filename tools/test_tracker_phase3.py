@@ -699,7 +699,14 @@ def migration_check(tracker, wt, fixture, scratch):
     shutil.copyfile(fixture, dst)
     raw = json.loads(dst.read_text())
     n_shadow = len([t for t in raw["tasks"] if t.get("cross_sprint_parent")])
-    check(n_shadow > 0, f"fixture really has {n_shadow} shadow task(s)")
+    check(n_shadow > 0, f"fixture really has {n_shadow} shadow task(s)",
+          "" if n_shadow else
+          f"{fixture} has no cross_sprint_parent tasks, so it is already "
+          "migrated — almost certainly a copy of the live data file passed "
+          "into the <pre-migration.json> slot. This is an INVOCATION error, "
+          "not a code regression. Rebuild the fixtures and re-run:\n"
+          "            python3 tools/make_fixtures.py <source.json> <out-dir>\n"
+          "        then pass <out-dir>/pre.json, migrated.json and baseline.json.")
     saved = tracker.DATA_FILE
     try:
         tracker.DATA_FILE = dst

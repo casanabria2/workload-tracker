@@ -51,9 +51,42 @@ paths:
 cp ~/.workload_tracker.json /tmp/wt-work.json
 python3 tools/baseline.py /tmp/wt-work.json /tmp/wt-baseline.json
 python3 tools/check_invariants.py /tmp/wt-work.json /tmp/wt-baseline.json
-python3 tools/test_reconcile.py  <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
-python3 tools/test_phase3.py     <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
-python3 tools/test_mcp_phase3.py <pre-migration.json> <migrated.json> <baseline.json> <scratch-dir>
+```
+
+**Generate the fixtures first — do not hand the harnesses a live copy.** Five
+harnesses take the four-argument form `<pre-migration.json> <migrated.json>
+<baseline.json> <scratch-dir>`, and the first slot must be a **pre-migration**
+snapshot: one that still has `cross_sprint_parent` shadow tasks and per-sprint
+recurrent clones. No such file exists any more (the live data was migrated in
+place in July 2026), so `tools/make_fixtures.py` reconstructs one by running
+both migrations backwards:
+
+```bash
+python3 tools/make_fixtures.py /tmp/wt-work.json /tmp/fx   # -> pre/migrated/baseline.json
+FX=/tmp/fx
+python3 tools/test_reconcile.py      $FX/pre.json $FX/migrated.json $FX/baseline.json /tmp/scratch
+python3 tools/test_phase3.py         $FX/pre.json $FX/migrated.json $FX/baseline.json /tmp/scratch
+python3 tools/test_mcp_phase3.py     $FX/pre.json $FX/migrated.json $FX/baseline.json /tmp/scratch
+python3 tools/test_tracker_phase3.py $FX/pre.json $FX/migrated.json $FX/baseline.json /tmp/scratch
+python3 tools/test_daemon.py         $FX/pre.json $FX/migrated.json $FX/baseline.json /tmp/scratch
+```
+
+Passing an already-migrated file (e.g. a copy of the live data) into the `pre`
+slot is the standing trap: the migration sections then assert "0 shadows became
+0 bindings" and either **pass vacuously** or fail with a message that looks like
+a code regression but is really a bad argument. `check_invariants` comparisons
+also fail spuriously, because a live copy in the `baseline` slot no longer
+matches after the harness mutates anything. **A failure in a migration section
+or an invariants-vs-baseline check is an invocation error until proven
+otherwise** — regenerate the fixtures and re-run before investigating the code.
+
+Use a **fresh scratch directory** per run too: `test_daemon.py`'s "starting from
+no token file" check fails against a reused one.
+
+```bash
+# Two harnesses take different argument forms:
+python3 tools/test_atomic_save.py <source.json> <scratch-dir> [n-writers]
+python3 tools/test_wt_api.py <fixture.json> <migrated.json> <baseline.json> <scratch-dir>
 ```
 
 **`WT_DATA_FILE` overrides the data file path** (`wt.py` and `mcp_server.py`), so

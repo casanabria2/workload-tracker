@@ -995,6 +995,32 @@ def test_other_harnesses(fixture, migrated, baseline, scratch):
               f"rc={proc.returncode} {proc.stdout[-500:]}")
 
 
+def pre_migration_fixture_ok(fixture) -> bool:
+    """Refuse an already-migrated file in the ``<pre-migration.json>`` slot.
+
+    Without this the migration sections assert "0 shadows became 0 bindings"
+    and **pass vacuously**, which is strictly worse than failing: the harness
+    reports green while exercising none of the migration code it exists to
+    cover. Copying the live data file into this slot is the standing mistake —
+    it was migrated in place in July 2026 and has carried no shadows since.
+    """
+    try:
+        raw = json.loads(Path(fixture).read_text())
+    except Exception as exc:                      # noqa: BLE001 - report, don't crash
+        print(f"REFUSING TO RUN: cannot read {fixture}: {exc}", file=sys.stderr)
+        return False
+    if any(t.get("cross_sprint_parent") for t in raw.get("tasks", [])):
+        return True
+    print(f"REFUSING TO RUN: {fixture} carries no cross_sprint_parent tasks, so "
+          "it is already migrated.\n"
+          "  The first argument must be a PRE-migration snapshot. Rebuild the "
+          "fixtures:\n"
+          "      python3 tools/make_fixtures.py <source.json> <out-dir>\n"
+          "  then pass <out-dir>/pre.json <out-dir>/migrated.json "
+          "<out-dir>/baseline.json <scratch>.", file=sys.stderr)
+    return False
+
+
 def main():
     if len(sys.argv) != 5:
         print(__doc__.strip(), file=sys.stderr)
@@ -1015,6 +1041,9 @@ def main():
             print(f"REFUSING TO RUN: {mod.__name__}.DATA_FILE is the live file",
                   file=sys.stderr)
             return 2
+
+    if not pre_migration_fixture_ok(fixture):
+        return 2
 
     test_import_and_shape(wt, mcp_server)
     test_load_migrates(wt, mcp_server, fixture, scratch)
