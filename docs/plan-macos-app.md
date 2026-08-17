@@ -898,7 +898,34 @@ Kept deliberately until then: the monitor still *decodes* the field, because bot
 servers still send it and decoding a field you ignore is free, while failing on a
 payload the server still emits is not.
 
-### 1c. `reconcile_task_sprints` can report success having written nothing
+### 1c. `reconcile_task_sprints` can report success having written nothing — **DONE**
+
+> Done on `hours-synced-truth`, together with **1f** and a third instance not
+> recorded here. All three were the same defect — a write whose result was
+> discarded and a cache written anyway — and the entry below understates the
+> worst one.
+>
+> `reconcile`'s own hours path was already honest (it raises and only caches
+> after a confirmed write). The damage was in `close_task`, which called
+> `add_to_project_and_update` — a function that returned a **hardcoded
+> `{"success": True}`**, discarding both of its inner results — then set
+> `project_updated: True` and cached `hours_synced` unconditionally. Since
+> reconcile skips an hours write when the computed value equals `hours_synced`,
+> that false cache does not merely go stale: it convinces every later reconcile
+> there is nothing to do, so the wrong number stays on the issue permanently.
+> The entry below says "a re-run does retry"; on this path it did not.
+>
+> Fixed: `add_to_project_and_update` reports `{success, status_ok, hours_ok,
+> errors}`; `close_task` caches only on `hours_ok` and surfaces
+> `project_errors`; new `sync_project_fields()` returns per-operation results
+> (`sync_project_hours` stays as a bool wrapper for the TUI and daemon), which
+> also stops the Sprint write's return value being discarded outright;
+> `setup_issue_in_project` now records what it pushed, closing the third
+> instance — `wt push` moved the project's Hours field while leaving
+> `hours_synced` at `None`. The invariant is now stated in CLAUDE.md and has a
+> named accessor pair, `record_hours_synced` / `clear_hours_synced`.
+
+The original entry follows.
 
 Found in Phase 6. `sync_project_hours()` swallows a `gh` failure and returns
 `False` without raising, so a reconcile whose only operation was an hours update
@@ -949,7 +976,20 @@ harness section to assert the *retirement* rather than the incidental "creates
 nothing" — an assertion that only holds for 13 days out of every 14 is not an
 assertion.
 
-### 1f. Reconcile leaves a stale `hours_synced` on a fresh sprint's binding
+### 1f. Reconcile leaves a stale `hours_synced` on a fresh sprint's binding — **DONE**
+
+> Done on `hours-synced-truth` with 1c. The `repoint` executor now calls
+> `clear_hours_synced(binding)` before moving it, so a carried-forward issue
+> starts its new sprint with no cached hours.
+>
+> Covered by a **constructed** case in `test_reconcile.py` §17 rather than one
+> hunted for in the fixture: whether any real task happens to carry forward
+> depends on the day the fixture was taken, and an assertion that only fires on
+> some Tuesdays is not an assertion. Verified to fail without the fix
+> (`hours_synced=6.0` surviving onto a sprint with zero logged minutes) before
+> being restored.
+
+The original entry follows.
 
 Also boundary-only. After a reconcile at the start of Sprint 106,
 `tools/test_tracker_phase3.py` finds a binding whose cache and logs disagree:

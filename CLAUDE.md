@@ -601,6 +601,16 @@ design and the migration away from them.
   the task's `status`. `hours_synced` caches what GitHub was last told so a
   reconcile can skip no-op API calls — it is never a source of truth; hours are
   always recomputed from `logs`.
+
+  **The invariant: `hours_synced` is written if and only if an hours update
+  returned success.** It caches GitHub's state, never our intent. Write it with
+  `record_hours_synced(task, issue_ref, hours, sprint_id=None)` and clear it
+  with `clear_hours_synced(binding)` — never by assignment. The asymmetry
+  matters: a missing entry costs one redundant API call, while an entry cached
+  after a *failed* push convinces every later reconcile there is nothing to do
+  (it skips when the computed hours equal `hours_synced`), so the wrong number
+  stays on the issue permanently. Any binding that is re-pointed to another
+  sprint must have it cleared — the cached value described the old sprint.
 - `start_sprint_id` / `start_sprint` — derived from the earliest log, then
   frozen, so a later log edit doesn't silently rewrite history.
 - `sprint` / `sprint_id` — **legacy**, still written and read as a mirror of the
@@ -859,9 +869,11 @@ Authoritative signatures (use these instead of guessing — see live values via 
 **GitHub integration** (the signature footguns)
 - `create_github_issue(task: dict, repo: str) -> str` — **NOT** `(title, body, repo)`; body is read from `notes_path(task["id"])`
 - `setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict` — adds to project, sets Status/Activity/Type/Sprint/Hours (Activity/Type read from the task)
-- `add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict`
+- `add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict` — `{success, status_ok, hours_ok, errors}`. It used to return a hardcoded `{"success": True}`; read `hours_ok` before caching anything
 - `sync_project_status(issue_ref, status, data, project_info=None, item_id=None) -> bool` — silently no-ops for statuses missing from `PROJECT_STATUS_MAP`
-- `sync_project_hours(issue_ref, task, data, save_callback=None) -> bool`
+- `sync_project_fields(issue_ref, task, data, save_callback=None) -> dict` — `{ok, reason, hours, hours_written, ops, errors}`. **Prefer this** in new code: `ops` says which field failed, and `reason` (`no_issue`/`no_project`) distinguishes "nothing to do" from "GitHub refused"
+- `sync_project_hours(issue_ref, task, data, save_callback=None) -> bool` — thin `["ok"]` wrapper over the above, kept for the TUI and daemon callers
+- `record_hours_synced(task, issue_ref, hours, sprint_id=None) -> bool` / `clear_hours_synced(binding) -> None` — the only supported way to touch `hours_synced`; see the invariant in the Sprint Tracking section
 - `update_project_activity(issue_ref, activity, data, project_info=None, item_id=None) -> bool`
 - `update_project_type(issue_ref, type_val, data, project_info=None, item_id=None) -> bool`
 - `get_project_hours(issue_ref, data) -> float | None`

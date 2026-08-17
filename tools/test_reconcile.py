@@ -427,6 +427,179 @@ def test_historical(wt, migrated, scratch):
           f"mint {total_issues} issues across {tasks_affected} tasks — NOT executed.")
 
 
+def test_hours_synced_truth(wt, migrated, scratch):
+    """`hours_synced` must mean "GitHub confirmed this", never "we tried".
+
+    The three defects this covers all had the same shape — a write whose result
+    was discarded, and a cache written anyway — but different blast radii. The
+    close-path one is the worst: because reconcile skips an hours write when the
+    computed value equals `hours_synced`, a value cached after a failed push
+    convinces every later reconcile there is nothing to do, so the wrong number
+    stays on the issue permanently. A missing cache entry costs one redundant
+    API call; a falsely-present one costs correctness, silently and forever.
+    """
+    section("16. hours_synced records what GitHub confirmed, not what we tried")
+    data = load_copy(wt, migrated, scratch / "hours-truth.json")
+    sprints = wt.get_cached_sprints(data)
+
+    # -- the accessors -------------------------------------------------------
+    task = {"sprint_issues": [
+        {"sprint_id": "s1", "issue": "o/r#1", "hours_synced": None, "synced_at": None},
+        {"sprint_id": "s2", "issue": "o/r#2", "hours_synced": 4.0, "synced_at": 1.0},
+    ]}
+    check(wt.record_hours_synced(task, "o/r#1", 2.5),
+          "record_hours_synced finds the binding by issue ref")
+    b1, b2 = task["sprint_issues"]
+    check(b1["hours_synced"] == 2.5 and b1["synced_at"],
+          "…and writes both the value and the timestamp", str(b1))
+    check(b2["hours_synced"] == 4.0,
+          "…leaving every other binding alone", str(b2))
+    check(not wt.record_hours_synced(task, "o/r#404", 1.0),
+          "…and reports False rather than inventing a binding")
+    wt.clear_hours_synced(b2)
+    check(b2["hours_synced"] is None and b2["synced_at"] is None,
+          "clear_hours_synced nulls value and timestamp together", str(b2))
+
+    # -- add_to_project_and_update can now report failure ---------------------
+    # It used to `return {"success": True}` unconditionally, discarding both
+    # inner results, so its caller could not have checked even if it wanted to.
+    # `Stubs` replaces add_to_project_and_update itself, so grab the real one
+    # first — otherwise this asserts against the stub's hardcoded answer, which
+    # is precisely the shape the fix exists to remove.
+    real_atpu = wt.add_to_project_and_update
+    with Stubs(wt, mode="record", sprints=sprints):
+        saved = wt.update_project_hours
+        wt.update_project_hours = lambda *a, **k: False
+        try:
+            res = real_atpu("o/r#7", 3.0, data)
+        finally:
+            wt.update_project_hours = saved
+    check(res["success"] is False and res["hours_ok"] is False,
+          "add_to_project_and_update reports a failed hours write", str(res))
+    check(any("hours" in e for e in res["errors"]),
+          "…with the failure named in errors", str(res["errors"]))
+
+    # -- close_task must not cache hours it failed to push --------------------
+    data2 = load_copy(wt, migrated, scratch / "hours-close.json")
+    sprints2 = wt.get_cached_sprints(data2)
+    subject = next((t for t in data2["tasks"]
+                    if t.get("status") != "done" and t.get("github_repo")
+                    and (t.get("sprint_issues") or [])), None)
+    if subject is None:
+        check(False, "fixture has an open task with a binding to close")
+        return
+    binding = subject["sprint_issues"][0]
+    binding["hours_synced"] = None
+    before_state = dict(binding)
+    with Stubs(wt, mode="record", sprints=sprints2) as st:
+        # Simulate GitHub rejecting the hours write specifically.
+        st_saved = wt.add_to_project_and_update
+        wt.add_to_project_and_update = lambda *a, **k: {
+            "success": False, "status_ok": True, "hours_ok": False,
+            "errors": ["Failed to set hours to 3.0"]}
+        try:
+            out = wt.close_task(subject, data2, lambda d: None)
+        finally:
+            wt.add_to_project_and_update = st_saved
+    after = next(b for b in subject["sprint_issues"]
+                 if b.get("issue") == before_state.get("issue"))
+    check(after["hours_synced"] is None,
+          "a failed hours push leaves hours_synced unset, so a later reconcile "
+          "still retries it", str(after.get("hours_synced")))
+    check(out.get("project_updated") is False,
+          "…and the close reports project_updated=False rather than True",
+          str(out.get("project_updated")))
+    check(out.get("project_errors"),
+          "…carrying the reason, not just a flag", str(out.get("project_errors")))
+
+    # -- setup_issue_in_project must cache what it just pushed ---------------
+    # The `wt push` gap: it moved the project's Hours field while leaving
+    # hours_synced at None, so the tracker disagreed with GitHub immediately
+    # after the one command whose job is to make them agree.
+    data3 = load_copy(wt, migrated, scratch / "hours-push.json")
+    sprints3 = wt.get_cached_sprints(data3)
+    subj3 = next((t for t in data3["tasks"]
+                  if t.get("status") != "done" and (t.get("sprint_issues") or [])
+                  and wt.task_reportable_mins(t, sprints3) > 0), None)
+    if subj3 is None:
+        check(False, "fixture has an open task with reportable minutes")
+        return
+    for b in subj3["sprint_issues"]:
+        b["hours_synced"] = None
+    ref = wt.task_current_issue(subj3, data3)
+    with Stubs(wt, mode="record", sprints=sprints3):
+        res3 = wt.setup_issue_in_project(ref, subj3, data3)
+    cached = [b.get("hours_synced") for b in subj3["sprint_issues"]
+              if b.get("issue") == ref]
+    check(res3["success"], "setup_issue_in_project succeeds under stubs",
+          str(res3.get("errors")))
+    check(cached and cached[0] is not None,
+          "…and records the pushed hours on the binding (the `wt push` gap)",
+          str(cached))
+
+
+def test_repoint_clears_hours_synced(wt, migrated, scratch):
+    """A carried-forward binding must not keep the old sprint's hours (1f)."""
+    section("17. carry-forward clears the previous sprint's hours_synced")
+    data = load_copy(wt, migrated, scratch / "repoint.json")
+    sprints = wt.get_cached_sprints(data)
+
+    # Built explicitly rather than hunted for in the fixture: whether any task
+    # happens to carry forward depends on the day the fixture was taken, and an
+    # assertion that only fires on some Tuesdays is not an assertion.
+    #
+    # Shape: an open task with NO logs (so no past sprint is a target) holding a
+    # single binding on an older sprint. The only target is the current sprint,
+    # which is unbound, so the planner carries the existing issue forward.
+    current = wt.find_sprint_for_date(sprints, datetime.now().date())
+    if current is None:
+        check(False, "a current sprint is resolvable from the cache")
+        return
+    older = [s for s in sprints if s["start_date"] < current["start_date"]]
+    if not older:
+        check(False, "the sprint cache has a sprint before the current one")
+        return
+    old = older[-1]
+
+    task = next(t for t in data["tasks"] if t.get("status") != "done")
+    task["status"] = "inprogress"
+    task["logs"] = []
+    task.pop("github_repo", None)          # no repo -> nothing to mint
+    task["sprint_issues"] = [{
+        "sprint_id": old["id"], "sprint": old["title"],
+        "issue": "owner/repo#4242", "state": "open",
+        "hours_synced": 6.0, "synced_at": 1700000000.0,
+        "created_at": 1700000000.0,
+    }]
+    task["sprint_id"] = old["id"]
+    task["sprint"] = old["title"]
+
+    with Stubs(wt, mode="record", sprints=sprints):
+        res = wt.reconcile_task_sprints(task, data, sprints,
+                                        create_issues=False, dry_run=False)
+
+    repointed = res.get("repointed", [])
+    check(repointed, "the constructed task carries its issue forward",
+          f"planned={[o.get('op') for o in res.get('planned', [])]}")
+    if not repointed:
+        return
+
+    b = next((x for x in task["sprint_issues"]
+              if x.get("issue") == "owner/repo#4242"), None)
+    check(b is not None, "the carried binding survives")
+    if b is None:
+        return
+    check(b.get("sprint_id") == current["id"],
+          "…now pointing at the current sprint",
+          f"{b.get('sprint')} ({b.get('sprint_id')})")
+    check(b.get("hours_synced") is None,
+          "…and the previous sprint's 6.0h is NOT carried with it (plan 1f)",
+          f"hours_synced={b.get('hours_synced')}")
+    check(b.get("synced_at") is None,
+          "…with the timestamp cleared alongside it",
+          f"synced_at={b.get('synced_at')}")
+
+
 def test_already_split(wt, migrated, scratch):
     section("3. already-split task (IRON Infusion) must mint nothing")
     data = load_copy(wt, migrated, scratch / "iron.json")
@@ -1310,6 +1483,8 @@ def main():
     test_hours_withheld_guard(wt, migrated, scratch)
     test_project_info_cache(wt, migrated, scratch)
     test_phase5_merge(wt, fixture, scratch)
+    test_hours_synced_truth(wt, migrated, scratch)
+    test_repoint_clears_hours_synced(wt, migrated, scratch)
     test_idempotency(wt, migrated, scratch, baseline)
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")

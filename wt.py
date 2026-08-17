@@ -2345,6 +2345,44 @@ def _match_sprint(sprints: list[dict], query: str) -> dict | None:
     return None
 
 
+def record_hours_synced(task: dict, issue_ref: str, hours: float,
+                        sprint_id: str = None) -> bool:
+    """Cache on the binding what GitHub was **confirmed** to have been told.
+
+    The invariant this exists to enforce: ``hours_synced`` is written **if and
+    only if** an hours update returned success. It is a cache of GitHub's state,
+    never of our intent.
+
+    That distinction is load-bearing rather than pedantic. ``reconcile`` skips an
+    hours write when the computed value already equals ``hours_synced``, so a
+    value cached after a *failed* push is not merely stale — it convinces every
+    later reconcile that there is nothing to do, and the wrong number stays on
+    the issue permanently. A missing cache entry costs one redundant API call; a
+    falsely-present one costs correctness, silently and forever.
+
+    Returns True when a binding was found and updated.
+    """
+    binding = _find_binding(task.get("sprint_issues") or [],
+                            issue=issue_ref, sprint_id=sprint_id)
+    if binding is None:
+        return False
+    binding["hours_synced"] = hours
+    binding["synced_at"] = time.time()
+    return True
+
+
+def clear_hours_synced(binding: dict) -> None:
+    """Forget what GitHub was told, because it is no longer about this sprint.
+
+    Called when a binding is re-pointed to a new sprint. The cached value
+    described the *previous* sprint's hours; carrying it forward makes a client
+    report hours that were never logged in the new sprint, and makes reconcile
+    skip the first real write when the numbers happen to coincide.
+    """
+    binding["hours_synced"] = None
+    binding["synced_at"] = None
+
+
 def _find_binding(bindings: list[dict], issue: str = None, sprint_id: str = None) -> dict | None:
     """Locate a binding by issue ref first, then by sprint_id. None if absent.
 
@@ -2958,6 +2996,11 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
                     raise Exception("binding to carry forward has disappeared")
                 binding["sprint_id"] = op["sprint_id"]
                 binding["sprint"] = op["sprint"]
+                # The cached hours described the sprint we just left. Carrying
+                # them forward would have a client report hours never logged in
+                # the new sprint (plan §13.5 item 1f), and would make the first
+                # real hours write look like a no-op if the numbers coincided.
+                clear_hours_synced(binding)
                 if binding.get("issue") and pi and sprint and sprint.get("field_id"):
                     progress(f"  {label}: Moving issue {binding['issue']} forward...")
                     item_id = add_issue_to_project(binding["issue"], data)
@@ -3359,15 +3402,29 @@ def update_project_hours(issue_ref: str, hours: int, data: dict,
 def add_to_project_and_update(issue_ref: str, hours: int, data: dict) -> dict:
     """Add issue to GitHub project and set Status=Done, add hours.
 
-    Returns dict with item_id and success status.
+    Returns ``{"success", "status_ok", "hours_ok", "errors"}``. Both writes are
+    attempted regardless of the other's outcome — a failed status must not
+    silently skip the hours — and each is reported separately, because "the
+    close half-worked" is a different situation from "the close failed" and the
+    caller has to be able to tell them apart.
+
+    This used to `return {"success": True}` unconditionally, discarding both
+    return values. Its one caller then cached the hours as synced on that
+    fiction, which stopped any later reconcile from retrying.
     """
-    # Sync status to Done
-    sync_project_status(issue_ref, "done", data)
+    result = {"success": False, "status_ok": False, "hours_ok": False,
+              "errors": []}
 
-    # Update hours
-    update_project_hours(issue_ref, hours, data)
+    result["status_ok"] = bool(sync_project_status(issue_ref, "done", data))
+    if not result["status_ok"]:
+        result["errors"].append("Failed to set status to Done")
 
-    return {"success": True}
+    result["hours_ok"] = bool(update_project_hours(issue_ref, hours, data))
+    if not result["hours_ok"]:
+        result["errors"].append(f"Failed to set hours to {hours}")
+
+    result["success"] = not result["errors"]
+    return result
 
 
 def get_project_hours(issue_ref: str, data: dict) -> float | None:
@@ -3490,6 +3547,13 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
             else:
                 # Mark logs as uploaded
                 mark_logs_uploaded(task)
+                # …and cache it on the binding. Without this, `wt push` moved
+                # the project's Hours field while leaving hours_synced at None,
+                # so the tracker's record of what GitHub knows disagreed with
+                # GitHub immediately after the one command whose job is to make
+                # them agree.
+                result["hours_recorded"] = record_hours_synced(
+                    task, issue_ref, hours)
 
         result["success"] = len(result["errors"]) == 0
         return result
@@ -3499,61 +3563,94 @@ def setup_issue_in_project(issue_ref: str, task: dict, data: dict) -> dict:
         return result
 
 
-def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=None) -> bool:
-    """Sync task to GitHub project - updates Hours, Status, Activity, Type, and Sprint.
+def sync_project_fields(issue_ref: str, task: dict, data: dict,
+                        save_callback=None) -> dict:
+    """Sync Status, Activity, Type, Sprint and Hours, reporting each separately.
 
-    Calculates total logged time, rounds to nearest 0.25 hours, and updates project.
-    Also syncs Status, Activity, Type, and Sprint fields.
-    Marks logs as uploaded after successful sync.
+    Returns::
 
-    Returns True on success.
+        {"ok": bool, "reason": str | None, "hours": float | None,
+         "hours_written": bool, "ops": {name: bool}, "errors": [str]}
+
+    ``ops`` carries one entry per field actually attempted, so a caller can say
+    *which* half failed instead of "sync failed". ``reason`` is set when nothing
+    was attempted at all (``no_issue`` / ``no_project``), which the old bool
+    reported as plain ``False`` — indistinguishable from a GitHub error.
+
+    ``hours_written`` is the one a client should trust for "did the number on
+    the issue change": it is False both when the write failed **and** when there
+    were no minutes to report, and only those minutes are cached on the binding.
     """
+    result = {"ok": False, "reason": None, "hours": None,
+              "hours_written": False, "ops": {}, "errors": []}
+
+    def attempt(name, ok, detail):
+        result["ops"][name] = bool(ok)
+        if not ok:
+            result["errors"].append(detail)
+        return ok
+
     if not issue_ref:
-        return False
+        result["reason"] = "no_issue"
+        return result
 
     config = data.get("config", {})
     if not config.get("github_project_number"):
-        return False
+        result["reason"] = "no_project"
+        return result
 
-    success = True
+    attempt("status", sync_project_status(issue_ref, task.get("status", "todo"), data),
+            "Failed to set status")
 
-    # Sync status
-    status = task.get("status", "todo")
-    if not sync_project_status(issue_ref, status, data):
-        success = False
-
-    # Sync activity from the task
     activity = get_task_activity(task)
     if activity:
-        if not update_project_activity(issue_ref, activity, data):
-            success = False
+        attempt("activity", update_project_activity(issue_ref, activity, data),
+                f"Failed to set activity: {activity}")
 
-    # Sync type from the task
     type_val = get_task_type(task)
     if type_val:
-        if not update_project_type(issue_ref, type_val, data):
-            success = False
+        attempt("type", update_project_type(issue_ref, type_val, data),
+                f"Failed to set type: {type_val}")
 
-    # Sync sprint: use task's stored sprint
+    # The sprint write's return value used to be discarded outright, so a failed
+    # Sprint field was invisible even to the collapsed bool.
     all_sprints = get_all_sprints(data)
     sprint_id = task.get("sprint_id")
     if sprint_id:
         field_id = all_sprints[0]["field_id"] if all_sprints else None
         if field_id:
-            update_project_sprint(issue_ref, sprint_id, field_id, data)
+            attempt("sprint",
+                    update_project_sprint(issue_ref, sprint_id, field_id, data),
+                    f"Failed to set sprint: {task.get('sprint', sprint_id)}")
 
-    # Sync hours (filtered by the task's current sprint)
+    # Hours, filtered to the reportable sprint. Nothing to report is not a
+    # failure, but it is also not a write — hence hours_written rather than
+    # inferring it from ok.
     sprint_mins = task_reportable_mins(task, all_sprints)
     if sprint_mins > 0:
         hours = mins_to_quarter_hours(sprint_mins)
-        if update_project_hours(issue_ref, hours, data):
+        result["hours"] = hours
+        if attempt("hours", update_project_hours(issue_ref, hours, data),
+                   f"Failed to set hours to {hours}"):
+            result["hours_written"] = True
             mark_logs_uploaded(task)
+            record_hours_synced(task, issue_ref, hours, sprint_id)
             if save_callback:
                 save_callback(data)
-        else:
-            success = False
 
-    return success
+    result["ok"] = not result["errors"]
+    return result
+
+
+def sync_project_hours(issue_ref: str, task: dict, data: dict, save_callback=None) -> bool:
+    """Bool-returning wrapper over :func:`sync_project_fields`.
+
+    Kept so the TUI and the daemon keep compiling unchanged. New code should
+    call ``sync_project_fields`` and read ``ops`` / ``hours_written``: a bare
+    False here still cannot distinguish "GitHub rejected the write" from "this
+    task has no issue" from "no project is configured".
+    """
+    return sync_project_fields(issue_ref, task, data, save_callback)["ok"]
 
 
 def close_github_issue(issue_ref: str) -> bool:
@@ -3768,14 +3865,26 @@ def close_task(task: dict, data: dict, save_callback, prompt_callback=None, comm
             sprint_id = (binding or {}).get("sprint_id") or task.get("sprint_id")
             sprint_mins = task_reportable_mins(task, all_sprints, sprint_id)
             hours = mins_to_quarter_hours(sprint_mins)
-            add_to_project_and_update(issue_ref, hours, data)
-            result["project_updated"] = True
+            # Read defensively: `add_to_project_and_update` is monkeypatched by
+            # the harnesses (and could be by any caller), and a stub returning
+            # the older bare {"success": ...} must not raise a KeyError in here
+            # — this whole block is inside a try/except, so a KeyError would be
+            # swallowed and would silently skip the Activity/Sprint/Type writes
+            # below rather than surfacing.
+            proj = add_to_project_and_update(issue_ref, hours, data) or {}
+            proj_ok = bool(proj.get("success"))
+            result["project_updated"] = proj_ok
+            proj_errors = proj.get("errors") or []
+            if proj_errors:
+                result.setdefault("project_errors", []).extend(proj_errors)
 
-            # Record what GitHub was told on the matching binding, so a later
-            # reconcile doesn't re-push an identical value.
-            if binding is not None:
-                binding["hours_synced"] = hours
-                binding["synced_at"] = time.time()
+            # Record what GitHub was told, so a later reconcile doesn't re-push
+            # an identical value — but ONLY when the write was confirmed. See
+            # record_hours_synced: caching a failed push is what stops the
+            # retry that would otherwise fix it. When a caller reports only
+            # overall success, that is the best signal available.
+            if proj.get("hours_ok", proj_ok):
+                record_hours_synced(task, issue_ref, hours, sprint_id)
 
             # Set activity if the task has one
             activity = get_task_activity(task)
