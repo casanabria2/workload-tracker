@@ -1063,7 +1063,7 @@ pick a log by prefix and assume its minutes. Until then, every harness run needs
 its results read against the *data of the day*, which is precisely the ambiguity
 Phase 0.5 set out to remove.
 
-### 1h. `test_reconcile`'s failed-hours-push assertion is still data-coupled
+### 1h. `test_reconcile`'s failed-hours-push assertion is still data-coupled — **DONE**
 
 1g missed one. On the live fixture of 2026-08-19:
 
@@ -1088,6 +1088,31 @@ pending sprint hours — and assert on the binding the failed call targeted rath
 than on `sprint_issues[0]`, whose identity moves with the data. Same shape as the
 rot 1g set out to remove, so the acceptance test there (identical output on two
 fixtures) should be re-run afterwards.
+
+**Done.** Split into two scenarios, because the two hours writers need opposite
+setups and one test cannot serve both:
+
+- **A** fails *every* hours path (`add_to_project_and_update` **and**
+  `update_project_hours`), so "nothing was pushed" is actually true, and asserts
+  that **no** binding — including any the reconcile created — came out carrying
+  an `hours_synced`. Which writer got there first is then unknowable, so the
+  companion check only requires the close to surface *a* reason: a reconcile
+  abort reports `error`, the project block reports `project_errors`.
+- **B** takes the reconcile out of the picture (`get_all_sprints` → `[]`, which
+  `close_task` skips on) so the project block is reached on every fixture, fails
+  only `add_to_project_and_update`, and has the stub **record the `issue_ref` it
+  was handed**. The assertion then names the binding the failed call actually
+  targeted instead of `sprint_issues[0]` — the coupling 1g was about.
+
+Verified: 147/147 on both the 2026-08-19 and 2026-08-06 fixtures. Negative
+control — reverting `close_task`'s `if proj.get("hours_ok", proj_ok):` guard to
+`if True:` — fails B's targeted-binding check, so it bites rather than passing
+vacuously. Full 1g sweep re-run: all nine harnesses green on both fixtures with
+a fake `gh` first on `PATH` and an empty call log. The two runs' *labels* still
+differ where a harness interpolates the fixture's own counts (`61 tasks` vs
+`55`, `Sprint 98` vs `Sprint 105`); the check sequence and every verdict match,
+which is the property 1g was after — literal byte-identical output was never
+reachable for label-interpolating harnesses.
 
 ### 2. Collapse the daemon's `_guarded_load()`
 

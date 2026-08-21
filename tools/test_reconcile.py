@@ -480,37 +480,91 @@ def test_hours_synced_truth(wt, migrated, scratch):
           "…with the failure named in errors", str(res["errors"]))
 
     # -- close_task must not cache hours it failed to push --------------------
-    data2 = load_copy(wt, migrated, scratch / "hours-close.json")
-    sprints2 = wt.get_cached_sprints(data2)
-    subject = next((t for t in data2["tasks"]
-                    if t.get("status") != "done" and t.get("github_repo")
-                    and (t.get("sprint_issues") or [])), None)
+    # Two scenarios, because close_task has two hours writers and they need
+    # different setups. Neither may key off sprint_issues[0]: which binding
+    # receives the write depends on where the task has time, so the index that
+    # happened to be right on one day's data is wrong on another's
+    # (plan §13.5 1h).
+    def _subject(dst):
+        d = load_copy(wt, migrated, scratch / dst)
+        t = next((t for t in d["tasks"]
+                  if t.get("status") != "done" and t.get("github_repo")
+                  and (t.get("sprint_issues") or [])), None)
+        if t is not None:
+            for b in t["sprint_issues"]:
+                b["hours_synced"] = None
+        return d, t
+
+    # A. Every hours path fails, so nothing was pushed and nothing may be
+    #    cached. Failing only add_to_project_and_update is not enough: `Stubs`
+    #    leaves update_project_hours succeeding, and the reconcile close_task
+    #    runs first writes through *that* one — a genuinely successful push,
+    #    legitimately cached, which then read as a violation on any fixture
+    #    whose subject had a sprint needing an hours write.
+    data2, subject = _subject("hours-close.json")
     if subject is None:
         check(False, "fixture has an open task with a binding to close")
         return
-    binding = subject["sprint_issues"][0]
-    binding["hours_synced"] = None
-    before_state = dict(binding)
-    with Stubs(wt, mode="record", sprints=sprints2) as st:
-        # Simulate GitHub rejecting the hours write specifically.
-        st_saved = wt.add_to_project_and_update
+    sprints2 = wt.get_cached_sprints(data2)
+    with Stubs(wt, mode="record", sprints=sprints2):
+        st_atpu, st_uph = wt.add_to_project_and_update, wt.update_project_hours
         wt.add_to_project_and_update = lambda *a, **k: {
             "success": False, "status_ok": True, "hours_ok": False,
             "errors": ["Failed to set hours to 3.0"]}
+        wt.update_project_hours = lambda *a, **k: False
         try:
             out = wt.close_task(subject, data2, lambda d: None)
         finally:
-            wt.add_to_project_and_update = st_saved
-    after = next(b for b in subject["sprint_issues"]
-                 if b.get("issue") == before_state.get("issue"))
-    check(after["hours_synced"] is None,
-          "a failed hours push leaves hours_synced unset, so a later reconcile "
-          "still retries it", str(after.get("hours_synced")))
-    check(out.get("project_updated") is False,
+            wt.add_to_project_and_update = st_atpu
+            wt.update_project_hours = st_uph
+    # Read the bindings back afterwards, so any the reconcile *created* count.
+    cached = {b.get("issue"): b.get("hours_synced")
+              for b in subject["sprint_issues"]
+              if b.get("hours_synced") is not None}
+    check(not cached,
+          "a failed hours push leaves hours_synced unset on every binding, so a "
+          "later reconcile still retries it", str(cached))
+    # Whichever writer got there first, the close has to say why it failed —
+    # a reconcile abort reports `error`, the project block reports
+    # `project_errors`. Both are a reason; silence is the regression.
+    check(out.get("error") or out.get("project_errors"),
+          "…and the close surfaces the reason rather than failing silently",
+          str({k: out.get(k) for k in ("error", "project_errors")}))
+
+    # B. Only the project write fails. The reconcile is taken out of the
+    #    picture (no sprints -> close_task skips it) so the project block is
+    #    reached every run, whatever the fixture's sprint layout looks like.
+    data3, subject3 = _subject("hours-close-b.json")
+    check(bool((data3.get("config") or {}).get("github_project_number")),
+          "fixture configures a project, so close_task runs the project block")
+    pushed = []
+    with Stubs(wt, mode="record", sprints=sprints2):
+        st_atpu, st_gas = wt.add_to_project_and_update, wt.get_all_sprints
+
+        def _fail_hours(issue_ref, hours, data, *a, **k):
+            pushed.append(issue_ref)
+            return {"success": False, "status_ok": True, "hours_ok": False,
+                    "errors": [f"Failed to set hours to {hours}"]}
+
+        wt.add_to_project_and_update = _fail_hours
+        wt.get_all_sprints = lambda *a, **k: []
+        try:
+            out3 = wt.close_task(subject3, data3, lambda d: None)
+        finally:
+            wt.add_to_project_and_update = st_atpu
+            wt.get_all_sprints = st_gas
+    check(len(pushed) == 1,
+          "the project block ran exactly one hours write", str(pushed))
+    # Assert on the binding the failed call actually targeted, not on an index.
+    target = next((b for b in subject3["sprint_issues"]
+                   if b.get("issue") == (pushed[-1] if pushed else None)), None)
+    check(target is not None and target.get("hours_synced") is None,
+          "…and the binding it targeted keeps hours_synced unset", str(target))
+    check(out3.get("project_updated") is False,
           "…and the close reports project_updated=False rather than True",
-          str(out.get("project_updated")))
-    check(out.get("project_errors"),
-          "…carrying the reason, not just a flag", str(out.get("project_errors")))
+          str(out3.get("project_updated")))
+    check(out3.get("project_errors"),
+          "…carrying the reason, not just a flag", str(out3.get("project_errors")))
 
     # -- setup_issue_in_project must cache what it just pushed ---------------
     # The `wt push` gap: it moved the project's Hours field while leaving
