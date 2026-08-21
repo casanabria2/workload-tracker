@@ -949,6 +949,41 @@ def test_github_and_integrations(wt, wt_api, wt_daemon, migrated, scratch):
         check(_wtd.cmux_workspace_ref_for_issue("999", rows) is None,
               "…with no match when nothing begins with the number")
 
+        # Where the cmux socket password is read from, in order. cmux rewrites
+        # its own cmux.json — observed 2026-08-18, when it normalised the file
+        # from 10,761 bytes to 193 and dropped `socketPassword` while leaving
+        # `socketControlMode: "password"`, locking every outside process out.
+        # So cmux's file is consulted *last*.
+        real_pw_file, real_settings = _wtd.CMUX_PASSWORD_FILE, _wtd.CMUX_SETTINGS_PATH
+        owned = scratch / "cmux-password"
+        settings = scratch / "cmux.json"
+        _wtd.CMUX_PASSWORD_FILE, _wtd.CMUX_SETTINGS_PATH = owned, settings
+        had_env = os.environ.pop("CMUX_SOCKET_PASSWORD", None)
+        try:
+            check(_wtd._cmux_password() is None,
+                  "no password anywhere -> None (rather than an empty string)")
+
+            settings.write_text('{ // c\n "automation": { "socketPassword": "from-cmux" } }')
+            check(_wtd._cmux_password() == "from-cmux",
+                  "…falls back to cmux.json, comments and all")
+
+            owned.write_text("from-owned-file\n")
+            check(_wtd._cmux_password() == "from-owned-file",
+                  "…our own file wins over cmux.json, which cmux rewrites")
+
+            os.environ["CMUX_SOCKET_PASSWORD"] = "from-env"
+            check(_wtd._cmux_password() == "from-env",
+                  "…and the environment wins over both")
+
+            os.environ["CMUX_SOCKET_PASSWORD"] = "   "
+            check(_wtd._cmux_password() == "from-owned-file",
+                  "…a blank env var is ignored, not treated as a password")
+        finally:
+            os.environ.pop("CMUX_SOCKET_PASSWORD", None)
+            if had_env is not None:
+                os.environ["CMUX_SOCKET_PASSWORD"] = had_env
+            _wtd.CMUX_PASSWORD_FILE, _wtd.CMUX_SETTINGS_PATH = real_pw_file, real_settings
+
         daemon_src = (REPO / "wt_daemon.py").read_text()
         check("import webbrowser" not in daemon_src,
               "wt_daemon never imports webbrowser (it needs a TCC grant "

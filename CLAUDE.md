@@ -311,6 +311,50 @@ The monitor's `ActiveTimer.activeWindowID` is an `Int?`, so dropping the field
 from `/status` decodes as nil rather than failing — which is why the two repos
 needed no coordinated release.
 
+### Opening a GitHub issue — it goes to cmux, not a browser
+
+`POST /v1/tasks/{id}/github/open` (the app's "Open Issue") hands the URL to
+**cmux**, the owner's terminal-and-browser, and targets the workspace for that
+issue: the one whose **title begins with the issue number**, or a new
+`"<number> - <first 15 chars of the task title>"` — e.g. `316 - Teams integrati`.
+
+Three things here were learned the hard way; none is guessable from the code.
+
+**Never use Python's `webbrowser`.** On macOS `webbrowser.get()` resolves to
+`MacOSXOSAScript`, which drives the browser through `osascript` — an Apple Event,
+so it needs an Automation (TCC) grant. `wt_daemon.py` runs as a **launchd agent**
+and can never be given one interactively, so `webbrowser.open()` returned False
+on every call while no window appeared. Use `/usr/bin/open` (Launch Services),
+which needs no grant. Same trap applies to anything else the daemon launches.
+
+**cmux refuses outside processes by default.** `automation.socketControlMode`
+defaults to `cmuxOnly`, which produces
+`ERROR: Access denied - only processes started inside cmux can connect`. It must
+be `"password"`, *and* a matching `automation.socketPassword` must be set — the
+mode is the part people miss, since setting only the password changes nothing.
+
+**cmux rewrites `~/.config/cmux/cmux.json` and drops things.** Observed
+2026-08-18: it normalised the file from 10,761 bytes to 193, stripping every
+comment **and** `socketPassword`, while leaving `socketControlMode: "password"`
+— which locks every outside process out until the password is set again. So:
+- Do not put durable notes in `cmux.json`; comments do not survive. Document
+  here instead.
+- Set the password through **cmux Settings → Automation**, so cmux owns the
+  write, and mirror it into `~/.workload_tracker_cmux_password` (mode 0600).
+- `_cmux_password()` reads `CMUX_SOCKET_PASSWORD`, then that file, then
+  `cmux.json` **last**, precisely because cmux rewrites the last one.
+
+**Match workspaces by title, never by a remembered ref.** cmux renumbers refs
+when workspaces are reordered or closed — a ref that meant the issue's workspace
+one minute can mean an unrelated one the next. `cmux_workspace_ref_for_issue()`
+also enforces a **digit boundary**, so issue `31` cannot adopt the workspace for
+`316` and file work under the wrong issue.
+
+When cmux is not answering, the daemon launches it by bundle id
+(`com.cmuxterm.app`) and waits for the socket. It deliberately does **not** fall
+back to the default browser: an unreachable cmux should be visible, not produce a
+surprise tab somewhere else.
+
 ### Time Log Management
 
 Full log editing capabilities via CLI, TUI, and MCP:

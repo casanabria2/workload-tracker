@@ -146,6 +146,15 @@ CMUX_BUNDLE_ID = "com.cmuxterm.app"
 #: Where cmux keeps `automation.socketPassword`. Read at call time, never cached:
 #: it is the owner's secret and rotating it should not need a daemon restart.
 CMUX_SETTINGS_PATH = Path.home() / ".config" / "cmux" / "cmux.json"
+#: A copy of the same secret that cmux does not own.
+#:
+#: cmux rewrites ``cmux.json`` itself — observed 2026-08-18, when it normalised
+#: the file from 10,761 bytes to 193, stripping every comment *and*
+#: ``socketPassword`` while leaving ``socketControlMode: "password"`` in place.
+#: That combination locks every outside process out, so the daemon does not rely
+#: on a file cmux rewrites. Set the same value in cmux Settings → Automation and
+#: here (mode 0600).
+CMUX_PASSWORD_FILE = Path.home() / ".workload_tracker_cmux_password"
 #: How much of the task title goes into a new workspace name.
 CMUX_TITLE_CHARS = 15
 
@@ -180,13 +189,27 @@ def cmux_workspace_ref_for_issue(issue_number: str,
 
 
 def _cmux_password() -> str | None:
-    """`automation.socketPassword` from cmux's JSONC settings, or None.
+    """The cmux socket password, or None. Three sources, first one wins.
+
+    ``CMUX_SOCKET_PASSWORD`` in the environment, then
+    :data:`CMUX_PASSWORD_FILE`, then cmux's own settings. cmux's file is checked
+    *last* precisely because cmux rewrites it — see
+    :data:`CMUX_PASSWORD_FILE`.
 
     cmux refuses outside processes unless ``automation.socketControlMode`` is
     ``"password"`` and this is set — the daemon is a launchd agent, so it is
     always an outside process. The file is JSONC (comments, trailing commas), so
     strip those before parsing rather than reaching for a JSON5 dependency.
     """
+    from_env = (os.environ.get("CMUX_SOCKET_PASSWORD") or "").strip()
+    if from_env:
+        return from_env
+    try:
+        owned = CMUX_PASSWORD_FILE.read_text().strip()
+        if owned:
+            return owned
+    except OSError:
+        pass
     try:
         raw = CMUX_SETTINGS_PATH.read_text()
     except OSError:
