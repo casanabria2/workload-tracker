@@ -1063,6 +1063,32 @@ pick a log by prefix and assume its minutes. Until then, every harness run needs
 its results read against the *data of the day*, which is precisely the ambiguity
 Phase 0.5 set out to remove.
 
+### 1h. `test_reconcile`'s failed-hours-push assertion is still data-coupled
+
+1g missed one. On the live fixture of 2026-08-19:
+
+```
+FAIL a failed hours push leaves hours_synced unset, so a later reconcile still
+     retries it   3.0
+```
+
+Green on the 2026-08-06 fixture, and **identical at `b1ae255` with no Swift or
+daemon changes in play** — so it is the data, not a regression.
+
+Not an invariant violation. The test picks `subject["sprint_issues"][0]`, clears
+its `hours_synced`, and forces **`add_to_project_and_update`** to fail — but the
+harness stubs **`update_project_hours` as a success**, and `close_task`
+reconciles before it reports. When the chosen subject has a sprint needing an
+hours write, that reconcile pushes through the succeeding path and caches `3.0`
+correctly. The rule ("`hours_synced` is written iff a push returned success")
+holds; the injection simply does not cover every path that writes hours.
+
+Fix: fail *both* hours paths for the duration, or choose a subject with no
+pending sprint hours — and assert on the binding the failed call targeted rather
+than on `sprint_issues[0]`, whose identity moves with the data. Same shape as the
+rot 1g set out to remove, so the acceptance test there (identical output on two
+fixtures) should be re-run afterwards.
+
 ### 2. Collapse the daemon's `_guarded_load()`
 
 `wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
