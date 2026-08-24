@@ -41,9 +41,14 @@ This one command replaces the old "split each cross-sprint task, then re-point
 the strays" pair of steps.
 
 ```bash
-wt sync-sprints --all --dry-run          # ALWAYS first — review the plan
-wt sync-sprints --all --create-issues    # then execute, with confirmation
+wt sync-sprints --all --dry-run                 # ALWAYS first — review the plan
+wt sync-sprints --all --create-issues --dry-run # the plan that will actually run
+wt sync-sprints --all --create-issues --yes     # then execute, with confirmation
 ```
+
+Dry-run **twice**. The plain `--all` plan is not the one that executes: it shows
+`SKIP` and `HOLD` where `--create-issues` will show `create` lines and real
+hours. Present the second plan to Carlos, not the first.
 
 What it does, per non-recurrent task:
 
@@ -63,8 +68,13 @@ Read the dry-run output carefully before approving:
   want to mint a couple dozen issues for sprints that predate this workflow.
   If the list contains old sprints Carlos doesn't want issues for, reconcile
   those tasks individually instead of running `--all --create-issues`.
-- **`recurrent` tasks are always skipped** and listed as such — steps 1 and 2
-  own them.
+- **`recurrent` tasks are reconciled like everything else** — the old exclusion
+  was removed with steps 1 and 2. A perpetual series is one task with a binding
+  per sprint, so reconcile is exactly the right operation on it: it closes the
+  ended sprint's issue and mints the new sprint's on the same task, which is
+  what `close-recurrent` / `new-recurrent` used to do by hand. Expect one
+  `create Sprint <current>` line per series — at the 106→107 boundary that was
+  7 of the 10 issues created. Do **not** treat those as duplicates.
 - **`HOLD` lines mean hours were withheld.** If a task has time in a sprint
   that has no issue, reconcile refuses to narrow its *other* issues, because
   that would delete the unreported time from the project. Adding
@@ -100,5 +110,18 @@ wt report --sprint "Sprint <previous>"
 logged time and no binding — after a successful reconcile that list should be
 empty or only contain tasks you deliberately skipped. Spot-check one
 newly-created issue on GitHub (Status=Done, Sprint, Hours) and one
-carried-forward issue (Sprint = current, Hours = only this sprint's). Remind
-Carlos to press `r` in the TUI to reload.
+carried-forward issue (Sprint = current, Hours = only this sprint's).
+
+Two more checks worth running, both cheap:
+
+```bash
+wt sync-sprints --all --dry-run   # must now report "Nothing to do"
+```
+
+and confirm `check_invariants.py` reports the same `minutes=` and `logs=` as
+before the run — reconcile never touches `logs`, so a change there means
+something went wrong. `bindings=` should grow by exactly the number of issues
+created.
+
+There is no TUI reload step: `tracker.py` is retired and stays closed, so
+nothing needs to be told to re-read the file.
