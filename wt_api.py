@@ -145,7 +145,8 @@ class WtError(Exception):
 
 
 STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress",
-                 "recurrent": "Recurrent", "done": "Done"}
+                 "recurrent": "Recurrent", "parked": "Parked",
+                 "done": "Done"}
 
 
 # ------------------------------------------------------------- primitives -----
@@ -629,13 +630,20 @@ def set_task_type(data: dict, task_id: str, type: str | None = None) -> dict:
 
 
 def list_tasks(data: dict, *, role: str | None = None, status: str | None = None,
-               include_done: bool = False) -> list[dict]:
-    """Task summaries for a list view. Done tasks are hidden unless asked for.
+               include_done: bool = False,
+               include_parked: bool = False) -> list[dict]:
+    """Task summaries for a list view. Done and parked tasks are hidden unless asked for.
 
-    An explicit ``status`` filter always wins over ``include_done`` — including
-    ``status="done"``, which is how a caller asks for only the done ones. No
-    shadow-task filter exists any more: cross-sprint work lives in the task's own
-    ``sprint_issues`` bindings, so there is nothing hidden to exclude.
+    An explicit ``status`` filter always wins over ``include_done`` /
+    ``include_parked`` — including ``status="done"`` or ``status="parked"``,
+    which is how a caller asks for only those. No shadow-task filter exists any
+    more: cross-sprint work lives in the task's own ``sprint_issues`` bindings,
+    so there is nothing hidden to exclude.
+
+    ``parked`` is hidden for the same reason ``done`` is, and by the same
+    mechanism: it is work the owner has decided is not part of this sprint. The
+    two flags are separate because the questions are — "what did I finish?" and
+    "what did I defer?" have different answers and different follow-ups.
     """
     tasks = data.get("tasks", [])
     active_timer = data.get("active_timer")
@@ -645,8 +653,11 @@ def list_tasks(data: dict, *, role: str | None = None, status: str | None = None
         tasks = [t for t in tasks if t.get("role_id") == role]
     if status:
         tasks = [t for t in tasks if t.get("status") == status]
-    elif not include_done:
-        tasks = [t for t in tasks if t.get("status") != "done"]
+    else:
+        if not include_done:
+            tasks = [t for t in tasks if t.get("status") != "done"]
+        if not include_parked:
+            tasks = [t for t in tasks if t.get("status") != "parked"]
 
     out = []
     for t in tasks:

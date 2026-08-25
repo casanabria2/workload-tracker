@@ -117,9 +117,11 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUSES = ["todo", "inprogress", "recurrent", "done"]
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
-STATUS_COLORS = {"todo": "white", "inprogress": "blue", "recurrent": "magenta", "done": "green"}
+STATUSES = ["todo", "inprogress", "recurrent", "parked", "done"]
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent",
+                 "parked": "Parked", "done": "Done"}
+STATUS_COLORS = {"todo": "white", "inprogress": "blue", "recurrent": "magenta",
+                 "parked": "yellow", "done": "green"}
 
 
 def uid() -> str:
@@ -3041,7 +3043,7 @@ class WorkloadTracker(App):
         Binding("x",   "delete_github_issue", "Delete GH issue", show=False),
         Binding("c",   "import_calendar", "Calendar"),
         Binding("i",   "open_terminal", "iTerm"),
-        Binding("a",   "toggle_show_done", "Show done"),
+        Binding("a",   "toggle_show_done", "Show done/parked"),
         Binding("r",   "refresh",     "Refresh"),
         Binding("1",   "filter_role_1", "DemoKit", show=False),
         Binding("2",   "filter_role_2", "Demos",   show=False),
@@ -3335,7 +3337,12 @@ class WorkloadTracker(App):
         if self.filter_role != "all":
             tasks = [t for t in tasks if t.get("role_id") == self.filter_role]
         if not self.show_done:
-            tasks = [t for t in tasks if t.get("status") != "done"]
+            # One toggle covers both hidden statuses. They are hidden for
+            # different reasons — finished vs. deliberately deferred — but the
+            # TUI has one "show me everything" key and splitting it would mean a
+            # second binding in an app that is no longer the primary surface.
+            tasks = [t for t in tasks
+                     if t.get("status") not in ("done", "parked")]
         return tasks
 
     def _selected_task(self) -> Optional[dict]:
@@ -3598,7 +3605,7 @@ class WorkloadTracker(App):
         self.show_done = not self.show_done
         self._populate_table()
         status = "shown" if self.show_done else "hidden"
-        self.notify(f"Done tasks {status}", severity="information")
+        self.notify(f"Done and parked tasks {status}", severity="information")
 
     def action_new_task(self):
         roles = get_roles(self._data)
@@ -4225,14 +4232,19 @@ class WorkloadTracker(App):
             self._refresh_overview()
 
     def action_start_progress(self):
-        """Move a To Do task into In Progress."""
+        """Move a To Do or Parked task into In Progress.
+
+        Parked is accepted because picking a deferred task back up is exactly
+        this transition, and the alternative — unpark to To Do, then start — is
+        two keystrokes for one decision.
+        """
         task = self._selected_task()
         if not task:
             return
         current = task.get("status", "todo")
-        if current != "todo":
+        if current not in ("todo", "parked"):
             self.notify(
-                f"Can only start tasks in To Do state (current: {STATUS_LABELS.get(current, current)})",
+                f"Can only start tasks in To Do or Parked state (current: {STATUS_LABELS.get(current, current)})",
                 severity="warning",
             )
             return
@@ -4636,14 +4648,21 @@ class WorkloadTracker(App):
         }
 
     def _bridge_list_tasks(self) -> dict:
-        """Non-done tasks for the client's task picker.
+        """Non-done, non-parked tasks for the client's task picker.
 
         The old shadow-task exclusion is gone — cross-sprint work is now one task
         with several issue bindings, so every entry here is a real unit of work.
+
+        ``parked`` is excluded alongside ``done``: this feeds the Stream Deck /
+        menu-bar picker, and work deliberately deferred out of the sprint should
+        not be one button-press from a running timer. ``wt_daemon``'s
+        ``legacy_tasks_payload`` applies the same rule — the two are compared
+        against each other by ``tools/test_legacy_contract.py``, so they have to
+        move together.
         """
         tasks = []
         for t in self._data.get("tasks", []):
-            if t.get("status") == "done":
+            if t.get("status") in ("done", "parked"):
                 continue
             tasks.append({
                 "id": t["id"],

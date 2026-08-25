@@ -2112,7 +2112,12 @@ def legacy_status_payload(data: dict) -> dict:
 
 
 def legacy_tasks_payload(data: dict) -> dict:
-    """Byte-compatible with ``tracker.WorkloadTracker._bridge_list_tasks``."""
+    """Byte-compatible with ``tracker.WorkloadTracker._bridge_list_tasks``.
+
+    ``parked`` joins ``done`` in the exclusion: this is the Stream Deck /
+    menu-bar picker, and a task the owner has deliberately deferred out of the
+    sprint should not be one button-press from a running timer.
+    """
     return {"tasks": [
         {
             "id": t["id"],
@@ -2122,7 +2127,8 @@ def legacy_tasks_payload(data: dict) -> dict:
             # Phase 1 moved this out of tracker.py so both callers share it.
             "last_logged_at": wt_api.task_last_logged_at(t),
         }
-        for t in data.get("tasks", []) if t.get("status") != "done"
+        for t in data.get("tasks", [])
+        if t.get("status") not in ("done", "parked")
     ]}
 
 

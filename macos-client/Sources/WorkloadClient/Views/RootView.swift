@@ -30,6 +30,10 @@ struct RootView: View {
     /// row count, and persisting a stale number would reintroduce the Phase 5
     /// bug where the pane was drawn shorter than its contents.
     @SceneStorage("recurrentShelfVisible") private var storedShelf: Bool = true
+    /// Whether the Parked column was revealed. Defaults to **false**: a new
+    /// window shows the sprint's live work, and finding what you deferred is a
+    /// deliberate act.
+    @SceneStorage("parkedColumnVisible") private var storedParked: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -87,6 +91,7 @@ struct RootView: View {
             store.selection = selection ?? .board
             store.showsInspector = storedInspector
             store.showsRecurrentShelf = storedShelf
+            store.showsParkedColumn = storedParked
             // Restoring *before* the first snapshot lands is what cancels the
             // current-sprint default, so a filter the user cleared stays clear.
             //
@@ -104,6 +109,7 @@ struct RootView: View {
         .onChange(of: store.timelineZoom) { _, new in storedZoom = new.rawValue }
         .onChange(of: store.showsInspector) { _, new in storedInspector = new }
         .onChange(of: store.showsRecurrentShelf) { _, new in storedShelf = new }
+        .onChange(of: store.showsParkedColumn) { _, new in storedParked = new }
         .onChange(of: selection) { _, new in
             storedSelection = Self.encode(new ?? .board)
             if let new { store.selection = new }

@@ -74,6 +74,7 @@ enum TaskStatus: RawRepresentable, Codable, Sendable, Hashable {
     case todo
     case inProgress
     case recurrent
+    case parked
     case done
     case unknown(String)
 
@@ -82,6 +83,7 @@ enum TaskStatus: RawRepresentable, Codable, Sendable, Hashable {
         case "todo": self = .todo
         case "inprogress": self = .inProgress
         case "recurrent": self = .recurrent
+        case "parked": self = .parked
         case "done": self = .done
         default: self = .unknown(rawValue)
         }
@@ -92,14 +94,31 @@ enum TaskStatus: RawRepresentable, Codable, Sendable, Hashable {
         case .todo: "todo"
         case .inProgress: "inprogress"
         case .recurrent: "recurrent"
+        case .parked: "parked"
         case .done: "done"
         case .unknown(let raw): raw
         }
     }
 
-    /// The three Kanban columns, in board order. `recurrent` is deliberately
-    /// absent: those tasks live in their own shelf (plan §7, §9).
+    /// The three Kanban columns the board shows **by default**, in board order.
+    ///
+    /// `recurrent` is deliberately absent: those tasks live in their own shelf
+    /// (plan §7, §9). `parked` is absent for a different reason — it is work the
+    /// owner has decided is not part of this sprint, so the whole point is that
+    /// the default view does not show it. It appears as a fourth column only
+    /// while `Store.showsParkedColumn` is on; see `allColumns`.
     static let boardColumns: [TaskStatus] = [.todo, .inProgress, .done]
+
+    /// Every column the board can show, in board order, with Parked leading.
+    ///
+    /// Parked sits **left of To Do**, the conventional icebox position: you
+    /// defer work by pushing it further from Done, and picking it back up is a
+    /// move to the right like every other forward step on this board.
+    ///
+    /// Render from `Store.visibleColumns`, not from this — it is the superset,
+    /// and is what a menu offering "Move to…" iterates so a card can be parked
+    /// while the column itself is hidden.
+    static let allColumns: [TaskStatus] = [.parked] + boardColumns
 
     /// Display title used for column headers and status pills.
     var displayName: String {
@@ -107,6 +126,7 @@ enum TaskStatus: RawRepresentable, Codable, Sendable, Hashable {
         case .todo: "To Do"
         case .inProgress: "In Progress"
         case .recurrent: "Recurrent"
+        case .parked: "Parked"
         case .done: "Done"
         case .unknown(let raw): raw.capitalized
         }

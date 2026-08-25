@@ -77,7 +77,8 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent",
+                 "parked": "Parked", "done": "Done"}
 
 mcp = FastMCP("workload-tracker")
 
@@ -266,22 +267,28 @@ def add_task(
 
 
 @mcp.tool()
-def list_tasks(role: str | None = None, status: str | None = None, include_done: bool = False) -> str:
+def list_tasks(role: str | None = None, status: str | None = None,
+               include_done: bool = False, include_parked: bool = False) -> str:
     """List all tasks, optionally filtered by role or status.
 
-    By default, done tasks are hidden. Use include_done=True or status="done" to see them.
+    By default, done and parked tasks are hidden. Use include_done=True or
+    status="done" to see the done ones, and include_parked=True or
+    status="parked" for the parked ones.
 
     Args:
         role: Filter by role ID (use list_roles to see available roles)
-        status: Filter by status (todo, inprogress, recurrent, done)
+        status: Filter by status (todo, inprogress, recurrent, parked, done)
         include_done: Include done tasks in the list (default: False)
+        include_parked: Include parked tasks — work deliberately deferred out of
+            this sprint — in the list (default: False)
     """
     # No shadow-task filter any more: cross-sprint work lives in the task's own
     # ``sprint_issues`` bindings, so there is nothing hidden to exclude (plan
     # §1.1). ``load()`` strips any shadow an older wt.py might reintroduce.
     data = load()
     rows = wt_api.list_tasks(data, role=role, status=status,
-                             include_done=include_done)
+                             include_done=include_done,
+                             include_parked=include_parked)
     if not rows:
         return "No tasks found."
 
@@ -830,7 +837,9 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
 
     Args:
         task_query: Task ID or partial title
-        status: New status: todo, inprogress, recurrent, or done
+        status: New status: todo, inprogress, recurrent, parked, or done.
+            "parked" defers a task out of the board's default view without
+            closing it — its GitHub issue stays open and keeps its binding.
         create_issue: If True and setting to done, create GitHub issue if missing
     """
     data = load()
@@ -839,7 +848,8 @@ def set_task_status(task_query: str, status: str, create_issue: bool = False) ->
         return f"No task found matching '{task_query}'"
 
     if status not in STATUS_LABELS:
-        return f"Invalid status '{status}'. Use: todo, inprogress, recurrent, done"
+        return (f"Invalid status '{status}'. "
+                "Use: todo, inprogress, recurrent, parked, done")
 
     try:
         res = wt_api.set_status(data, task["id"], status,

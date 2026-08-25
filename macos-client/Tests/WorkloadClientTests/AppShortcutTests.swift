@@ -60,6 +60,20 @@ final class AppShortcutTests: XCTestCase {
         XCTAssertEqual(AppShortcut.toggleShelf.display, "⌥⌘R")
     }
 
+    /// And for `⇧⌘P` (park the selected task) against `⌥⌘P` (reveal the Parked
+    /// column). Two P bindings that do adjacent-sounding things is exactly the
+    /// pair a modifier typo would collapse, and the loser would be silent.
+    func testParkAndParkedColumnShareAKeyButNotAShortcut() {
+        XCTAssertEqual(AppShortcut.togglePark.key.character,
+                       AppShortcut.toggleParked.key.character)
+        XCTAssertNotEqual(AppShortcut.togglePark.signature,
+                          AppShortcut.toggleParked.signature)
+        XCTAssertEqual(AppShortcut.togglePark.display, "⇧⌘P")
+        XCTAssertEqual(AppShortcut.toggleParked.display, "⌥⌘P")
+        XCTAssertEqual(AppShortcut.togglePark.owner, .taskMenu)
+        XCTAssertEqual(AppShortcut.toggleParked.owner, .viewMenu)
+    }
+
     /// Same shape for `⌘T` (timer) and `⌥⌘T` (timeline Today).
     func testTimerAndTodayShareAKeyButNotAShortcut() {
         XCTAssertNotEqual(AppShortcut.toggleTimer.signature, AppShortcut.today.signature)
@@ -81,6 +95,7 @@ final class AppShortcutTests: XCTestCase {
             "findFilter": "⌘F",
             "toggleInspector": "⌥⌘I",
             "toggleShelf": "⌥⌘R",
+            "toggleParked": "⌥⌘P",
             "zoomIn": "⌘+",
             "zoomOut": "⌘-",
             "previousPeriod": "⌥←",
@@ -88,6 +103,7 @@ final class AppShortcutTests: XCTestCase {
             "today": "⌥⌘T",
             "toggleTimer": "⌘T",
             "logTime": "⌘L",
+            "togglePark": "⇧⌘P",
             "openIssue": "⌘G",
             "syncSprints": "⇧⌘S",
             "markDone": "⇧⌘D",

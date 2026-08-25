@@ -27,7 +27,7 @@ final class SnapshotDecodingTests: XCTestCase {
 
     func testDecodesTopLevel() throws {
         let snapshot = try loadFixture()
-        XCTAssertEqual(snapshot.tasks.count, 7)
+        XCTAssertEqual(snapshot.tasks.count, 8)
         XCTAssertEqual(snapshot.roles.count, 7)
         XCTAssertEqual(snapshot.sprints.count, 3)
         XCTAssertEqual(snapshot.generatedAt ?? 0, 1786022400.5, accuracy: 0.001)
@@ -243,6 +243,20 @@ final class SnapshotDecodingTests: XCTestCase {
     func testBoardColumnsExcludeRecurrent() {
         XCTAssertEqual(TaskStatus.boardColumns, [.todo, .inProgress, .done])
         XCTAssertFalse(TaskStatus.boardColumns.contains(.recurrent))
+    }
+
+    /// `parked` is a **known** status that is nonetheless off the default board.
+    /// Both halves matter: known, so it renders as "Parked" rather than as an
+    /// unrecognised pill; off the default columns, because the whole point is
+    /// that deferred work does not compete for attention.
+    func testParkedIsKnownButNotADefaultColumn() throws {
+        let snapshot = try loadFixture()
+        let task = try self.task("t-parked", in: snapshot)
+        XCTAssertEqual(task.status, .parked)
+        XCTAssertEqual(task.status.rawValue, "parked")
+        XCTAssertEqual(task.status.displayName, "Parked")
+        XCTAssertFalse(TaskStatus.boardColumns.contains(.parked))
+        XCTAssertEqual(TaskStatus.allColumns, [.parked, .todo, .inProgress, .done])
     }
 
     /// An entirely empty document still yields a usable, empty snapshot rather

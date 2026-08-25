@@ -18,6 +18,8 @@
     "  t-done-nulls     optional fields present but explicitly null",
     "  t-future-status  a status this client does not know, to prove the snapshot",
     "                   still decodes",
+    "  t-parked         deliberately deferred: absent from the default columns,",
+    "                   present only once the Parked column is revealed",
     "",
     "Roles: 6, of which 3 are colour 'white' (the value `wt roles add` seeds) and",
     "two share 'blue' - both collision cases RolePalette has to handle. role-empty",
@@ -295,6 +297,31 @@
       "reportable_mins": 0,
       "last_logged_at": null,
       "logs": [],
+      "tabs": []
+    },
+
+    {
+      "id": "t-parked",
+      "title": "Rewrite the onboarding walkthrough",
+      "description": "Deferred out of this sprint; picked back up in the next.",
+      "status": "parked",
+      "status_label": "Parked",
+      "role_id": "demos",
+      "created_at": 1776300500.0,
+      "activity": null,
+      "github_repo": "",
+      "type": null,
+      "sprints_with_time": [],
+      "start_sprint": null,
+      "start_sprint_id": null,
+      "sprint_issues": [],
+      "current_issue": null,
+      "logged_mins": 0,
+      "live_mins": 0,
+      "reportable_mins": 0,
+      "last_logged_at": null,
+      "logs": [],
+      "local_folder": null,
       "tabs": []
     }
   ]

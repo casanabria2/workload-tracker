@@ -136,7 +136,7 @@ enum BoardDropRejection: Equatable, Sendable {
             "Closing one ends the whole series and closes its live issue. "
             + "Use the recurrent shelf’s End Series action instead."
         case .unknownStatus:
-            "Only To Do, In Progress and Done are drop targets."
+            "Only Parked, To Do, In Progress and Done are drop targets."
         }
     }
 }
@@ -159,9 +159,18 @@ enum BoardDropDecision: Equatable, Sendable {
 /// |---|---|
 /// | → In Progress | `POST /status {inprogress}`, optimistic |
 /// | → To Do (from In Progress) | `POST /status {todo}`, optimistic |
+/// | → Parked | `POST /status {parked}`, optimistic |
+/// | → To Do / In Progress (from Parked) | `POST /status {…}`, optimistic |
 /// | → Done | the confirmation sheet, never silent |
 /// | → anywhere **from** Done | rejected, "reopening isn't supported" |
 /// | recurrent → anywhere | rejected |
+///
+/// Parked needs no case of its own. It is an ordinary one-field status write in
+/// both directions, so it falls through to `optimisticStatus` — and the rules
+/// that must still hold for it already do: `Done → Parked` is caught by the
+/// reopen rule (a done task is not "deferred", and there is no reopen path),
+/// and `recurrent ↔ Parked` by the recurrent prohibition (parking a perpetual
+/// series would turn on reconcile's carry-forward and strand its hours).
 ///
 /// The asymmetry is not an oversight: the underlying operations are not
 /// symmetric. Two of them are a one-field write; the third mints and closes
