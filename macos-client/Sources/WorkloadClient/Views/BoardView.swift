@@ -344,10 +344,29 @@ struct BoardColumn: View {
         return BoardDropRules.accepts(dragging, in: status)
     }
 
+    /// The row a card zone is currently hovered over, i.e. where the card would
+    /// be inserted. `tasks.count` is the tail zone under the last card.
+    ///
+    /// Written by the per-card drop destinations rather than derived from a
+    /// pointer coordinate: `.dropDestination` reports *whether* it is targeted
+    /// and nothing else — there is no continuous hover location during a
+    /// Transferable drag. (`hoverY` below is the fossil of the attempt: it is
+    /// read by `autoScroll` and assigned `nil` in two places, and nothing has
+    /// ever given it a value. Spring-loaded scrolling has therefore never run.)
+    /// Making each row its own destination turns "where is the pointer" into
+    /// "which view says it is targeted", which is a question SwiftUI answers.
+    @State private var hoverRow: Int?
+
     /// Where the insertion indicator goes, or `nil` when nothing is hovering.
+    ///
+    /// A hovered row wins, because the user is pointing at a specific gap and
+    /// the line is a promise about where the card will actually land. Falling
+    /// back to `landingIndex` covers the column's own background, where no
+    /// placement is expressed and the card simply sorts in.
     private var insertionRow: Int? {
-        guard isTargeted, accepts, let dragging,
-              dragging.status != status else { return nil }
+        guard let dragging, accepts else { return nil }
+        if let hoverRow { return hoverRow }
+        guard isTargeted, dragging.status != status else { return nil }
         return store.landingIndex(of: dragging.taskId, movedTo: status)
     }
 
@@ -408,26 +427,70 @@ struct BoardColumn: View {
         // auto-scroll — but a refusal is still *visible*: the column keeps its
         // orange dashed border and `RefusalOverlay`, both driven by
         // `isTargeted` + `dragging`, and returning `false` snaps the card back.
+        //
+        // This is the column's *background*: the header, and the gap under the
+        // last card that the tail zone does not cover. It carries no placement
+        // (`.column`), so a drop here is the pre-ordering behaviour exactly —
+        // a status change, and the card sorts in. Manual ordering engages only
+        // when the user points at a card or at the tail zone, which keeps a
+        // drag that meant "start this" from silently freezing the destination
+        // column's order.
         .dropDestination(for: TaskDragPayload.self) { items, _ in
-            isTargeted = false
-            hoverY = nil
-            // Prefer the decoded payload over the shared `dragging` state: it
-            // is what actually crossed the drag boundary.
-            guard let payload = items.first ?? dragging else { return false }
-            dragging = nil
-            _Concurrency.Task { await store.perform(drop: payload, on: status) }
-            // Refusals return false so the card animates home; `store.perform`
-            // still runs, because it owns the "why" message.
-            if case .rejected = BoardDropRules.decide(payload, to: status) { return false }
-            return true
+            handleDrop(items, at: .column)
         } isTargeted: { targeted in
             isTargeted = targeted
             if !targeted { hoverY = nil }
         }
     }
 
+    /// **The one place a drop becomes a request.**
+    ///
+    /// All three landing areas — a card, the tail zone, the column background —
+    /// funnel through here, so they cannot drift on what they send, on when
+    /// they return `false`, or on clearing the drag state.
+    private func handleDrop(_ items: [TaskDragPayload],
+                            at placement: BoardDropTarget) -> Bool {
+        isTargeted = false
+        hoverRow = nil
+        hoverY = nil
+        // Prefer the decoded payload over the shared `dragging` state: it is
+        // what actually crossed the drag boundary.
+        guard let payload = items.first ?? dragging else { return false }
+        dragging = nil
+        _Concurrency.Task { await store.perform(drop: payload, on: status, at: placement) }
+        // Refusals return false so the card animates home; `store.perform`
+        // still runs, because it owns the "why" message.
+        if case .rejected = BoardDropRules.decide(payload, to: status, at: placement) {
+            return false
+        }
+        return true
+    }
+
+    /// Marks `content` as the landing area for `placement`, drawing the
+    /// insertion line at `row` while it is hovered.
+    ///
+    /// `row` is a display index and is only ever used to position the line;
+    /// what actually gets persisted is the neighbouring **task id** carried by
+    /// `placement`, which survives the filter (row 2 of what is drawn is not
+    /// row 2 of what exists) and survives a snapshot landing mid-drag.
+    private func placementZone<Content: View>(_ content: Content, row: Int,
+                                              placement: BoardDropTarget) -> some View {
+        content
+            .dropDestination(for: TaskDragPayload.self) { items, _ in
+                handleDrop(items, at: placement)
+            } isTargeted: { targeted in
+                if targeted { hoverRow = row }
+                else if hoverRow == row { hoverRow = nil }
+            }
+    }
+
+    /// The refusal the overlay explains. Asked with the same placement
+    /// `accepts` uses, so the border and the words behind it can never disagree
+    /// about why a column is refusing.
     private func rejection(for payload: TaskDragPayload) -> BoardDropRejection? {
-        if case .rejected(let why) = BoardDropRules.decide(payload, to: status) { return why }
+        if case .rejected(let why) = BoardDropRules.decide(payload, to: status, at: .end) {
+            return why
+        }
         return nil
     }
 
@@ -459,11 +522,21 @@ struct BoardColumn: View {
                     LazyVStack(spacing: 8) {
                         ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
                             if insertionRow == index { InsertionIndicator() }
-                            card(task)
-                                .id(task.id)
+                            placementZone(card(task).id(task.id), row: index,
+                                          placement: .before(taskId: task.id))
                         }
                         if let insertionRow, insertionRow >= tasks.count {
                             InsertionIndicator()
+                        }
+                        // The only way to say "last". Dropping on the bottom
+                        // card means *before* it, so without this the final
+                        // slot would be unreachable with the mouse. Present
+                        // only during a drag, so it is not a dead 44pt of
+                        // column the rest of the time.
+                        if dragging != nil {
+                            placementZone(Color.clear.frame(height: 44)
+                                            .contentShape(Rectangle()),
+                                          row: tasks.count, placement: .end)
                         }
                     }
                     .padding(12)

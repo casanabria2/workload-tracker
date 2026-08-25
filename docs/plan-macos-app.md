@@ -495,6 +495,8 @@ are not:
 | → **Done** | **Never silent.** Opens a confirmation sheet built from `close/plan` (§7.1). |
 | → To Do/In Progress **from Done** | **Rejected**, with a "reopening isn't supported" hint. `wt.py` has no reopen path (no `gh issue reopen`), and faking it locally would desync the GitHub Project. Follow-up, not v1. |
 | Recurrent card → any column | **Rejected.** Closing a recurrent task ends the series and closes its live issue; CLAUDE.md warns explicitly. Only the shelf's explicit menu action can do it, behind its own confirmation. |
+| Onto another card, same column | **Reorder** (§7.2). `POST /v1/tasks/reorder`, no status write. |
+| Onto the column background, same column | **Rejected**, "already there" — unchanged. |
 
 ### 7.1 The close sheet
 
@@ -518,6 +520,52 @@ existing contract that a failed reconcile aborts the close.
 
 **Keyboard parity.** Arrow keys move between cards and columns; `⌘←`/`⌘→` move the
 selected card between columns; every TUI binding gets a menu command (§11).
+
+### 7.2 Manual card order
+
+Columns originally sorted by `last_logged_at` descending. That answers "what did
+I touch last", which is a different question from "what am I doing next" — and
+only the second one can be answered by a person. So a task carries an optional
+integer `position`, and dragging a card within (or into) a column persists it.
+
+**The data model.** `position` is one optional integer per task, lower first.
+Absent means **unpositioned**, and unpositioned tasks sort *above* the arranged
+block, ordered among themselves by the old recency rule. That band is what keeps
+a newly created task visible instead of filing it at the bottom of a hand-sorted
+column, and it is why the field must not be defaulted to `0`.
+
+A reorder normalises the whole column to `0..n-1` rather than picking a
+fractional index: the data file is rewritten wholesale on every save, so a
+fractional scheme would buy no write amplification back and would need a
+renormalisation pass later anyway.
+
+**A status change clears it** (`wt_api.set_status`, and `wt_api.close`). A
+position of 7 meant "seventh in To Do"; carrying that number into In Progress
+would drop the card at an arbitrary depth of a column it has never been ordered
+against. A cross-column *drag* re-sends the destination column's order
+immediately afterwards, so the user never sees that state; a `⌘→` does, and the
+card lands in the unpositioned band at the top — which is where a card you have
+just started work on belongs.
+
+**The gesture.** `.dropDestination` reports only *whether* it is targeted —
+there is no continuous hover location during a `Transferable` drag, which is why
+`BoardColumn.hoverY` was never once assigned a value and spring-loaded scrolling
+has never actually run. So each row is its own drop destination: hovering a card
+draws the insertion line above it and dropping inserts before it, and a tail
+zone below the last card (present only during a drag) is the only way to say
+"last". The column background keeps carrying **no** placement, so a drag that
+meant "start this" cannot silently freeze the destination column's order.
+
+**What crosses the wire** is the whole column's ids, in order — not the card
+that moved. That makes the call idempotent, makes the persisted order exactly
+what the user was looking at, and lets the client anchor on a neighbouring
+**task id** rather than a row index: with a filter on, row 2 of the board is not
+row 2 of the column, and persisting the drawn rows would drop every hidden card
+out of the order.
+
+The CLI is deliberately untouched. `wt list` groups by role and prints file
+order; `position` is a board concept, and teaching the CLI a second ordering
+would be a different feature.
 
 ---
 

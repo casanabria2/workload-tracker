@@ -19,10 +19,10 @@ final class BoardDropRulesTests: XCTestCase {
         let expected: [(TaskStatus, TaskStatus, BoardDropDecision)] = [
             // from To Do
             (.todo, .todo, .rejected(.sameColumn)),
-            (.todo, .inProgress, .optimisticStatus(.inProgress)),
+            (.todo, .inProgress, .optimisticStatus(.inProgress, at: .column)),
             (.todo, .done, .confirmClose),
             // from In Progress
-            (.inProgress, .todo, .optimisticStatus(.todo)),
+            (.inProgress, .todo, .optimisticStatus(.todo, at: .column)),
             (.inProgress, .inProgress, .rejected(.sameColumn)),
             (.inProgress, .done, .confirmClose),
             // from Done — no reopen path exists in wt.py
@@ -50,13 +50,108 @@ final class BoardDropRulesTests: XCTestCase {
 
         // And nothing anywhere produces an optimistic `.done`, which would be a
         // silent close: `DaemonClient.setStatus` refuses `done`, but the rule
-        // table must not even ask.
+        // table must not even ask. Swept over every placement too — manual
+        // ordering added an axis to the table, and the close guarantee has to
+        // hold across all of it, not just down the `.column` column.
+        let placements: [BoardDropTarget] = [.column, .end, .before(taskId: "t-any")]
         for source in columns + [.recurrent, .unknown("blocked")] {
             for target in columns + [.recurrent, .unknown("blocked")] {
-                XCTAssertNotEqual(BoardDropRules.decide(from: source, to: target),
-                                  .optimisticStatus(.done),
-                                  "\(source.rawValue) → \(target.rawValue)")
+                for placement in placements {
+                    let decision = BoardDropRules.decide(from: source, to: target,
+                                                         at: placement)
+                    let where_ = "\(source.rawValue) → \(target.rawValue) @ \(placement)"
+                    XCTAssertNotEqual(decision, .optimisticStatus(.done, at: placement),
+                                      where_)
+                }
             }
+        }
+
+        // And a placement never *downgrades* a close: dropping onto a card in
+        // the Done column is still the sheet, not a reorder that happens to
+        // change status on the way.
+        for source in [TaskStatus.todo, .inProgress] {
+            for placement in placements {
+                XCTAssertEqual(BoardDropRules.decide(from: source, to: .done,
+                                                     at: placement),
+                               .confirmClose,
+                               "\(source.rawValue) → done @ \(placement)")
+            }
+        }
+    }
+
+    // MARK: - Placement (manual ordering)
+
+    /// The second axis, written out the same way as the first: what each
+    /// landing area means in the card's own column.
+    ///
+    /// The interesting row is Done→Done. Under the pre-ordering table that was
+    /// `.sameColumn`; now a card zone reorders it. That is safe *because* it is
+    /// a reorder — it writes one integer and reaches no `gh` command — and the
+    /// test exists so a later reading of "Done is untouchable" cannot quietly
+    /// convert it back into a reopen or a close.
+    func testSameColumnDropsReorderOnlyWhenAPlaceWasPointedAt() {
+        let cases: [(TaskStatus, BoardDropTarget, BoardDropDecision)] = [
+            (.todo, .column, .rejected(.sameColumn)),
+            (.todo, .end, .reorder(.end)),
+            (.todo, .before(taskId: "t-1"), .reorder(.before(taskId: "t-1"))),
+            (.inProgress, .column, .rejected(.sameColumn)),
+            (.inProgress, .end, .reorder(.end)),
+            (.done, .column, .rejected(.sameColumn)),
+            (.done, .end, .reorder(.end)),
+            (.done, .before(taskId: "t-9"), .reorder(.before(taskId: "t-9"))),
+        ]
+        for (column, placement, decision) in cases {
+            XCTAssertEqual(BoardDropRules.decide(from: column, to: column, at: placement),
+                           decision, "\(column.rawValue) @ \(placement)")
+        }
+    }
+
+    /// A cross-column drop carries its placement through unchanged, so one
+    /// gesture is one status change *and* one placement rather than two
+    /// half-expressed intentions.
+    func testCrossColumnDropsCarryTheirPlacement() {
+        XCTAssertEqual(
+            BoardDropRules.decide(from: .todo, to: .inProgress, at: .before(taskId: "t-2")),
+            .optimisticStatus(.inProgress, at: .before(taskId: "t-2")))
+        XCTAssertEqual(BoardDropRules.decide(from: .inProgress, to: .todo, at: .end),
+                       .optimisticStatus(.todo, at: .end))
+    }
+
+    /// Placement never rescues a refusal. Recurrent stays locked and Done stays
+    /// unreopenable however precisely the user aims.
+    func testPlacementNeverUnlocksARefusal() {
+        let placements: [BoardDropTarget] = [.column, .end, .before(taskId: "t-1")]
+        for placement in placements {
+            XCTAssertEqual(BoardDropRules.decide(from: .recurrent, to: .todo, at: placement),
+                           .rejected(.recurrentLocked))
+            XCTAssertEqual(BoardDropRules.decide(from: .todo, to: .recurrent, at: placement),
+                           .rejected(.recurrentLocked))
+            XCTAssertEqual(BoardDropRules.decide(from: .done, to: .todo, at: placement),
+                           .rejected(.reopenNotSupported))
+            XCTAssertEqual(
+                BoardDropRules.decide(from: .unknown("blocked"), to: .todo, at: placement),
+                .rejected(.unknownStatus("blocked")))
+        }
+    }
+
+    /// A card's own column highlights during a reorder drag.
+    ///
+    /// `accepts` is what draws the green border versus the orange "Already
+    /// there" bar, and it has to ask the permissive question — otherwise every
+    /// intra-column reorder is conducted under a refusal banner.
+    func testAColumnAcceptsItsOwnCardsSoAReorderIsNotDrawnAsARefusal() {
+        for column in TaskStatus.boardColumns {
+            XCTAssertTrue(
+                BoardDropRules.accepts(TaskDragPayload(taskId: "t-1", sourceStatus: column),
+                                       in: column),
+                column.rawValue)
+        }
+        // But a recurrent card still lights nothing up, anywhere.
+        for column in TaskStatus.boardColumns {
+            XCTAssertFalse(
+                BoardDropRules.accepts(TaskDragPayload(taskId: "t-r", sourceStatus: .recurrent),
+                                       in: column),
+                column.rawValue)
         }
     }
 
@@ -123,7 +218,11 @@ final class BoardDropRulesTests: XCTestCase {
     func testAcceptsMirrorsDecide() {
         let payload = TaskDragPayload(taskId: "t-1", sourceStatus: .done)
         XCTAssertFalse(BoardDropRules.accepts(payload, in: .todo))
-        XCTAssertFalse(BoardDropRules.accepts(payload, in: .done))
+        // Done *does* accept its own cards now: a same-column drop reorders,
+        // which writes one integer and reaches no reopen path. What stays
+        // impossible is leaving the column, asserted on the line above and
+        // across every placement in `testPlacementNeverUnlocksARefusal`.
+        XCTAssertTrue(BoardDropRules.accepts(payload, in: .done))
 
         let open = TaskDragPayload(taskId: "t-2", sourceStatus: .todo)
         XCTAssertTrue(BoardDropRules.accepts(open, in: .inProgress))

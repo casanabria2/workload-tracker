@@ -151,6 +151,15 @@ final class Store {
     /// what makes a drop feel instant.
     private(set) var pendingStatus: [String: PendingStatusChange] = [:]
 
+    /// Manual positions applied to the UI but not yet confirmed by a snapshot,
+    /// keyed by task id. Same contract as `pendingStatus` and read by the same
+    /// sort, which is what stops a reordered column from snapping back to the
+    /// old order for the one refresh between the write and the next snapshot.
+    ///
+    /// A whole column's worth of entries is written at once, because a reorder
+    /// renumbers the whole column.
+    private(set) var pendingOrder: [String: PendingPosition] = [:]
+
     /// The operation id of the close currently running, so SSE `progress` and
     /// `error` events can be routed to the sheet rather than to the connection
     /// state.
@@ -320,6 +329,7 @@ final class Store {
             let fetched = try await client.snapshot()
             self.snapshot = fetched
             self.prunePendingStatus(against: fetched)
+            self.prunePendingOrder(against: fetched)
             self.adoptSnapshotForFiltering()
             // Health is supplementary (TUI-running warning, daemon version); a
             // failure there must not blank a snapshot that arrived fine.
@@ -384,27 +394,60 @@ final class Store {
     /// True when `tracker.py` holds :7373 and could clobber daemon writes.
     var tuiIsRunning: Bool { health?.tuiBridge?.running ?? false }
 
-    /// Non-recurrent tasks in a board column, newest activity first.
+    /// Non-recurrent tasks in a board column: the owner's manual order first,
+    /// then newest activity.
     ///
-    /// Sorted by last-logged descending so the top of each column is the work
-    /// most recently touched; never-logged tasks sort to the bottom by creation
-    /// date, which keeps a freshly created To Do card visible.
-    ///
-    /// Reads through `pendingStatus`, so a dropped card appears in its new
-    /// column immediately and reappears in the old one if the write fails.
+    /// Reads through `pendingStatus` *and* `pendingOrder`, so a dropped card
+    /// appears in its new column and its new place immediately, and reverts if
+    /// the write fails.
     func boardTasks(_ status: TaskStatus) -> [TrackerTask] {
-        tasks.filter { effectiveStatus(of: $0) == status }.sorted(by: Self.boardOrder)
+        tasks
+            .filter { effectiveStatus(of: $0) == status }
+            .sorted { Self.boardOrder($0, $1, position: { self.effectivePosition(of: $0) }) }
     }
 
-    /// The column sort, factored out so the drop indicator can predict where a
-    /// card will land using the same rule the column will apply to it.
-    static func boardOrder(_ lhs: TrackerTask, _ rhs: TrackerTask) -> Bool {
+    /// The column sort, as a pure function over a position lookup.
+    ///
+    /// Two bands, in this order:
+    ///
+    /// 1. **Unpositioned** tasks — never dragged — by last-logged descending,
+    ///    then creation date. This is the rule the board used everywhere before
+    ///    manual ordering existed, and it stays on top so a task created after
+    ///    the column was arranged lands where it can be seen rather than at the
+    ///    bottom of somebody's hand-sorted list.
+    /// 2. **Positioned** tasks, ascending. A reorder renumbers the whole column
+    ///    0..n-1, so ties do not occur in practice; the recency rule breaks them
+    ///    anyway rather than leaving the order to `sorted`'s instability.
+    ///
+    /// The position is passed in rather than read off the task so that
+    /// `pendingOrder` can be layered over the snapshot — and so `landingIndex`
+    /// can ask "where would this card go if it were unpositioned?", which is
+    /// exactly what a cross-column keyboard move produces.
+    static func boardOrder(_ lhs: TrackerTask, _ rhs: TrackerTask,
+                           position: (TrackerTask) -> Int?) -> Bool {
+        switch (position(lhs), position(rhs)) {
+        case let (l?, r?): return l == r ? recencyOrder(lhs, rhs) : l < r
+        case (_?, nil): return false
+        case (nil, _?): return true
+        case (nil, nil): return recencyOrder(lhs, rhs)
+        }
+    }
+
+    /// The pre-manual-ordering sort: most recently logged first, never-logged
+    /// last by creation date.
+    static func recencyOrder(_ lhs: TrackerTask, _ rhs: TrackerTask) -> Bool {
         switch (lhs.lastLoggedAt, rhs.lastLoggedAt) {
         case let (l?, r?): l > r
         case (_?, nil): true
         case (nil, _?): false
         case (nil, nil): (lhs.createdAt ?? 0) > (rhs.createdAt ?? 0)
         }
+    }
+
+    /// A task's manual position, reading an unconfirmed reorder over the
+    /// snapshot's.
+    func effectivePosition(of task: TrackerTask) -> Int? {
+        pendingOrder[task.id]?.target ?? task.position
     }
 
     /// The perpetual tasks, shown in their own shelf rather than on the board.
@@ -824,6 +867,22 @@ final class Store {
         }
     }
 
+    /// The same contract as `prunePendingStatus`, for manual positions.
+    ///
+    /// Separate rather than folded in because the two are confirmed by
+    /// different fields and a reorder writes a whole column at once — one
+    /// task's position confirming says nothing about its neighbours'.
+    private func prunePendingOrder(against snapshot: Snapshot) {
+        guard !pendingOrder.isEmpty else { return }
+        let byID = Dictionary(snapshot.tasks.map { ($0.id, $0) },
+                              uniquingKeysWith: { first, _ in first })
+        for (id, pending) in pendingOrder {
+            let confirmed = byID[id]?.position == pending.target
+            let stale = Date.now.timeIntervalSince(pending.startedAt) > Self.pendingStatusTTL
+            if confirmed || stale || byID[id] == nil { pendingOrder[id] = nil }
+        }
+    }
+
     /// How long an unconfirmed optimistic change survives. Long enough for a
     /// slow `gh project` round trip on the status sync, short enough that a
     /// dropped event does not leave the board permanently lying.
@@ -832,20 +891,32 @@ final class Store {
     /// Applies a status change optimistically and rolls it back if the daemon
     /// refuses. Never used for `.done` — `DaemonClient.setStatus` throws on it,
     /// and `beginClose` is the only route to a close.
-    func moveTask(_ task: TrackerTask, to status: TaskStatus) async {
+    ///
+    /// - Returns: whether the task is now in `status` — which is the question
+    ///   the caller actually has, since it decides whether a follow-up
+    ///   placement in that column is still meaningful. So a no-op (a snapshot
+    ///   landed mid-drag and the card is already there) answers `true`, not
+    ///   `false`: nothing failed, and the placement should still be sent.
+    ///
+    ///   It cannot be inferred from `pendingStatus` instead: the refresh on the
+    ///   success path may already have confirmed and pruned the entry.
+    @discardableResult
+    func moveTask(_ task: TrackerTask, to status: TaskStatus) async -> Bool {
         let previous = effectiveStatus(of: task)
-        guard previous != status else { return }
+        guard previous != status else { return true }
         pendingStatus[task.id] = PendingStatusChange(
             target: status, previous: previous, startedAt: .now)
         do {
             _ = try await client.setStatus(taskId: task.id, status: status)
             // Left in place until a snapshot confirms it; see prunePendingStatus.
             await refresh()
+            return true
         } catch {
             pendingStatus[task.id] = nil
             let detail = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             show(.error("Could not move “\(task.title)” to \(status.displayName): \(detail)"))
+            return false
         }
     }
 
@@ -855,17 +926,34 @@ final class Store {
     /// diverge on what is allowed — and neither can bypass the rule table.
     /// Nothing irreversible happens in this method: the `.confirmClose` branch
     /// opens the sheet, which only sends the write-free dry run.
-    func perform(drop payload: TaskDragPayload, on column: TaskStatus) async {
-        switch BoardDropRules.decide(payload, to: column) {
+    ///
+    /// - Parameter placement: where in the column the card was released. The
+    ///   keyboard has no pointer and passes `.column`, which asks for a status
+    ///   change and no placement.
+    func perform(drop payload: TaskDragPayload, on column: TaskStatus,
+                 at placement: BoardDropTarget = .column) async {
+        switch BoardDropRules.decide(payload, to: column, at: placement) {
         case .rejected(let why):
             // A same-column drop is a shrug, not an error; the other two are
             // worth explaining.
             show(BoardFeedback(message: why.message,
                                isError: why != .sameColumn,
                                hint: why.hint))
-        case .optimisticStatus(let status):
+        case .reorder(let target):
+            guard tasks.contains(where: { $0.id == payload.taskId }) else { return }
+            await reorder(column: column,
+                          ids: reorderedIDs(in: column, moving: payload.taskId,
+                                            to: target))
+        case .optimisticStatus(let status, let target):
             guard let task = tasks.first(where: { $0.id == payload.taskId }) else { return }
-            await moveTask(task, to: status)
+            // Order matters and is not interchangeable: `set_status` *clears*
+            // `position`, so a reorder sent first would be undone by the status
+            // write. And it is skipped entirely when the status change failed,
+            // because persisting an order for a column the card never reached
+            // would be a lie about a column the user is still looking at.
+            guard await moveTask(task, to: status), target != .column else { return }
+            await reorder(column: status,
+                          ids: reorderedIDs(in: status, moving: task.id, to: target))
         case .confirmClose:
             guard let task = tasks.first(where: { $0.id == payload.taskId }) else { return }
             await beginClose(task)
@@ -881,12 +969,14 @@ final class Store {
         return TaskStatus.boardColumns[target]
     }
 
-    /// Where a card will land in `column` once it moves there.
+    /// Where a card will land in `column` when it moves there *without* a
+    /// placement — the `.column` drop target, i.e. a `⌘←` / `⌘→` move.
     ///
-    /// Uses the column's own sort, not the pointer's position: the board does
-    /// not persist card order (it is derived from `last_logged_at`), so an
-    /// indicator that followed the cursor would promise a placement the data
-    /// model cannot keep.
+    /// The answer is not simply 0. A status change clears `position`
+    /// (`wt_api.set_status`), so the card joins the unpositioned band at the
+    /// top of the column and then sorts *within* that band by recency — which
+    /// is why this asks the real comparator with the moved card's position
+    /// forced to `nil` rather than guessing.
     ///
     /// Counts against the **filtered** column, because that is what is drawn. A
     /// status change never alters a task's role, activity, repo or logged time,
@@ -895,8 +985,72 @@ final class Store {
         guard let moved = tasks.first(where: { $0.id == taskId }) else { return 0 }
         var destination = filteredBoardTasks(column).filter { $0.id != taskId }
         destination.append(moved)
-        destination.sort(by: Self.boardOrder)
+        destination.sort {
+            Self.boardOrder($0, $1, position: { task in
+                task.id == taskId ? nil : self.effectivePosition(of: task)
+            })
+        }
         return destination.firstIndex { $0.id == taskId } ?? destination.count - 1
+    }
+
+    // MARK: - Manual card order
+
+    /// The ids of `column`, in the order it should be persisted with `taskId`
+    /// moved to `placement`.
+    ///
+    /// Computed against the **unfiltered** column, unlike `landingIndex`, and
+    /// that difference is the whole point: the user places a card relative to
+    /// the cards they can see, but the persisted order has to describe every
+    /// card in the column. Anchoring on the *neighbour's id* rather than on a
+    /// row index is what makes that translation exact — with a filter on, row 2
+    /// of what is drawn is not row 2 of what exists.
+    ///
+    /// Removal happens before insertion, so this is correct whether or not the
+    /// card is already in `column` (it is, for a reorder; for a cross-column
+    /// drop it arrives via `pendingStatus`).
+    func reorderedIDs(in column: TaskStatus, moving taskId: String,
+                      to placement: BoardDropTarget) -> [String] {
+        let current = boardTasks(column).map(\.id)
+        // Dropped on itself: the user asked for the place it already has.
+        // Falling through would remove it and re-append, quietly sending the
+        // card to the bottom of its own column.
+        if case .before(taskId) = placement { return current }
+
+        var ids = current.filter { $0 != taskId }
+        switch placement {
+        case .before(let anchor):
+            // A missing anchor means the snapshot moved under the drag; append
+            // rather than drop the card on the floor.
+            ids.insert(taskId, at: ids.firstIndex(of: anchor) ?? ids.count)
+        case .end, .column:
+            ids.append(taskId)
+        }
+        return ids
+    }
+
+    /// Persists a column's manual order, optimistically.
+    ///
+    /// Writes the whole column's positions locally first so the cards settle
+    /// where they were dropped, then sends the same list. A failure clears the
+    /// optimistic entries, which snaps the column back to the snapshot's order
+    /// and says so — silently keeping a placement the daemon rejected would be
+    /// the one outcome worse than not reordering at all.
+    func reorder(column: TaskStatus, ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        let previous = pendingOrder
+        for (index, id) in ids.enumerated() {
+            pendingOrder[id] = PendingPosition(target: index, startedAt: .now)
+        }
+        do {
+            _ = try await client.reorderTasks(taskIds: ids)
+            // Left in place until a snapshot confirms it; see prunePendingOrder.
+            await refresh()
+        } catch {
+            pendingOrder = previous
+            let detail = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            show(.error("Could not reorder \(column.displayName): \(detail)"))
+        }
     }
 
     // MARK: - The close workflow (never optimistic, never silent)
@@ -1319,6 +1473,12 @@ struct PendingStatusChange: Equatable, Sendable {
     /// Kept so a rollback restores what was on screen, not what the (possibly
     /// stale) snapshot says.
     let previous: TaskStatus
+    let startedAt: Date
+}
+
+/// One task's optimistic manual position, awaiting snapshot confirmation.
+struct PendingPosition: Equatable, Sendable {
+    let target: Int
     let startedAt: Date
 }
 

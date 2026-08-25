@@ -687,6 +687,55 @@ def test_task_and_log_endpoints(wt, wt_api, wt_daemon, migrated, baseline,
               f"{status} {code_of(body)}")
         invariants(work, "POST /v1/tasks/{id}/status")
 
+        # -- reorder (the board's manual card order) ------------------------
+        #
+        # Note this runs *after* the status change above, which cleared any
+        # position the created task had — so the ids below start unpositioned,
+        # which is the state a real first drag meets.
+        order = [t["id"] for t in
+                 json.loads(work.read_text())["tasks"][:3]]
+        status, body, _ = h.post("/v1/tasks/reorder", {"task_ids": order})
+        check(status == 200
+              and body["positions"] == {tid: i for i, tid in enumerate(order)},
+              "POST /v1/tasks/reorder -> 200 with the positions written",
+              f"{status} {body.get('positions')}")
+        persisted = {t["id"]: t.get("position")
+                     for t in json.loads(work.read_text())["tasks"]}
+        check([persisted[tid] for tid in order] == [0, 1, 2],
+              "…and the order reached the data file",
+              str([persisted[tid] for tid in order]))
+        check(sum(1 for v in persisted.values() if v is not None) == 3,
+              "…and nothing outside the list was positioned",
+              str(sum(1 for v in persisted.values() if v is not None)))
+
+        status, body, _ = h.post("/v1/tasks/reorder", {})
+        check(status == 400 and code_of(body) == "bad_request",
+              "…a reorder with no task_ids -> 400 bad_request",
+              f"{status} {code_of(body)}")
+        status, body, _ = h.post("/v1/tasks/reorder", {"task_ids": ["nope"]})
+        check(status == 404 and code_of(body) == "task_not_found",
+              "…an unknown id -> 404 task_not_found",
+              f"{status} {code_of(body)}")
+        status, body, _ = h.post("/v1/tasks/reorder", {"task_ids": []})
+        check(status == 400 and code_of(body) == "invalid_args",
+              "…an empty list -> 400 invalid_args",
+              f"{status} {code_of(body)}")
+
+        # `reorder` is a literal path segment, not a task id: the {tid} routes
+        # must not swallow it, and the reorder route must not shadow them.
+        status, body, _ = h.patch(f"/v1/tasks/{task_id}", {"description": "still here"})
+        check(status == 200, "…and /tasks/{id} still routes to the task itself",
+              f"{status} {code_of(body)}")
+        invariants(work, "POST /v1/tasks/reorder")
+
+        # A snapshot must carry the order back out, or the client has no way to
+        # render what it just wrote.
+        status, body, _ = h.get("/v1/snapshot")
+        views = {t["id"]: t for t in body.get("tasks", [])}
+        check(status == 200 and [views[tid]["position"] for tid in order] == [0, 1, 2],
+              "GET /v1/snapshot reports position",
+              str([views.get(tid, {}).get("position") for tid in order]))
+
         # -- logs ----------------------------------------------------------
         status, body, _ = h.post(f"/v1/tasks/{task_id}/logs",
                                  {"minutes": 90, "note": "harness log",

@@ -32,6 +32,21 @@ extension DaemonClient {
                               as: StatusChange.self)
     }
 
+    /// `POST /v1/tasks/reorder` — persist the manual card order of one column.
+    ///
+    /// Sends the **whole column**, not the card that moved: the daemon assigns
+    /// `position` 0..n-1 over exactly these ids, so what gets persisted is the
+    /// order the user was looking at when they let go. That also makes a retry
+    /// harmless — the call is idempotent.
+    ///
+    /// Unlike `setStatus`, this reaches no GitHub code path at all: it writes
+    /// one integer per task and nothing else.
+    func reorderTasks(taskIds: [String]) async throws -> TaskOrder {
+        try await post("/v1/tasks/reorder",
+                       body: ["task_ids": .strings(taskIds)],
+                       as: TaskOrder.self)
+    }
+
     /// `POST /v1/tasks/{id}/close/plan` — the §7.1 preview.
     ///
     /// Write-free by construction on the Python side. `offline` makes the daemon
@@ -151,6 +166,9 @@ extension DaemonClient {
         case bool(Bool)
         case int(Int)
         case double(Double)
+        /// The one non-scalar the write surface needs: a column's task ids, in
+        /// order, for `reorderTasks`.
+        case strings([String])
 
         var json: Any {
             switch self {
@@ -158,6 +176,7 @@ extension DaemonClient {
             case .bool(let v): v
             case .int(let v): v
             case .double(let v): v
+            case .strings(let v): v
             }
         }
     }
@@ -177,6 +196,25 @@ extension DaemonClient {
         request.httpBody = try JSONSerialization.data(
             withJSONObject: body.mapValues(\.json))
         return try await authorized(request, as: type)
+    }
+}
+
+/// `POST /v1/tasks/reorder`'s success body (`wt_api.reorder_tasks`).
+struct TaskOrder: Decodable, Sendable, Equatable {
+    /// The ids that were positioned, in the order they were positioned.
+    let taskIds: [String]
+    /// `task id -> position`, which is what the snapshot will report next.
+    let positions: [String: Int]
+
+    enum CodingKeys: String, CodingKey {
+        case taskIds = "task_ids"
+        case positions
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        taskIds = try c.decodeIfPresent([String].self, forKey: .taskIds) ?? []
+        positions = try c.decodeIfPresent([String: Int].self, forKey: .positions) ?? [:]
     }
 }
 

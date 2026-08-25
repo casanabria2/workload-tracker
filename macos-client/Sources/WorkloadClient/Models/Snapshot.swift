@@ -127,6 +127,15 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
     let roleId: String?
     let createdAt: TimeInterval?
 
+    /// The owner's manual board order within a column — lower is higher up.
+    ///
+    /// `nil` on a task that has never been dragged, which is **not** the same
+    /// as `0`: unpositioned tasks sort *above* the positioned block, by the old
+    /// recency rule, so a task created after the column was arranged still
+    /// arrives where it can be seen. `Store.boardOrder` is the one place that
+    /// encodes this; see `wt_api.reorder_tasks` for the Python half.
+    let position: Int?
+
     /// Per-task GitHub Project fields. `activity` and `githubRepo` are the two
     /// filter facets (plan §8); `type` is carried for the editor only and is
     /// `nil` on every task in the owner's current data.
@@ -173,7 +182,7 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
     let recurrentSeries: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, description, status, activity, type, logs, tabs
+        case id, title, description, status, activity, type, logs, tabs, position
         case statusLabel = "status_label"
         case roleId = "role_id"
         case createdAt = "created_at"
@@ -202,6 +211,7 @@ struct TrackerTask: Codable, Sendable, Identifiable, Equatable {
         statusLabel = try c.decodeIfPresent(String.self, forKey: .statusLabel)
         roleId = try c.decodeIfPresent(String.self, forKey: .roleId)
         createdAt = try c.decodeIfPresent(TimeInterval.self, forKey: .createdAt)
+        position = try c.decodeIfPresent(Int.self, forKey: .position)
         activity = try c.decodeIfPresent(String.self, forKey: .activity)
         githubRepo = try c.decodeIfPresent(String.self, forKey: .githubRepo)
         type = try c.decodeIfPresent(String.self, forKey: .type)

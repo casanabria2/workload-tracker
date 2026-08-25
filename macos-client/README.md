@@ -167,6 +167,30 @@ nothing happens, revert — do not start debugging the drop handlers, because th
 are not the problem. `DragTypeRegistrationTests` will need its expectation
 updated in the same change.
 
+## Dragging to reorder — what a test cannot cover
+
+Columns are ordered by the owner's hand (`position` on each task, plan §7.2),
+and the gesture is a drag within or into a column. Two things about the
+implementation are worth knowing before touching `BoardColumn`:
+
+**Each row is its own drop destination.** `.dropDestination` reports only
+*whether* it is targeted — during a `Transferable` drag there is no continuous
+hover location. (`BoardColumn.hoverY` is the fossil of assuming otherwise: it is
+read by `autoScroll` and only ever assigned `nil`, so spring-loaded scrolling
+has never actually run.) Hovering a card draws the insertion line above it and
+dropping inserts before it; a tail zone under the last card — present only
+during a drag — is the only way to say "last". The column background carries no
+placement at all, so a drag that meant "start this" cannot silently freeze the
+destination column's order.
+
+**The rules stay a pure function.** `BoardDropRules.decide(from:to:at:)` takes
+the landing area as a value, so the whole two-axis table is exercised by
+`BoardDropRulesTests` without a window. `BoardOrderTests` covers the sort, the
+id list a drag persists, and which requests each drop issues. What no test can
+cover is the drag itself, so after changing anything here run the **bundled**
+app and check three things by hand: the line appears above the hovered card, the
+card lands exactly there, and dragging within one column issues no status write.
+
 ## App icon
 
 There is none, deliberately. Plan §11 calls for an icon authored in **Icon
@@ -332,7 +356,7 @@ re-derived for the new zoom rather than snapping back to today.
 
 ```bash
 swift build            # debug
-swift test             # 324 tests, 4 skipped (the skips need a live daemon)
+swift test             # 348 tests, 4 skipped (the skips need a live daemon)
 ```
 
 `swift test` never touches `~/.workload_tracker.json` and makes no GitHub calls.

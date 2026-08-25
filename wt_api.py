@@ -74,6 +74,7 @@ __all__ = [
     "resolve_task", "require_task",
     "snapshot", "task_view", "task_detail",
     "create_task", "update_task", "set_status", "rename_task", "delete_task",
+    "reorder_tasks", "board_position",
     "set_task_repo", "set_task_activity", "set_task_type",
     "start_timer", "stop_timer",
     "add_log", "edit_log", "delete_log", "split_log", "merge_logs",
@@ -273,6 +274,9 @@ def task_view(task: dict, data: dict, sprints: list[dict] | None = None,
         "status_label": STATUS_LABELS.get(task.get("status"), task.get("status")),
         "role_id": task.get("role_id"),
         "created_at": task.get("created_at"),
+        # The owner's manual board order, or None on a task never dragged.
+        # See the "board order" note above :func:`reorder_tasks`.
+        "position": board_position(task),
 
         # The two per-task fields the filter bar needs (plan §8), plus `type`
         # for the editor.
@@ -533,6 +537,107 @@ def update_task(data: dict, task_id: str, **fields) -> dict:
                 task[key] = value
                 changed[key] = value
     return {"task": task, "changed": changed}
+
+
+# ------------------------------------------------------------ board order -----
+#
+# ``position`` is the owner's *manual* board order: one optional integer per
+# task, lower first. It exists because the board's derived sort (most recently
+# logged first) answers "what did I touch last", which is not the same question
+# as "what am I doing next" — and only the second one can be answered by a
+# person.
+#
+# Three properties, all deliberate:
+#
+# 1. **Absent means unpositioned, not zero.** A task nobody has dragged carries
+#    no ``position`` key at all, and unpositioned tasks sort *above* positioned
+#    ones, ordered among themselves by the old recency rule. So a freshly
+#    created task still appears at the top of its column where it can be seen,
+#    rather than silently at the bottom of a hand-sorted list. Coercing a
+#    missing key to 0 instead would tie every never-dragged task for first
+#    place and make the sort depend on dict order.
+#
+# 2. **The numbers are per column, and normalised on every write.** They are
+#    assigned 0..n-1 over exactly the ids :func:`reorder_tasks` is given, which
+#    is the whole column as the client last rendered it. There is no
+#    fractional-index scheme: the data file is rewritten wholesale on every
+#    save, so "insert at 3.5" would buy no write amplification back and would
+#    cost a renormalisation pass later.
+#
+# 3. **A status change clears it** (:func:`_clear_position`). A position of 7
+#    meant "seventh in To Do"; carrying that number into In Progress would drop
+#    the card at an arbitrary depth of a column it has never been ordered
+#    against. Clearing it puts the card in the unpositioned band at the top of
+#    its new column — explainable, and where a card you have just started work
+#    on belongs. A drag that crosses columns re-sends the destination column's
+#    full order immediately afterwards, so the user never sees that
+#    intermediate state; a keyboard move or a CLI status change does, and lands
+#    at the top.
+
+def board_position(task: dict) -> int | None:
+    """The task's manual board position, or ``None`` when it has never been set.
+
+    Tolerates the junk a hand-edit or an older client can leave behind: a
+    non-numeric value (or a bool, which *is* an ``int`` in Python) reads as
+    unpositioned rather than raising in the middle of a snapshot render.
+    """
+    value = task.get("position")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _clear_position(task: dict) -> None:
+    """Drop a task out of the manual order — see note 3 above."""
+    task.pop("position", None)
+
+
+def reorder_tasks(data: dict, task_ids: list) -> dict:
+    """Assign ``position`` 0..n-1 to *task_ids*, in the order given.
+
+    The client sends the **whole column** it just rendered, not the one card
+    that moved. That makes the call idempotent, and makes the persisted order
+    exactly the order the user was looking at when they let go. Tasks not named
+    are untouched, so a stale list can misorder the column it names but can
+    never disturb another one.
+
+    Ids are matched **exactly** — no fuzzy title resolution, unlike
+    :func:`require_task`. This is a machine-to-machine call carrying ids the
+    client read out of a snapshot, and a substring match here would silently
+    reorder the wrong card.
+
+    Raises ``invalid_args`` (not a list, empty, non-string or repeated entries)
+    and ``task_not_found``.
+    """
+    if not isinstance(task_ids, list):
+        raise WtError("invalid_args", "'task_ids' must be a list of task ids",
+                      field="task_ids")
+    if not task_ids:
+        raise WtError("invalid_args", "'task_ids' cannot be empty",
+                      field="task_ids")
+    if any(not isinstance(t, str) or not t for t in task_ids):
+        raise WtError("invalid_args", "'task_ids' must contain only task ids",
+                      field="task_ids")
+
+    duplicates = sorted({t for t in task_ids if task_ids.count(t) > 1})
+    if duplicates:
+        raise WtError("invalid_args",
+                      f"'task_ids' repeats {', '.join(duplicates)}",
+                      field="task_ids", duplicates=duplicates)
+
+    by_id = {t.get("id"): t for t in data.get("tasks", [])}
+    missing = [t for t in task_ids if t not in by_id]
+    if missing:
+        raise WtError("task_not_found",
+                      f"No task found matching '{missing[0]}'",
+                      query=missing[0], missing=missing)
+
+    positions = {}
+    for index, task_id in enumerate(task_ids):
+        by_id[task_id]["position"] = index
+        positions[task_id] = index
+    return {"task_ids": list(task_ids), "positions": positions,
+            "count": len(task_ids)}
 
 
 def rename_task(data: dict, task_id: str, new_title: str, *,
@@ -958,6 +1063,10 @@ def set_status(data: dict, task_id: str, status: str, *,
         return result
 
     task["status"] = status
+    if status != old_status:
+        # The card is arriving in a column it has never been ordered against;
+        # see note 3 above `reorder_tasks`.
+        _clear_position(task)
     if save_callback:
         save_callback(data)
 
@@ -1024,6 +1133,13 @@ def close(data: dict, task_id: str, *, create_issue: bool = False,
     result = wt.close_task(task, data, save_callback,
                            prompt_callback=lambda _msg: bool(create_issue),
                            comment_callback=comment_callback)
+    if task.get("status") == "done" and board_position(task) is not None:
+        # Same rule as `set_status`: the card has changed column, so its manual
+        # position no longer describes anything. Read the status off the *task*
+        # rather than off `result`, because a failed reconcile aborts the close
+        # and leaves the task open — and an open task keeps its place.
+        _clear_position(task)
+        save_callback(data)
     out = dict(result)
     out["task"] = task
     out["title"] = task.get("title")

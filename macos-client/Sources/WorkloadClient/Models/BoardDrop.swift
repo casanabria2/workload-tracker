@@ -141,15 +141,48 @@ enum BoardDropRejection: Equatable, Sendable {
     }
 }
 
+/// Where a card was released, which is what separates "move it" from "put it
+/// *there*".
+///
+/// Keeping the landing area in the payload — rather than inferring it from a
+/// pointer coordinate at drop time — is what lets the rule table stay a pure
+/// function that a test can drive without a drag session.
+///
+/// Note that **every drag expresses a placement**: a card zone or the empty
+/// space below the cards, and nothing else is reachable with the mouse.
+/// `.column` exists for the routes that have no pointer at all — `⌘←` / `⌘→`,
+/// and any drop that arrives without a resolvable landing area.
+enum BoardDropTarget: Equatable, Sendable {
+    /// Released over the card with this id: insert *before* it, which is
+    /// exactly where the insertion line was drawn.
+    case before(taskId: String)
+    /// Released below the last card: append. This is what the column's own
+    /// empty space means, so releasing into the gap under a short column does
+    /// the obvious thing rather than nothing.
+    case end
+    /// No placement expressed — a keyboard move. The card takes the status
+    /// change alone and therefore arrives unpositioned, at the top of its new
+    /// column (`wt_api.set_status` clears `position`).
+    case column
+}
+
 /// What a drop should do.
 enum BoardDropDecision: Equatable, Sendable {
     /// Do nothing but tell the user why.
     case rejected(BoardDropRejection)
-    /// `POST /v1/tasks/{id}/status`. Applied to the UI immediately and rolled
-    /// back if the daemon refuses.
-    case optimisticStatus(TaskStatus)
+    /// `POST /v1/tasks/{id}/status`, then — unless the placement is `.column` —
+    /// `POST /v1/tasks/reorder` for the destination column. Applied to the UI
+    /// immediately and rolled back if the daemon refuses.
+    case optimisticStatus(TaskStatus, at: BoardDropTarget)
+    /// `POST /v1/tasks/reorder` alone: the card stays in its column and only
+    /// changes place. **No status is written**, so this is the one drop that
+    /// touches nothing but a local integer.
+    case reorder(BoardDropTarget)
     /// Open the §7.1 close sheet. **No request is issued by the drop itself**
     /// beyond the sheet's write-free `close/plan` dry run.
+    ///
+    /// Carries no placement: a task being closed is leaving the board, and
+    /// `wt_api.close()` clears its position anyway.
     case confirmClose
 }
 
@@ -166,29 +199,47 @@ enum BoardDropDecision: Equatable, Sendable {
 /// The asymmetry is not an oversight: the underlying operations are not
 /// symmetric. Two of them are a one-field write; the third mints and closes
 /// GitHub issues.
+///
+/// Manual ordering adds a second axis — *where* in the column the card was
+/// released (`BoardDropTarget`) — without adding a second table. The status
+/// verdict is decided first and identically; the placement only rides along.
+/// The one new row is the same-column drop, which used to be uniformly a shrug
+/// and now depends on where it landed:
+///
+/// | Drop | Behaviour |
+/// |---|---|
+/// | same column, onto a card | `POST /tasks/reorder`, no status write |
+/// | same column, onto the background | rejected, "already there" |
 enum BoardDropRules {
 
     /// The whole table. Precedence matters and is asserted by the tests:
     /// recurrent beats everything (it is a prohibition, not a limitation);
     /// an unknown status is next, because nothing can be reasoned about it;
-    /// a same-column drop is a no-op *before* it is a reopen attempt, so
-    /// dropping a Done card back on Done says "already there" rather than
-    /// lecturing about reopening.
-    static func decide(from source: TaskStatus, to target: TaskStatus) -> BoardDropDecision {
+    /// a same-column drop is resolved *before* the Done rules, so dropping a
+    /// Done card onto another Done card reorders it rather than lecturing about
+    /// reopening — reordering Done is a pure local write and reaches no `gh`
+    /// command at all.
+    static func decide(from source: TaskStatus, to target: TaskStatus,
+                       at placement: BoardDropTarget = .column) -> BoardDropDecision {
         if source == .recurrent || target == .recurrent {
             return .rejected(.recurrentLocked)
         }
         if case .unknown(let raw) = source { return .rejected(.unknownStatus(raw)) }
         if case .unknown(let raw) = target { return .rejected(.unknownStatus(raw)) }
-        if source == target { return .rejected(.sameColumn) }
+        if source == target {
+            // Dropping a card back on its own column's background asks for
+            // nothing; dropping it on a specific card asks for a place.
+            return placement == .column ? .rejected(.sameColumn) : .reorder(placement)
+        }
         if source == .done { return .rejected(.reopenNotSupported) }
         if target == .done { return .confirmClose }
-        return .optimisticStatus(target)
+        return .optimisticStatus(target, at: placement)
     }
 
     /// Convenience over a payload, for the drop handler.
-    static func decide(_ payload: TaskDragPayload, to target: TaskStatus) -> BoardDropDecision {
-        decide(from: payload.status, to: target)
+    static func decide(_ payload: TaskDragPayload, to target: TaskStatus,
+                       at placement: BoardDropTarget = .column) -> BoardDropDecision {
+        decide(from: payload.status, to: target, at: placement)
     }
 
     /// Whether a card may be picked up at all. Recurrent cards are not
@@ -201,10 +252,15 @@ enum BoardDropRules {
 
     /// Whether *this* column will accept *this* card — what a drop target uses
     /// to decide whether to highlight and whether to show the "no" cursor.
+    ///
+    /// Asks the question with a real placement (`.end`), not `.column`: a
+    /// same-column drag is a legitimate reorder, and probing with `.column`
+    /// would light the card's own column orange and put "Already there" over
+    /// it for the whole of every reorder.
     static func accepts(_ payload: TaskDragPayload, in column: TaskStatus) -> Bool {
-        switch decide(payload, to: column) {
+        switch decide(payload, to: column, at: .end) {
         case .rejected: false
-        case .optimisticStatus, .confirmClose: true
+        case .optimisticStatus, .reorder, .confirmClose: true
         }
     }
 }

@@ -132,7 +132,16 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 ### Data Model
 
 Plain JSON with three top-level keys:
-- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `github_repo`, `activity`, `type`, `calendar_event_uid`, `sprint_issues[]`, `start_sprint`/`start_sprint_id` (plus the legacy `sprint`/`sprint_id` mirror)
+- `tasks[]` — Each task has: id, title, description, role_id, status, logs[], created_at, and optionally `github_issue`, `github_repo`, `activity`, `type`, `calendar_event_uid`, `sprint_issues[]`, `start_sprint`/`start_sprint_id` (plus the legacy `sprint`/`sprint_id` mirror), `position`
+- `position` — the macOS board's **manual card order** within a column, lower
+  first. Optional, and **absent means unpositioned, not zero**: unpositioned
+  tasks sort *above* the arranged block (by the old last-logged-descending
+  rule), which is what keeps a freshly created task visible instead of filing
+  it at the bottom of a hand-sorted column. Written only by
+  `wt_api.reorder_tasks()`, which normalises a whole column to `0..n-1`;
+  **cleared** by any status change (`wt_api.set_status`, `wt_api.close`),
+  because a position of 7 meant "seventh in To Do" and means nothing in another
+  column. See "Board card order" below and docs/plan-macos-app.md §7.2.
 - `active_timer` — `{task_id, started_at}` or null
 - `roles[]` — Each role has: id, label, color. Roles are pure categorization, user-configurable via `wt roles` commands. GitHub repo/activity/type are **per-task** fields (`wt set-repo/set-activity/set-type <task> ...`), not role fields.
 - `config.sprints_cache[]` — Persisted list of `{id, title, start_date, end_date, field_id}` written by `save_sprints_cache()` after the TUI fetches sprints from GitHub. Used by `get_sprint_date_range_for_task()` to avoid network calls (e.g. for the calendar modal's default range).
@@ -354,6 +363,30 @@ When cmux is not answering, the daemon launches it by bundle id
 (`com.cmuxterm.app`) and waits for the socket. It deliberately does **not** fall
 back to the default browser: an unreachable cmux should be visible, not produce a
 surprise tab somewhere else.
+
+### Board card order (`position`)
+
+The macOS client's Kanban columns are ordered by the owner's hand, not by
+recency. One optional integer per task (`position`), plus three rules:
+
+1. **Absent means unpositioned.** Unpositioned tasks sort *above* the arranged
+   block, among themselves by the old `last_logged_at`-descending rule. Never
+   coerce a missing `position` to `0` — that ties every never-dragged task for
+   first place and makes the sort depend on dict order.
+2. **A reorder normalises a whole column** to `0..n-1`. The only supported
+   writer is `wt_api.reorder_tasks(data, task_ids)`, which takes the column's
+   full id list (exact id matching, no fuzzy titles) and touches nothing else.
+   Re-sending the same list is a no-op, so a retry is safe.
+3. **A status change clears it.** `wt_api.set_status()` and `wt_api.close()`
+   both drop the key, so a card arriving in a new column lands in that column's
+   unpositioned band at the top rather than at an arbitrary depth. The macOS
+   client re-sends the destination column's order right after a cross-column
+   *drag*, so only keyboard/CLI status changes actually surface this.
+
+Wire surface: `task_view()` emits `position` (nullable), and
+`POST /v1/tasks/reorder` with `{"task_ids": [...]}` is the daemon route. The
+CLI is untouched — `wt list` groups by role and prints file order, and
+`position` is deliberately a board concept only.
 
 ### Time Log Management
 
@@ -901,6 +934,10 @@ Authoritative signatures (use these instead of guessing — see live values via 
 - `resolve_task(data: dict, query: str)` — fuzzy match by id or title
 - `resolve_task_by_id(data: dict, task_id: str) -> dict | None` — exact id only
 
+**Board card order** (in `wt_api.py`, not `wt.py`)
+- `wt_api.board_position(task) -> int | None` — the manual position, or `None`. Tolerates junk (a string, a bool) as unpositioned rather than raising mid-snapshot
+- `wt_api.reorder_tasks(data, task_ids: list) -> dict` — assign `0..n-1` over exactly these ids. **Ids are matched exactly**, unlike `require_task`. Raises `invalid_args` / `task_not_found`
+
 **Time accounting**
 - `task_logged_mins(task) -> float`
 - `task_uploaded_mins(task) -> float`
@@ -1071,6 +1108,7 @@ wt.save(data)
 
 - Don't shell out to `gh issue create` or `gh project item-edit` directly — use `create_github_issue` + `setup_issue_in_project` so Status/Activity/Sprint/Hours fields stay in sync.
 - Don't write to `data["config"]["sprints_cache"]` by hand — use `save_sprints_cache(data, sprints)` so the entry shape stays correct (ISO date strings).
+- Don't set `task["position"]` by hand or read it with `task.get("position", 0)`. Use `wt_api.reorder_tasks()` and `wt_api.board_position()`: a missing position means *unpositioned* (sorts above the arranged block), and defaulting it to 0 ties every never-dragged task for first place. Any new status-writing path must clear it, the way `set_status`/`close` do.
 - Don't add new task statuses without updating `PROJECT_STATUS_MAP` (`wt.py`) — missing entries cause silent sync no-ops.
 - Don't bypass `resolve_event_to_task()` in new code that logs a calendar event to a mapped task — manual `resolve_task_by_id(get_event_mapping(...))` skips the sprint-aware routing.
 - When reporting hours to a GitHub issue, use the **sprint-filtered** total (`task_reportable_mins(task, data, sprints)`), never `task_logged_mins(task)`. A cross-sprint task keeps *all* its logs on one object as the source of truth while its per-sprint hours live on separate per-sprint issues; reporting the task total double-counts. `sync_project_hours()`, `close_task()` and `reconcile_task_sprints()` all use the sprint-filtered value — keep any new GitHub-hours path consistent.

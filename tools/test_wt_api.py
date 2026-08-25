@@ -234,7 +234,7 @@ def test_snapshot(wt, wt_api, migrated, scratch):
         "created_at", "activity", "github_repo", "type", "sprints_with_time",
         "start_sprint", "start_sprint_id", "sprint_issues", "current_issue",
         "logged_mins", "live_mins", "reportable_mins", "last_logged_at", "logs",
-        "local_folder",
+        "local_folder", "position",
     }
     missing = [k for t in snap["tasks"] for k in want_task_keys if k not in t]
     check(not missing, "every task carries every documented field",
@@ -623,6 +623,108 @@ def test_task_commands(wt, wt_api, migrated, scratch):
           str(dl["other_issues"]))
 
 
+def test_board_order(wt, wt_api, migrated, scratch):
+    section("7b. reorder_tasks / position — the board's manual card order")
+    data = fresh(wt, migrated, scratch / "order.json")
+    sprints = sprints_of(wt, data)
+
+    todo = [t for t in data["tasks"] if t.get("status") == "todo"][:4]
+    if len(todo) < 3:
+        # The migrated fixture always has some, but the harness must say so
+        # rather than pass vacuously if that ever stops being true.
+        check(False, "fixture has at least 3 todo tasks to order",
+              f"found {len(todo)}")
+        return
+    ids = [t["id"] for t in todo]
+
+    # -- absent means unpositioned, and stays absent -------------------------
+    check(all("position" not in t for t in data["tasks"]),
+          "the fixture starts with no positions at all (nothing is migrated)",
+          str([t["id"] for t in data["tasks"] if "position" in t][:3]))
+    check(wt_api.board_position(todo[0]) is None,
+          "board_position() of an untouched task is None")
+
+    # -- the write -----------------------------------------------------------
+    order = list(reversed(ids))
+    res = wt_api.reorder_tasks(data, order)
+    check(res["positions"] == {tid: i for i, tid in enumerate(order)},
+          "reorder_tasks returns the positions it wrote", str(res["positions"]))
+    check([wt_api.board_position(next(t for t in data["tasks"] if t["id"] == tid))
+           for tid in order] == list(range(len(order))),
+          "…and writes them 0..n-1 in the order given")
+
+    untouched = [t["id"] for t in data["tasks"]
+                 if t["id"] not in ids and "position" in t]
+    check(not untouched, "…and touches nothing it was not given",
+          str(untouched[:3]))
+
+    # Idempotent: the same list again is the same result, which is what makes a
+    # retry after a dropped response safe.
+    again = wt_api.reorder_tasks(data, order)
+    check(again["positions"] == res["positions"], "reorder_tasks is idempotent")
+
+    # -- the errors ----------------------------------------------------------
+    for bad, code, label in [
+        ("not-a-list", "invalid_args", "a non-list"),
+        ([], "invalid_args", "an empty list"),
+        ([ids[0], 7], "invalid_args", "a non-string entry"),
+        ([ids[0], ids[0]], "invalid_args", "a repeated id"),
+        ([ids[0], "no-such-task-id"], "task_not_found", "an unknown id"),
+    ]:
+        try:
+            wt_api.reorder_tasks(data, bad)
+            check(False, f"…{label} raises {code}", "no exception")
+        except wt_api.WtError as e:
+            check(e.code == code, f"…{label} raises {code}", e.code)
+
+    # Exact id matching, not `require_task`'s fuzzy title match: a substring is
+    # not an id, and silently reordering "the task whose title contains this"
+    # would move the wrong card.
+    title = todo[0].get("title", "")
+    if len(title) > 4:
+        try:
+            wt_api.reorder_tasks(data, [title[:5]])
+            check(False, "…a title fragment is not accepted as an id",
+                  "no exception")
+        except wt_api.WtError as e:
+            check(e.code == "task_not_found",
+                  "…a title fragment is not accepted as an id", e.code)
+
+    # -- the snapshot carries it --------------------------------------------
+    with Stubs(wt, mode="strict", sprints=sprints):
+        snap = wt_api.snapshot(data)
+    views = {t["id"]: t for t in snap["tasks"]}
+    check([views[tid]["position"] for tid in order] == list(range(len(order))),
+          "task_view reports position for a positioned task")
+    unpositioned = next(t for t in data["tasks"] if t["id"] not in ids)
+    check(views[unpositioned["id"]]["position"] is None,
+          "…and None (not 0) for one that has never been dragged")
+
+    # Junk in the file must not blow up a snapshot render.
+    unpositioned["position"] = "third"
+    check(wt_api.board_position(unpositioned) is None,
+          "a non-numeric position reads as unpositioned rather than raising")
+    unpositioned["position"] = True
+    check(wt_api.board_position(unpositioned) is None,
+          "…and so does a bool, which is an int in Python")
+    del unpositioned["position"]
+
+    # -- a status change clears it ------------------------------------------
+    moved = next(t for t in data["tasks"] if t["id"] == order[0])
+    with ApiStubs(wt, mode="record", sprints=sprints):
+        wt_api.set_status(data, moved["id"], "inprogress")
+    check("position" not in moved,
+          "set_status clears position: the card is in a column it was never "
+          "ordered against", str(moved.get("position")))
+
+    stayer = next(t for t in data["tasks"] if t["id"] == order[1])
+    before = stayer["position"]
+    with ApiStubs(wt, mode="record", sprints=sprints):
+        wt_api.set_status(data, stayer["id"], stayer["status"])
+    check(stayer.get("position") == before,
+          "…but a no-op status write leaves it alone", str(stayer.get("position")))
+
+
 def test_github_paths(wt, wt_api, migrated, scratch):
     section("8. GitHub: normalize / verify / link / unlink / push / ensure_issue")
     data = fresh(wt, migrated, scratch / "github.json")
@@ -919,6 +1021,7 @@ def main():
     test_log_errors_and_ops(wt, wt_api, migrated, scratch)
     test_timers(wt, wt_api, migrated, scratch)
     test_task_commands(wt, wt_api, migrated, scratch)
+    test_board_order(wt, wt_api, migrated, scratch)
     test_github_paths(wt, wt_api, migrated, scratch)
     test_close_and_reconcile(wt, wt_api, migrated, scratch)
     test_no_gh_escaped()

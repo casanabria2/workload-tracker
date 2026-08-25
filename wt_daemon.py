@@ -1590,6 +1590,26 @@ class ApiHandler(_BaseHandler):
                      "role_label": result.get("role_label"),
                      "status_label": result.get("status_label")}, None
 
+    @route("POST", rf"^{API_PREFIX}/tasks/reorder$")
+    def h_reorder_tasks(self):
+        """Persist the board's manual card order for one column.
+
+        The body is the **whole column** the client just rendered
+        (``{"task_ids": [...]}``), not the single card that moved — see the
+        board-order note in ``wt_api``. Registered above the ``{tid}`` routes
+        for readability only: no POST route matches
+        ``/tasks/<one-segment>``, so ``reorder`` cannot be swallowed as a task
+        id whatever the registration order.
+        """
+        body = self.read_json()
+        task_ids = body.get("task_ids")
+        if task_ids is None:
+            raise DaemonError("bad_request", "'task_ids' is required")
+        result = self.daemon.write(
+            lambda data: wt_api.reorder_tasks(data, task_ids),
+            reason="tasks_reordered")
+        return 200, result, None
+
     @route("PATCH", rf"^{API_PREFIX}/tasks/(?P<tid>[^/]+)$")
     def h_patch_task(self, tid):
         fields = self.read_json()
