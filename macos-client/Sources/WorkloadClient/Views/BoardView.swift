@@ -1,8 +1,9 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The Kanban board: three columns (To Do / In Progress / Done) with the
-/// recurrent tasks in a separate collapsible bottom pane.
+/// The Kanban board: three columns (To Do / In Progress / Done) — four with
+/// Parked revealed — and the recurrent tasks in a separate collapsible bottom
+/// pane.
 ///
 /// Phase 4 makes it interactive. Cards are `.draggable`, columns are drop
 /// targets, and `⌘←`/`⌘→` move the selected card — but every one of those
@@ -45,7 +46,7 @@ struct BoardView: View {
     private var isFilteredToNothing: Bool {
         store.isFiltering
             && !store.tasks.isEmpty
-            && TaskStatus.boardColumns.allSatisfy { column($0).isEmpty }
+            && store.visibleColumns.allSatisfy { column($0).isEmpty }
     }
 
     /// The keyboard cursor, built from **the same arrays the columns render**.
@@ -54,7 +55,7 @@ struct BoardView: View {
     /// the way the view does; that is what makes "a filtered-out card is not
     /// reachable by keyboard" an assertable fact rather than a claim.
     static func cursor(for store: Store) -> BoardCursor {
-        BoardCursor(columns: TaskStatus.boardColumns.map {
+        BoardCursor(columns: store.visibleColumns.map {
             store.filteredBoardTasks($0).map(\.id)
         })
     }
@@ -152,7 +153,7 @@ struct BoardView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             HStack(alignment: .top, spacing: 0) {
-                ForEach(Array(TaskStatus.boardColumns.enumerated()),
+                ForEach(Array(store.visibleColumns.enumerated()),
                         id: \.offset) { index, status in
                     BoardColumn(status: status,
                                 tasks: column(status),
@@ -161,7 +162,7 @@ struct BoardView: View {
                                 selection: Binding(get: { store.boardSelection },
                                                    set: { store.selectTask($0) }),
                                 isBoardFocused: boardFocused)
-                    if index < TaskStatus.boardColumns.count - 1 {
+                    if index < store.visibleColumns.count - 1 {
                         Divider()
                     }
                 }
@@ -225,7 +226,7 @@ struct BoardView: View {
         guard let id = selection,
               let task = store.tasks.first(where: { $0.id == id }),
               let here = cursor.location(of: id) else { return .ignored }
-        let source = TaskStatus.boardColumns[here.column]
+        let source = store.visibleColumns[here.column]
         guard let target = store.neighbourColumn(of: source, offset: offset) else {
             store.show(.info("\(source.displayName) is the "
                              + (offset < 0 ? "first" : "last") + " column."))
@@ -516,7 +517,12 @@ struct BoardColumn: View {
         // `TaskAction.markDone` are literally the same call — both land on
         // `Store.beginClose` — so listing both put two identically-behaved items
         // in one menu under two names.
-        ForEach(TaskStatus.boardColumns.filter { $0 != .done }, id: \.rawValue) { target in
+        //
+        // `allColumns`, not `visibleColumns`: "Move to Parked" has to be
+        // reachable *while the Parked column is hidden*, which is the state the
+        // board is in whenever you want to park something. Drag-and-drop cannot
+        // serve that case — there is no column to drop on.
+        ForEach(TaskStatus.allColumns.filter { $0 != .done }, id: \.rawValue) { target in
             let payload = TaskDragPayload(taskId: task.id,
                                           sourceStatus: store.effectiveStatus(of: task))
             if case .rejected = BoardDropRules.decide(payload, to: target) {
@@ -537,7 +543,7 @@ struct BoardColumn: View {
         -> [(name: String, perform: () -> Void)] {
         let payload = TaskDragPayload(taskId: task.id,
                                       sourceStatus: store.effectiveStatus(of: task))
-        var out: [(String, () -> Void)] = TaskStatus.boardColumns
+        var out: [(String, () -> Void)] = TaskStatus.allColumns
             .filter { $0 != .done }
             .compactMap { target in
                 if case .rejected = BoardDropRules.decide(payload, to: target) { return nil }

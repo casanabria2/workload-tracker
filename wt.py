@@ -6,7 +6,7 @@ Quick command-line interface to manage tasks without launching the full TUI.
 Usage:
     wt add "Task title" --role strategic --status inprogress [--sprint NN]
                         [--repo owner/repo] [--activity ACT] [--type TYPE] [--create-issue]
-    wt list [--role strategic] [--all]
+    wt list [--role strategic] [--all] [--parked]
     wt start <task-id or partial title>
     wt stop
     wt log <task-id or partial title> <minutes> [note]
@@ -15,6 +15,12 @@ Usage:
     wt report [<start> <end>] [--sprint NAME] [--last Nd] [--role ROLE] [--json]
                                    — Show logged time in a date range
     wt done <task-id or partial title>
+    wt park <task-id or partial title>
+                                   — Defer a task: keeps it open and keeps its
+                                     issue, but hides it from the board's
+                                     default view and from `wt sprint`
+    wt unpark <task> [--status todo|inprogress|recurrent]
+                                   — Bring a parked task back (default: todo)
     wt close-recurrent [--all-previous] [--dry-run]
                                    — Close recurrent tasks (with a GitHub issue)
                                      from the previous sprint; --all-previous
@@ -334,7 +340,8 @@ DEFAULT_ROLES = [
     {"id": "other",     "label": "Other",             "color": "white"},
 ]
 
-STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent", "done": "Done"}
+STATUS_LABELS = {"todo": "To Do", "inprogress": "In Progress", "recurrent": "Recurrent",
+                 "parked": "Parked", "done": "Done"}
 COLORS = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
     "blue": "\033[34m", "green": "\033[32m", "yellow": "\033[33m",
@@ -1446,6 +1453,14 @@ PROJECT_STATUS_MAP = {
     "todo": "Todo",
     "inprogress": "In Progress",
     "recurrent": "In Progress",
+    # A parked task is deferred, not abandoned: the issue stays queued, so it
+    # maps to the same project column a `todo` does. The project's Status field
+    # has no "Parked" option (Todo / In Progress / Done / Won't Do / Continuing),
+    # and "Won't Do" would be a lie — parking says "not this sprint", not "never".
+    # Leaving `parked` out of this map is the one thing not to do: an unmapped
+    # status makes sync_project_status() a silent no-op, so a task parked out of
+    # In Progress would sit on the project board as In Progress forever.
+    "parked": "Todo",
     "done": "Done",
 }
 
@@ -4075,21 +4090,28 @@ def cmd_list(args):
 
     filter_role = None
     show_done = False
+    show_parked = False
     i = 0
     while i < len(args):
         if args[i] == "--role" and i + 1 < len(args):
             filter_role = resolve_role(data, args[i+1]); i += 2
         elif args[i] in ("--all", "-a"):
-            show_done = True; i += 1
+            show_done = show_parked = True; i += 1
+        elif args[i] == "--parked":
+            show_parked = True; i += 1
         else:
             i += 1
 
     if filter_role:
         tasks = [t for t in tasks if t.get("role_id") == filter_role]
 
-    # Hide done tasks by default
+    # Hide done tasks by default…
     if not show_done:
         tasks = [t for t in tasks if t.get("status") != "done"]
+    # …and parked ones, which are the sprint's deliberate omissions. `--parked`
+    # shows them without also unearthing the done pile; `--all` shows both.
+    if not show_parked:
+        tasks = [t for t in tasks if t.get("status") != "parked"]
 
     # (Phase 3: the `--shadows` flag and its cross_sprint_parent filter are gone —
     # every task object is a real unit of work now.)
@@ -4505,6 +4527,120 @@ def cmd_merge_logs(args):
 
     save(data)
     print(c(f"✓ Merged {fmt_mins(log1.get('minutes', 0))} + {fmt_mins(log2.get('minutes', 0))} = {fmt_mins(combined_mins)}", "green"))
+
+
+def _set_status_and_sync(task, data, status):
+    """Write a task's status, persist, and push Status to the GitHub Project.
+
+    The same two steps ``wt_api.set_status`` performs for a non-``done``
+    transition. Duplicated rather than imported because ``wt_api`` imports
+    ``wt`` and not the other way round. ``done`` never comes through here: it
+    needs the full close workflow (``close_task`` via ``cmd_done``).
+
+    Returns ``(old_status, issue_ref, project_synced)``.
+    """
+    old = task.get("status", "todo")
+    task["status"] = status
+    save(data)
+    issue_ref = task_current_issue(task, data)
+    synced = bool(issue_ref) and bool(sync_project_status(issue_ref, status, data))
+    return old, issue_ref, synced
+
+
+def _report_status_change(task, old, status, issue_ref, synced):
+    print(c(f"✓ {STATUS_LABELS.get(status, status)}: {task['title']}", "green")
+          + c(f"  (was {STATUS_LABELS.get(old, old)})", "dim"))
+    if issue_ref:
+        column = PROJECT_STATUS_MAP.get(status)
+        if synced:
+            print(c(f"  {issue_ref}: project Status → {column}", "dim"))
+        else:
+            print(c(f"  {issue_ref}: project Status not updated", "yellow"))
+
+
+def cmd_park(args):
+    """Defer a task out of the board's default view for this sprint.
+
+    Parking is purely a visibility decision — it does **not** touch logs,
+    bindings or hours, and reconcile treats a parked task exactly like a ``todo``
+    one, so its issue stays open and keeps its current-sprint binding. That is
+    deliberate: a parked task is deferred, not finished, and closing its issue
+    (or stranding it on a past sprint) would misreport unfinished work.
+    """
+    if not args:
+        print("Usage: wt park <task-id or title>"); sys.exit(1)
+    data = load()
+    task = resolve_task(data, " ".join(args))
+    status = task.get("status", "todo")
+
+    if status == "parked":
+        print(c(f"Already parked: {task['title']}", "dim")); return
+    if status == "done":
+        print(c(f"Refusing to park a done task: {task['title']}", "red"))
+        print(c("  Parking is for work you intend to come back to.", "dim"))
+        sys.exit(1)
+    if status == "recurrent":
+        # A recurrent series is perpetual and gets no carry-forward (reconcile
+        # keys that off `status == "recurrent"`). Parking one would flip it onto
+        # the carry-forward path and re-point the sprint-just-ended's issue onto
+        # a later sprint, stranding the hours it carries.
+        print(c(f"Refusing to park a recurrent task: {task['title']}", "red"))
+        print(c("  A recurrent series is perpetual: parking it would turn on the "
+                "carry-forward\n  path and strand the hours on its last sprint's "
+                "issue. End the series\n  instead (wt done), or leave it running.", "dim"))
+        sys.exit(1)
+
+    at = data.get("active_timer")
+    if at and at.get("task_id") == task["id"]:
+        print(c(f"Timer is running on {task['title']}.", "red"))
+        print(c("  Run `wt stop` first — a parked task is hidden, and a hidden "
+                "task with a\n  running timer is how a session gets forgotten.", "dim"))
+        sys.exit(1)
+
+    old, issue_ref, synced = _set_status_and_sync(task, data, "parked")
+    _report_status_change(task, old, "parked", issue_ref, synced)
+    print(c("  Hidden from `wt list`, `wt sprint` and the board's default view. "
+            "Undo with `wt unpark`.", "dim"))
+
+
+def cmd_unpark(args):
+    """Bring a parked task back onto the board.
+
+    The restored status is ``todo`` unless ``--status`` says otherwise. There is
+    deliberately no memory of what the task was before it was parked: that would
+    be a new persisted field for one convenience, and an old ``wt.py`` on another
+    Mac would strip it on sight. Say what you want back.
+    """
+    usage = "Usage: wt unpark <task-id or title> [--status todo|inprogress|recurrent]"
+    if not args:
+        print(usage); sys.exit(1)
+
+    target = "todo"
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--status" and i + 1 < len(args):
+            target = args[i + 1]; i += 2
+        else:
+            rest.append(args[i]); i += 1
+
+    if target in ("parked", "done") or target not in STATUS_LABELS:
+        print(c(f"Invalid unpark status '{target}'. "
+                "Use: todo, inprogress, recurrent.", "red"))
+        print(c("  (`done` goes through the close workflow — use `wt done`.)", "dim"))
+        sys.exit(1)
+    if not rest:
+        print(usage); sys.exit(1)
+
+    data = load()
+    task = resolve_task(data, " ".join(rest))
+    if task.get("status") != "parked":
+        label = STATUS_LABELS.get(task.get("status"), task.get("status"))
+        print(c(f"Not parked: {task['title']} [{label}]", "yellow"))
+        sys.exit(1)
+
+    old, issue_ref, synced = _set_status_and_sync(task, data, target)
+    _report_status_change(task, old, target, issue_ref, synced)
 
 
 def cmd_done(args):
@@ -6443,7 +6579,8 @@ def cmd_sprint(args):
     else:
         print(c("\n  No active sprint right now.", "yellow"))
 
-    tasks = [t for t in data.get("tasks", []) if t.get("status") != "done"]
+    tasks = [t for t in data.get("tasks", [])
+             if t.get("status") not in ("done", "parked")]
     if not tasks:
         print(c("  No active tasks.", "dim"))
         print()
@@ -6904,6 +7041,8 @@ COMMANDS = {
     "split-log": cmd_split_log,
     "merge-logs": cmd_merge_logs,
     "done": cmd_done,
+    "park": cmd_park,
+    "unpark": cmd_unpark,
     "close-recurrent": cmd_close_recurrent,
     "new-recurrent": cmd_new_recurrent,
     "delete": cmd_delete,

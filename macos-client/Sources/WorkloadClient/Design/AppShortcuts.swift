@@ -36,6 +36,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
     case findFilter
     case toggleInspector
     case toggleShelf
+    case toggleParked
     case zoomIn
     case zoomOut
     case previousPeriod
@@ -50,6 +51,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
     case logTime
     case openIssue
     case syncSprints
+    case togglePark
     case markDone
 
     // MARK: Board key handler — registered by no menu
@@ -72,10 +74,11 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
     var owner: Owner {
         switch self {
         case .showBoard, .showTimeline, .showOverview, .refresh, .clearFilters,
-             .findFilter, .toggleInspector, .toggleShelf, .zoomIn, .zoomOut,
-             .previousPeriod, .nextPeriod, .today:
+             .findFilter, .toggleInspector, .toggleShelf, .toggleParked,
+             .zoomIn, .zoomOut, .previousPeriod, .nextPeriod, .today:
             return .viewMenu
-        case .toggleTimer, .logTime, .openIssue, .syncSprints, .markDone:
+        case .toggleTimer, .logTime, .openIssue, .syncSprints, .togglePark,
+             .markDone:
             return .taskMenu
         case .moveCardLeft, .moveCardRight:
             return .boardKeyHandler
@@ -92,6 +95,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
         case .findFilter: "f"
         case .toggleInspector: "i"
         case .toggleShelf: "r"
+        case .toggleParked: "p"
         case .zoomIn: "+"
         case .zoomOut: "-"
         case .previousPeriod: .leftArrow
@@ -101,6 +105,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
         case .logTime: "l"
         case .openIssue: "g"
         case .syncSprints: "s"
+        case .togglePark: "p"
         case .markDone: "d"
         case .moveCardLeft: .leftArrow
         case .moveCardRight: .rightArrow
@@ -113,9 +118,10 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
              .zoomIn, .zoomOut, .toggleTimer, .logTime, .openIssue,
              .moveCardLeft, .moveCardRight:
             return .command
-        case .clearFilters, .syncSprints, .markDone:
+        case .clearFilters, .syncSprints, .togglePark, .markDone:
             return [.shift, .command]
-        case .toggleInspector, .toggleShelf, .today, .previousPeriod, .nextPeriod:
+        case .toggleInspector, .toggleShelf, .toggleParked, .today,
+             .previousPeriod, .nextPeriod:
             // `previousPeriod`/`nextPeriod` are ⌥-only on purpose — see the
             // note in `App.swift`. Everything else here is ⌥⌘.
             return self == .previousPeriod || self == .nextPeriod
@@ -135,6 +141,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
         case .findFilter: "Find"
         case .toggleInspector: "Inspector"
         case .toggleShelf: "Recurrent Shelf"
+        case .toggleParked: "Parked Column"
         case .zoomIn: "Zoom In"
         case .zoomOut: "Zoom Out"
         case .previousPeriod: "Previous Period"
@@ -144,6 +151,7 @@ enum AppShortcut: String, CaseIterable, Identifiable, Sendable {
         case .logTime: "Log Time…"
         case .openIssue: "Open Issue"
         case .syncSprints: "Sync Sprints…"
+        case .togglePark: "Park"
         case .markDone: "Mark Done…"
         case .moveCardLeft: "Move Card Left"
         case .moveCardRight: "Move Card Right"

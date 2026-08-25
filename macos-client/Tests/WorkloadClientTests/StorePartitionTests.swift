@@ -32,6 +32,41 @@ final class StorePartitionTests: XCTestCase {
         XCTAssertEqual(store.boardTasks(.done).map(\.id), ["t-done-nulls"])
     }
 
+    /// **The default board does not show parked work.** This is the assertion
+    /// the whole status exists for: a task the owner has deferred out of the
+    /// sprint is in none of the three default columns, and is not swept into
+    /// `unclassifiedTasks` either (it is a known status, deliberately hidden,
+    /// not an unrecognised one).
+    func testParkedTasksAreAbsentFromTheDefaultColumns() throws {
+        let store = try makeStore()
+        XCTAssertFalse(store.showsParkedColumn)
+        XCTAssertEqual(store.visibleColumns, TaskStatus.boardColumns)
+        let columnIDs = store.visibleColumns.flatMap { store.boardTasks($0).map(\.id) }
+        XCTAssertFalse(columnIDs.contains("t-parked"))
+        XCTAssertFalse(store.unclassifiedTasks.map(\.id).contains("t-parked"))
+        XCTAssertEqual(store.parkedTasks.map(\.id), ["t-parked"])
+    }
+
+    /// …and revealing the column is the only thing that puts it on screen.
+    func testRevealingTheParkedColumnShowsThem() throws {
+        let store = try makeStore()
+        store.showsParkedColumn = true
+        XCTAssertEqual(store.visibleColumns, [.parked, .todo, .inProgress, .done])
+        XCTAssertEqual(store.boardTasks(.parked).map(\.id), ["t-parked"])
+    }
+
+    /// `⌘←`/`⌘→` walk `visibleColumns`, not the static table. If they walked the
+    /// static one, `⌘←` from To Do could move a card into a column that is not
+    /// on screen — the one failure a hideable column introduces.
+    func testKeyboardMovesFollowTheVisibleColumns() throws {
+        let store = try makeStore()
+        XCTAssertNil(store.neighbourColumn(of: .todo, offset: -1))
+        store.showsParkedColumn = true
+        XCTAssertEqual(store.neighbourColumn(of: .todo, offset: -1), .parked)
+        XCTAssertEqual(store.neighbourColumn(of: .parked, offset: 1), .todo)
+        XCTAssertNil(store.neighbourColumn(of: .parked, offset: -1))
+    }
+
     /// A status this client does not know must not silently vanish from every
     /// surface — it is absent from the columns but reachable.
     func testUnknownStatusIsNotDroppedSilently() throws {

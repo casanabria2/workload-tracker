@@ -63,6 +63,15 @@ final class Store {
     /// Whether the recurrent shelf is expanded.
     var showsRecurrentShelf: Bool = true
 
+    /// Whether the board shows its **Parked** column.
+    ///
+    /// Off by default, which is the entire point of the status: a parked task
+    /// is one the owner has already decided is not this sprint's work, so it
+    /// should not occupy attention on the default view. Turning this on is how
+    /// you go looking for what you deferred. Persisted by `RootView` via
+    /// `@SceneStorage`, exactly like `showsRecurrentShelf`.
+    var showsParkedColumn: Bool = false
+
     // MARK: - Phase 8 chrome state
 
     /// Whether the trailing task inspector is open (plan §11: "a panel, not a
@@ -405,6 +414,22 @@ final class Store {
         case (nil, _?): false
         case (nil, nil): (lhs.createdAt ?? 0) > (rhs.createdAt ?? 0)
         }
+    }
+
+    /// The columns the board actually renders right now.
+    ///
+    /// **Every board surface reads this, never `TaskStatus.boardColumns`** — the
+    /// column strip, the keyboard cursor, and `neighbourColumn` for `⌘←`/`⌘→`.
+    /// If they disagreed, `⌘←` could move a card into a column that is not on
+    /// screen, which is the one failure mode a hideable column introduces.
+    var visibleColumns: [TaskStatus] {
+        showsParkedColumn ? TaskStatus.allColumns : TaskStatus.boardColumns
+    }
+
+    /// The deferred tasks. Non-empty is what makes the Parked toggle worth
+    /// offering, so the menu item can report a count.
+    var parkedTasks: [TrackerTask] {
+        tasks.filter { effectiveStatus(of: $0) == .parked }
     }
 
     /// The perpetual tasks, shown in their own shelf rather than on the board.
@@ -777,6 +802,10 @@ final class Store {
             await perform(shelfAction, on: task)
         case .markDone:
             await beginClose(task)
+        case .togglePark:
+            let from = effectiveStatus(of: task)
+            let payload = TaskDragPayload(taskId: task.id, sourceStatus: from)
+            await perform(drop: payload, on: from == .parked ? .todo : .parked)
         }
     }
 
@@ -875,10 +904,11 @@ final class Store {
     /// The board column immediately left or right of `status`, or `nil` at the
     /// ends. Drives `⌘←` / `⌘→`.
     func neighbourColumn(of status: TaskStatus, offset: Int) -> TaskStatus? {
-        guard let index = TaskStatus.boardColumns.firstIndex(of: status) else { return nil }
+        let columns = visibleColumns
+        guard let index = columns.firstIndex(of: status) else { return nil }
         let target = index + offset
-        guard TaskStatus.boardColumns.indices.contains(target) else { return nil }
-        return TaskStatus.boardColumns[target]
+        guard columns.indices.contains(target) else { return nil }
+        return columns[target]
     }
 
     /// Where a card will land in `column` once it moves there.

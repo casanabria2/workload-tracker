@@ -68,8 +68,8 @@ struct TaskMenuCommands: View {
                 }
             }
         } label: {
-            Label(stops ? "Stop Timer" : action.title,
-                  systemImage: stops ? "stop.circle" : action.systemImage)
+            Label(stops ? "Stop Timer" : action.title(for: task),
+                  systemImage: stops ? "stop.circle" : action.systemImage(for: task))
         }
         .disabled(!stops && !availability.isAvailable)
 

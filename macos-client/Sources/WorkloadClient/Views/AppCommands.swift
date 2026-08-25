@@ -15,6 +15,9 @@ import SwiftUI
 ///   existed while the Board was on screen.
 /// * The **inspector** toggle (`⌥⌘I`) is new, and is the only way to reach the
 ///   panel from the keyboard.
+/// * The **Parked column** toggle (`⌥⌘P`) reveals the fourth column. It is off
+///   by default and lives here rather than in the toolbar for the same reason
+///   the shelf toggle moved: one registration, one collision check.
 struct ViewCommands: View {
     @Environment(Store.self) private var store
     @Binding var selection: SidebarSelection?
@@ -35,6 +38,13 @@ struct ViewCommands: View {
             .shortcut(.toggleShelf)
             // The shelf lives on the Board. Leaving it enabled on the Timeline
             // would let ⌥⌘R silently change a pane the user cannot see.
+            .disabled(store.selection != .board)
+        // The Parked column, same rule: it is a Board column, so the item is
+        // dead anywhere else. It stays enabled with **no** parked tasks — that
+        // is how you confirm there are none, and disabling it would make an
+        // empty board and a hidden column look identical.
+        Toggle(AppShortcut.toggleParked.title, isOn: parkedBinding)
+            .shortcut(.toggleParked)
             .disabled(store.selection != .board)
 
         Divider()
@@ -93,6 +103,11 @@ struct ViewCommands: View {
     private var shelfBinding: Binding<Bool> {
         Binding(get: { store.showsRecurrentShelf },
                 set: { store.showsRecurrentShelf = $0 })
+    }
+
+    private var parkedBinding: Binding<Bool> {
+        Binding(get: { store.showsParkedColumn },
+                set: { store.showsParkedColumn = $0 })
     }
 }
 

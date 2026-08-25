@@ -61,7 +61,10 @@ struct SettingsView: View {
                 Toggle("Show the inspector", isOn: Binding(
                     get: { store.showsInspector },
                     set: { store.showsInspector = $0 }))
-                Text("Both are restored per window from the last session; "
+                Toggle("Show the Parked column", isOn: Binding(
+                    get: { store.showsParkedColumn },
+                    set: { store.showsParkedColumn = $0 }))
+                Text("All three are restored per window from the last session; "
                      + "changing them here changes this window now.")
                     .font(.caption).foregroundStyle(.secondary)
             }

@@ -60,6 +60,49 @@ final class BoardDropRulesTests: XCTestCase {
         }
     }
 
+    // MARK: - Parked
+
+    /// Parking and unparking are ordinary one-field status writes, so they must
+    /// stay on the optimistic path — no confirmation sheet, nothing sent to
+    /// GitHub beyond the Status field.
+    func testParkingAndUnparkingAreOptimisticInBothDirections() {
+        for source in [TaskStatus.todo, .inProgress] {
+            XCTAssertEqual(BoardDropRules.decide(from: source, to: .parked),
+                           .optimisticStatus(.parked), "\(source.rawValue) → parked")
+            XCTAssertEqual(BoardDropRules.decide(from: .parked, to: source),
+                           .optimisticStatus(source), "parked → \(source.rawValue)")
+        }
+        XCTAssertEqual(BoardDropRules.decide(from: .parked, to: .parked),
+                       .rejected(.sameColumn))
+        XCTAssertTrue(BoardDropRules.isDraggable(.parked))
+    }
+
+    /// A parked card may still be closed — deferring work does not forfeit the
+    /// right to finish it — and that close goes through the same sheet.
+    func testParkedToDoneStillConfirms() {
+        XCTAssertEqual(BoardDropRules.decide(from: .parked, to: .done), .confirmClose)
+    }
+
+    /// **Done → Parked is refused.** A done task has nothing left to defer, and
+    /// the refusal it gets is the reopen one, because that is what the drop is
+    /// really asking for.
+    func testDoneCannotBeParked() {
+        XCTAssertEqual(BoardDropRules.decide(from: .done, to: .parked),
+                       .rejected(.reopenNotSupported))
+    }
+
+    /// **Recurrent ↔ Parked is refused**, and this one is not cosmetic:
+    /// `reconcile_task_sprints` keys its no-carry-forward rule off
+    /// `status == "recurrent"`, so a parked series would fall onto the
+    /// carry-forward path and re-point the just-ended sprint's issue, stranding
+    /// the hours it carries.
+    func testRecurrentCannotBeParked() {
+        XCTAssertEqual(BoardDropRules.decide(from: .recurrent, to: .parked),
+                       .rejected(.recurrentLocked))
+        XCTAssertEqual(BoardDropRules.decide(from: .parked, to: .recurrent),
+                       .rejected(.recurrentLocked))
+    }
+
     // MARK: - Recurrent
 
     /// Closing a recurrent task ends the series and closes its live issue —

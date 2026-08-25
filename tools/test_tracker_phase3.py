@@ -557,9 +557,13 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
 
         section("10. HTTP bridge helpers")
         listed = app._bridge_list_tasks()["tasks"]
-        want = len([t for t in data["tasks"] if t.get("status") != "done"])
-        check(len(listed) == want, f"/tasks lists all {want} non-done tasks",
+        want = len([t for t in data["tasks"]
+                    if t.get("status") not in ("done", "parked")])
+        check(len(listed) == want,
+              f"/tasks lists all {want} non-done, non-parked tasks",
               str(len(listed)))
+        check(not any(r.get("status") == "parked" for r in listed),
+              "…and never offers a parked task to the picker")
         status = app._bridge_status()
         check("active_timer" in status and "time_by_role" in status,
               "/status still renders")

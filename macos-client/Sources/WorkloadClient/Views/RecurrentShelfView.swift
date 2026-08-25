@@ -201,7 +201,7 @@ struct TaskActionMenu: View {
         Button(role: action.isDestructive ? .destructive : nil) {
             _Concurrency.Task { await store.perform(action, on: task) }
         } label: {
-            Label(action.title, systemImage: action.systemImage)
+            Label(action.title(for: task), systemImage: action.systemImage(for: task))
         }
         .disabled(!availability.isAvailable)
         .help(availability.reason ?? helpText(action))
@@ -221,6 +221,11 @@ struct TaskActionMenu: View {
         case .markDone:
             "Close this task. Shows the plan — hours, issues, sprints — "
             + "before anything is sent."
+        case .togglePark:
+            task.status == .parked
+            ? "Bring this task back onto the board as To Do."
+            : "Hide this task from the board's default view. It stays open and "
+            + "keeps its GitHub issue — nothing is closed and no hours change."
         }
     }
 }

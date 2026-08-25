@@ -28,11 +28,18 @@ enum TaskAction: Equatable, Sendable, Identifiable {
     case shelf(ShelfAction)
     /// Close a non-recurrent task through the §7.1 preview sheet.
     case markDone
+    /// Park a task out of the board's default view, or bring a parked one back.
+    ///
+    /// One entry rather than two, for the same reason `startTimer` is: it is one
+    /// item whose title flips with the task's state, so the two halves can never
+    /// both be offered and can never collide in the shortcut table.
+    case togglePark
 
     var id: String {
         switch self {
         case .shelf(let action): action.rawValue
         case .markDone: "markDone"
+        case .togglePark: "togglePark"
         }
     }
 
@@ -40,13 +47,31 @@ enum TaskAction: Equatable, Sendable, Identifiable {
         switch self {
         case .shelf(let action): action.title
         case .markDone: "Mark Done…"
+        // Overridden at the call site for a parked task, which reads "Unpark".
+        case .togglePark: "Park"
         }
+    }
+
+    /// The title for **this** task. Only `togglePark` differs from `title`: it
+    /// reads "Unpark" once the task is parked, the one-item-two-states shape
+    /// `startTimer`/"Stop Timer" already uses. Kept here rather than at each
+    /// call site so the board's context menu, the shelf's and the menu bar
+    /// cannot word the same item three ways.
+    func title(for task: TrackerTask) -> String {
+        if case .togglePark = self, task.status == .parked { return "Unpark" }
+        return title
+    }
+
+    func systemImage(for task: TrackerTask) -> String {
+        if case .togglePark = self, task.status == .parked { return "play.circle" }
+        return systemImage
     }
 
     var systemImage: String {
         switch self {
         case .shelf(let action): action.systemImage
         case .markDone: "checkmark.circle"
+        case .togglePark: "pause.circle"
         }
     }
 
@@ -55,7 +80,7 @@ enum TaskAction: Equatable, Sendable, Identifiable {
     var isDestructive: Bool {
         switch self {
         case .shelf(let action): action == .endSeries
-        case .markDone: false
+        case .markDone, .togglePark: false
         }
     }
 
@@ -63,6 +88,7 @@ enum TaskAction: Equatable, Sendable, Identifiable {
         switch self {
         case .shelf(let action): action.isSeparatedInMenu
         case .markDone: true
+        case .togglePark: false
         }
     }
 
@@ -76,6 +102,7 @@ enum TaskAction: Equatable, Sendable, Identifiable {
         case .shelf(.syncSprints): .syncSprints
         case .shelf(.endSeries): nil          // never — see ShelfAction
         case .markDone: .markDone
+        case .togglePark: .togglePark
         }
     }
 
@@ -89,6 +116,20 @@ enum TaskAction: Equatable, Sendable, Identifiable {
             return task.status == .done
                 ? .unavailable("This task is already done.")
                 : .available
+        case .togglePark:
+            // Parking is for open work you mean to come back to. A done task
+            // has nothing to defer, and a recurrent one must not be parked at
+            // all: reconcile keys its no-carry-forward rule off
+            // `status == "recurrent"`, so parking a series would re-point the
+            // just-ended sprint's issue and strand the hours on it.
+            switch task.status {
+            case .done: return .unavailable("A done task can't be parked.")
+            case .recurrent:
+                return .unavailable("Recurrent tasks can't be parked — parking one "
+                                    + "would move its last sprint's issue and strand "
+                                    + "the hours on it.")
+            default: return .available
+            }
         }
     }
 
@@ -101,7 +142,8 @@ enum TaskAction: Equatable, Sendable, Identifiable {
     /// place `End Series` occupies on the shelf — last, separated, and reached
     /// through the close preview rather than acting immediately.
     static let boardMenu: [TaskAction] =
-        ShelfAction.menu.filter { $0 != .endSeries }.map(TaskAction.shelf) + [.markDone]
+        ShelfAction.menu.filter { $0 != .endSeries }.map(TaskAction.shelf)
+        + [.togglePark, .markDone]
 
     /// The menu for a task, chosen by its status rather than by which view
     /// asked — so a recurrent row can never be offered `markDone` and a board

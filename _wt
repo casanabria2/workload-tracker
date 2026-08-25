@@ -55,6 +55,8 @@ _wt() {
         'unlink:Unlink task from GitHub issue'
         'push:Sync task to linked GitHub issue'
         'done:Mark a task as done'
+        'park:Defer a task out of the board default view'
+        'unpark:Bring a parked task back onto the board'
         'close-recurrent:RETIRED — use sync-sprints --all'
         'new-recurrent:RETIRED — use sync-sprints --all --create-issues'
         'delete:Delete a task'
@@ -91,7 +93,7 @@ _wt() {
     fi
 
     case "${words[2]}" in
-        start|notes|done|delete|del|rm|log|link|push)
+        start|notes|done|park|delete|del|rm|log|link|push)
             local -a tasks
             tasks=("${(@f)$(python3 -c "
 import json
@@ -99,6 +101,19 @@ from pathlib import Path
 data = json.loads((Path.home() / '.workload_tracker.json').read_text())
 for t in data.get('tasks', []):
     print(t['title'])
+" 2>/dev/null)}")
+            compadd -Q "${tasks[@]}"
+            ;;
+        unpark)
+            # Only parked tasks can be unparked — offering the rest is noise.
+            local -a tasks
+            tasks=("${(@f)$(python3 -c "
+import json
+from pathlib import Path
+data = json.loads((Path.home() / '.workload_tracker.json').read_text())
+for t in data.get('tasks', []):
+    if t.get('status') == 'parked':
+        print(t['title'])
 " 2>/dev/null)}")
             compadd -Q "${tasks[@]}"
             ;;
@@ -137,7 +152,7 @@ for t in data.get('tasks', []):
                     roles=("${(@f)$(_wt_get_roles)}")
                     _arguments \
                         "--role[Role]:role:(${roles[*]})" \
-                        '--status[Status]:status:(todo inprogress recurrent done)' \
+                        '--status[Status]:status:(todo inprogress recurrent parked done)' \
                         '--desc[Description]:' \
                         '--sprint[Sprint]:sprint:(none)' \
                         '--repo[GitHub repo (owner/repo)]:' \

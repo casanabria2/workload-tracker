@@ -28,6 +28,44 @@ final class TaskActionTests: XCTestCase {
                              "the fixture has no \(status.rawValue) task")
     }
 
+    // MARK: - Park
+
+    /// Park is offered on ordinary board work, in both directions, with the
+    /// title flipping rather than a second item appearing — the same
+    /// one-item-two-states shape `startTimer` uses.
+    func testParkIsOfferedOnBoardWorkAndFlipsItsTitle() throws {
+        XCTAssertTrue(TaskAction.boardMenu.contains(.togglePark))
+        let todo = try task(status: .todo)
+        let parked = try task(status: .parked)
+        XCTAssertEqual(TaskAction.togglePark.title(for: todo), "Park")
+        XCTAssertEqual(TaskAction.togglePark.title(for: parked), "Unpark")
+        XCTAssertTrue(TaskAction.togglePark
+            .availability(for: todo, isTimerRunning: false).isAvailable)
+        XCTAssertTrue(TaskAction.togglePark
+            .availability(for: parked, isTimerRunning: false).isAvailable)
+    }
+
+    /// Neither a finished task nor a perpetual series can be parked, and the
+    /// recurrent refusal is the load-bearing one — see `BoardDropRulesTests`.
+    func testParkIsUnavailableForDoneAndRecurrentTasks() throws {
+        for status in [TaskStatus.done, .recurrent] {
+            let subject = try task(status: status)
+            XCTAssertFalse(TaskAction.togglePark
+                .availability(for: subject, isTimerRunning: false).isAvailable,
+                           status.rawValue)
+        }
+        // A recurrent task is never even offered the item.
+        XCTAssertFalse(TaskAction.recurrentMenu.contains(.togglePark))
+    }
+
+    /// Park is safe enough for a shortcut — it writes one field and the same
+    /// item undoes it — unlike `endSeries`, which still has none.
+    func testParkHasAShortcutAndEndSeriesStillDoesNot() {
+        XCTAssertEqual(TaskAction.togglePark.shortcut, .togglePark)
+        XCTAssertNil(TaskAction.shelf(.endSeries).shortcut)
+        XCTAssertFalse(TaskAction.togglePark.isDestructive)
+    }
+
     // MARK: - Which menu
 
     func testRecurrentTasksGetTheShelfMenuUnchanged() throws {

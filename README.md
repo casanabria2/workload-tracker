@@ -87,7 +87,7 @@ exec zsh
 
 Now you can tab-complete commands and task names:
 ```bash
-wt <Tab>           # shows: add, list, start, stop, log, notes, done, delete, status
+wt <Tab>           # shows: add, list, start, stop, log, notes, done, park, unpark, delete, status
 wt notes <Tab>     # shows task titles
 wt add --role <Tab> # shows: demokit, demos, strategic, other
 ```
@@ -115,7 +115,7 @@ python3 tracker.py
 | `3`       | Filter: Strategic Deals                     |
 | `4`       | Filter: Other                               |
 | `0`       | Filter: All roles                           |
-| `a`       | Toggle showing done tasks                   |
+| `a`       | Toggle showing done and parked tasks        |
 | `r`       | Reload data from disk and refresh screen    |
 | `Tab`     | Switch between Task Board / Overview        |
 | `↑ ↓`     | Navigate tasks                              |
@@ -144,6 +144,11 @@ wt stop
 # Log time manually
 wt log "Banco Galicia" 45 "Call with customer"
 wt log "DemoKit PR" 30
+
+# Defer a task out of this sprint (hidden from list/sprint/board, issue untouched)
+wt park "NVIDIA Kratos demo"
+wt list --parked                 # what did I defer?
+wt unpark "NVIDIA Kratos demo"   # back as To Do (--status inprogress to resume)
 
 # Update status
 wt done "DemoKit PR"
@@ -224,7 +229,7 @@ the TUI.
 | Method & path        | Body                | Response                                                                              |
 |----------------------|---------------------|---------------------------------------------------------------------------------------|
 | `GET /status`        | —                   | `{ "active_timer": { "task_id", "title", "role", "started_at" } }` — `null` when idle |
-| `GET /tasks`         | —                   | `{ "tasks": [ { "id", "title", "role", "status" } ] }` (non-done, non-shadow)         |
+| `GET /tasks`         | —                   | `{ "tasks": [ { "id", "title", "role", "status" } ] }` (non-done, non-parked, non-shadow) |
 | `POST /timer/start`  | `{ "task_id": "…" }`| `{ "action": "started", "task": "…" }`                                                |
 | `POST /timer/stop`   | —                   | `{ "action": "stopped", "task": "…", "logged_minutes": 8.0 }`                         |
 
@@ -279,12 +284,12 @@ Allows Claude (via Claude Code or Claude Desktop) to interact directly with task
 | Tool | Description |
 |------|-------------|
 | `add_task` | Create a new task with title, role, status, github_issue |
-| `list_tasks` | List all tasks, optionally filter by role/status |
+| `list_tasks` | List all tasks, optionally filter by role/status; done and parked hidden unless `include_done` / `include_parked` |
 | `get_task` | Get details of a specific task |
 | `start_timer` | Start timer on a task |
 | `stop_timer` | Stop the running timer |
 | `log_time` | Log time manually to a task |
-| `set_task_status` | Change task status (todo/inprogress/done) |
+| `set_task_status` | Change task status (todo/inprogress/recurrent/parked/done) |
 | ~~`close_previous_recurrent_tasks`~~ | **RETIRED** — returns an explanation and nothing else; its planner in `wt.py` has been deleted. Recurring work is one perpetual task with an issue per sprint; use `sync_task_sprints` instead |
 | `delete_task` | Delete a task |
 | `get_status` | Get time summary by role |

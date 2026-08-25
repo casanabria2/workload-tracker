@@ -122,8 +122,8 @@ Single-file Python tools sharing one data file (`~/.workload_tracker.json`):
 > synced copy. If `ls` works but the file is still empty, it's a dataless iCloud
 > placeholder — force a download with `brctl download ~/WorkloadTracker/.workload_tracker.json`.
 
-- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`, or the whole object is `null` when idle), `GET /tasks` (non-done picker list; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs the (deprecated) Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still calls it, though it is now a no-op with `arc_space_id` empty. No browser is touched on any start or stop path. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
-- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, delete, rename, status, roles, ~~arc~~ (**deprecated**), iterm, presence, config, calendar, report, sprint, set-sprint, sync-sprints (alias: split-sprint), set-repo, set-activity, set-type.
+- **tracker.py** — Textual TUI with modal screens for task editing and time logging. Uses reactive properties for filtering and a 1-second interval timer for live updates. Also hosts the Stream Deck / Hammerspoon HTTP bridge (localhost:7373) on a background `ThreadingHTTPServer` (`_BridgeHandler` + `_start_bridge_server`). Endpoints: `GET /status` (`active_timer` with `task_id`/`title`/`role`/`started_at`, or the whole object is `null` when idle), `GET /tasks` (non-done, **non-parked** picker list — deferred work should not be one button-press from a running timer, and `wt_daemon.legacy_tasks_payload` applies the same rule, which `tools/test_legacy_contract.py` compares against this one; each task carries `id`/`title`/`role`/`status` plus `last_logged_at` — epoch seconds of the task's most recent time-log entry via `task_last_logged_at()`, or `null` when nothing has been logged — consumed by the menu-bar monitor's "recently logged" column), `POST /timer/start` (`{task_id}`), `POST /timer/stop` (`{logged_minutes}`), plus the legacy GET `/timer/toggle`, `/log/<minutes>`, `/filter/<role>`, `/push/<task>`. Bridge requests mutate the live in-memory `self._data` via `call_from_thread` and refresh the UI, so external actions stay in sync with the TUI. A bridge **stop** goes through `_commit_active_timer()` — the same helper the TUI `t`-key stop uses — so it logs an identical `"Timer session"` entry, syncs GitHub hours, and runs the (deprecated) Arc cleanup. A bridge **start** deliberately does *not* call `_arc_on_task_started` (no Arc space focus), since a remote/menu-bar start shouldn't reshuffle the Arc workspace; the TUI `t`-key start still calls it, though it is now a no-op with `arc_space_id` empty. No browser is touched on any start or stop path. A client should treat a connection error as a distinct "tracker unreachable" state, separate from a `200` with `active_timer: null` (up but idle).
+- **wt.py** — Stateless CLI that reads/writes the JSON file directly. Commands: add, add-issue, list, start, stop, log, logs, edit-log, delete-log, split-log, merge-logs, notes, link, unlink, push, done, delete, rename, status, roles, ~~arc~~ (**deprecated**), iterm, presence, config, calendar, report, sprint, set-sprint, sync-sprints (alias: split-sprint), set-repo, set-activity, set-type, **park**, **unpark**.
 - **idle_detector.py** — macOS idle detection module using `ioreg` to query HIDIdleTime.
 - **mcp_server.py** — MCP server enabling Claude to manage tasks directly. Tools: add_task, list_tasks, get_task, start_timer, stop_timer, log_time, list_logs, edit_log, delete_log, split_log, merge_logs, set_task_status, delete_task, rename_task, get_status, get_notes_path, link_github_issue, unlink_github_issue, push_task_to_github, view_github_issue, add_github_comment, list_roles, add_role, update_role, delete_role, set_task_repo, set_task_activity, set_task_type, ~~setup_arc_space~~, ~~get_arc_status~~, ~~cleanup_task_tabs~~, ~~sync_arc_folders~~ (these four are **deprecated** Arc tools — still registered, don't use), list_sprints, get_current_sprint_info, set_sprint, sync_task_sprints, report_time_range, create_task_from_issue. (39 tools registered — the four Safari task-window tools were removed with the feature.)
 - **arc_browser.py** — **DEPRECATED.** Arc browser integration for task-based tab management. Hybrid AppleScript/JSON approach. Dormant because `config.arc_space_id` is `""`. Nothing supersedes it — the Safari replacement was itself removed. Don't build on it.
@@ -185,15 +185,34 @@ iTerm2/tmux integration: Tasks can have associated terminal sessions and folders
 ### Domain Constants
 
 - **Roles**: Stored in data file, defaults to `demokit`, `demos`, `strategic`, `other`. Can be managed via `wt roles add/update/delete`. Current roles also include `testing`, `iron infusion` (label `iron`), `appenv-deployment` (label `Managing AppEnv Deployments`, color `red`), and `brokkr` (label `Brokkr`, color `cyan`). Roles carry **no** GitHub configuration — repo/activity/type live on each task (the historical role values were migrated onto their tasks by `_migrate_role_github_fields`). Note `wt roles add` always seeds `color: white`; there's no `set-color` subcommand, so non-default colors are set directly via `wt.load()`/`save()`.
-- **Statuses**: `todo`, `inprogress`, `recurrent`, `done`
-- Done tasks are hidden by default in all list views (CLI, TUI, MCP)
+- **Statuses**: `todo`, `inprogress`, `recurrent`, `parked`, `done`
+- Done **and parked** tasks are hidden by default in all list views (CLI, TUI,
+  MCP, daemon, macOS board). Two separate opt-ins, because "what did I finish?"
+  and "what did I defer?" are different questions: `wt list --parked` /
+  `--all`, `wt_api.list_tasks(include_parked=…)`, MCP
+  `list_tasks(include_parked=True)`, and the board's **Parked column** (⌥⌘P).
+- `parked` marks work the owner has decided is **not part of this sprint** —
+  deferred, not finished. It is otherwise an ordinary open task: parking touches
+  **nothing but `status`**. No logs move, no bindings change, no hours are
+  recomputed, and the GitHub issue stays open. Reconcile deliberately treats a
+  parked task exactly like a `todo` one (it still reserves a current-sprint
+  binding), because the alternative — dropping the reservation the way
+  `closing=True` does — would strand its live issue on a past sprint and let
+  `close_past` close it, misreporting unfinished work as done.
+  - **A `recurrent` task must never be parked.** `reconcile_task_sprints` keys
+    its no-carry-forward rule off `status == "recurrent"`, so a parked series
+    would fall onto the carry-forward path and re-point the just-ended sprint's
+    issue, stranding the hours it carries. `wt park`, `TaskAction.togglePark`
+    and `BoardDropRules` all refuse it.
+  - Parking is refused while a timer runs on the task (a hidden task with a
+    running timer is how a session gets forgotten), and for `done` tasks.
 - `recurrent` marks a **perpetual** task — recurring meetings, on-call, ad-hoc question triage. It is one task object that never closes and grows one GitHub issue per sprint via its `sprint_issues` bindings. It is **not** cloned per sprint any more (Phase 5 merged the old `- Sprint N` copies), and it gets **no carry-forward**: each sprint keeps its own issue permanently, so the ended sprint's issue closes and the new sprint's is minted. `wt sync-sprints --all --create-issues` does both.
-- **GitHub Project status mapping** (`PROJECT_STATUS_MAP` in `wt.py`): `todo` → `Todo`, `inprogress` → `In Progress`, `recurrent` → `In Progress`, `done` → `Done`. Used by `sync_project_status()` and `setup_issue_in_project()`. Any tracker status missing from this map causes project field sync to be silently skipped — keep it in sync when adding new statuses.
-- TUI status transitions are explicit (no cycling): `p` moves `todo` → `inprogress`, `D` (Shift+d) closes either `inprogress` or `recurrent` tasks via the close workflow. For `recurrent` tasks whose `sprint_id` matches the current sprint, an extra `ConfirmCloseRecurrentModal` fires first (because closing a recurrent task ends its recurrence + closes the linked GH issue); recurrent tasks in past sprints skip the extra prompt and go straight to the standard close flow. Status edits beyond that are done through the edit modal (`e`).
+- **GitHub Project status mapping** (`PROJECT_STATUS_MAP` in `wt.py`): `todo` → `Todo`, `inprogress` → `In Progress`, `recurrent` → `In Progress`, `parked` → `Todo`, `done` → `Done`. Parked maps to `Todo` because the project's Status field has no Parked option (`Todo` / `In Progress` / `Done` / `Won't Do` / `Continuing`) and `Won't Do` would be a lie — parking says "not this sprint", not "never". Used by `sync_project_status()` and `setup_issue_in_project()`. Any tracker status missing from this map causes project field sync to be silently skipped — keep it in sync when adding new statuses.
+- TUI status transitions are explicit (no cycling): `p` moves `todo` **or `parked`** → `inprogress` (picking a deferred task back up is that one decision, not two), `D` (Shift+d) closes either `inprogress` or `recurrent` tasks via the close workflow. For `recurrent` tasks whose `sprint_id` matches the current sprint, an extra `ConfirmCloseRecurrentModal` fires first (because closing a recurrent task ends its recurrence + closes the linked GH issue); recurrent tasks in past sprints skip the extra prompt and go straight to the standard close flow. Status edits beyond that are done through the edit modal (`e`).
 - `_run_close_workflow` wraps `close_github_issue` in try/except and always sets `task["status"] = "done"` afterwards — a `gh issue close` failure (silent non-zero or thrown) emits a `warning` notification but never leaves the local task in a half-closed state where the GH Project field reads `Done` while the tracker still says `recurrent`/`inprogress`.
 - `TaskModal` (edit modal) injects the task's existing `sprint_id` into the sprint Select options when it falls outside the rendered window of "current + previous 4". Without this, recurrent tasks pointing at old sprints (e.g. Sprint 95 with current = Sprint 100) crash on mount with `InvalidSelectValueError` because Textual's `Select` is strict about values being in its option list.
 - TUI board layout: the task board is split into two tables — non-recurrent tasks at the top, recurrent tasks at the bottom. Role filter and `_selected_task()` work against whichever table is focused.
-- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done tasks, `i` = open iTerm (TUI), `n` = new task, `G` = new task from an existing GitHub issue (`AddIssueModal` → `wt.create_task_from_issue`, status To Do)
+- Keyboard shortcuts 1-4 map to first 4 roles by order, 0 = all, `a` = toggle done **and parked** tasks (one key, because the TUI is no longer the primary surface and a second binding would not earn itself), `i` = open iTerm (TUI), `n` = new task, `G` = new task from an existing GitHub issue (`AddIssueModal` → `wt.create_task_from_issue`, status To Do)
 - `r` (TUI) reloads the data file from disk and re-renders the table, sidebar, and overview (`action_refresh`). Use it to pick up changes made by other processes (CLI, MCP server) without quitting and relaunching. (The HTTP bridge now runs in-process and refreshes the UI itself.)
 
 ### Key Patterns
@@ -1067,6 +1086,24 @@ task["logs"].append({
 wt.save(data)
 ```
 
+### Defer a task out of this sprint
+
+```bash
+wt park "Rewrite the onboarding walkthrough"    # hidden from list/sprint/board
+wt list --parked                                # see what you deferred
+wt unpark "Rewrite the onboarding walkthrough"  # back as To Do
+wt unpark "…" --status inprogress               # or straight back into flight
+```
+
+`unpark` deliberately does **not** remember the pre-park status: that would be a
+new persisted field for one convenience, and an old `wt.py` on another Mac would
+strip it. Say what you want back.
+
+On the macOS board, the same move is the card's context menu ("Move to Parked" —
+offered even while the column is hidden, which is the state you park from) or
+⇧⌘P; ⌥⌘P reveals the Parked column, which sits **left of To Do**, the icebox
+position, so unparking is a rightward move like every other forward step.
+
 ### Things to avoid
 
 - Don't shell out to `gh issue create` or `gh project item-edit` directly — use `create_github_issue` + `setup_issue_in_project` so Status/Activity/Sprint/Hours fields stay in sync.
@@ -1078,6 +1115,11 @@ wt.save(data)
 - Don't call `get_project_info()` in a per-task or per-field loop assuming it's cheap — it's two GraphQL calls. It's memoised now, but don't defeat that by passing `refresh=True` in a loop, and do pass `project_info=` down to the `update_project_*` helpers (they re-fetch when it's omitted).
 - **GraphQL, not REST, is the limit that bites.** `gh project` operations are GraphQL-backed with a 5000-point/hour budget; `gh api rate_limit` shows `resources.graphql` separately from `resources.core`. A rate-limited `gh project item-add` fails with `unknown owner type`, which looks like a config error but isn't.
 - Don't resurrect `wt close-recurrent` / `wt new-recurrent` / `close_previous_recurrent_tasks`. They are retired, their planners are deleted, and only the refusal remains. The close side's selection rule (`status == "recurrent"` + a prior-sprint `sprint_id`) matches the merged perpetual task, so running it would set a whole recurring series to done and close its live issue; the recreate side would mint per-sprint clones of a perpetual task. `wt sync-sprints --all --create-issues` does the sprint rollover.
+- Don't park a `recurrent` task, and don't loosen the refusals that stop it. It flips
+  reconcile onto the carry-forward path and strands the last sprint's hours.
+- Don't add a "does this task span sprints?"-style gate for `parked` in reconcile
+  either. A parked task is an *open* task; it keeps its current-sprint reservation so
+  its live issue is never left on a past sprint for `close_past` to close.
 - Don't give a `recurrent` task a carry-forward. Each sprint of a perpetual series keeps its own issue; re-pointing the last sprint's issue onto the new one strands the hours it carries.
 - Don't group recurring series by fuzzy title matching — use `RECURRENT_SERIES_ALIASES` / `recurrent_series_for_title()`. Real titles drifted three ways for one series.
 - Don't reintroduce a "does this task span sprints?" gate before reconciling. Reconcile is idempotent by construction; gates were how the old code needed 0-minute marker logs.
