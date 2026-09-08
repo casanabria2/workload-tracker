@@ -44,6 +44,10 @@ NOISE_SUBSTRINGS = [
     "lunch", "focus time", "pick up kids", "pickup kids", "therapy",
     "drumming lesson", "morning catch up", "afternoon catch up",
     "out of office", "happy hour", "ooo",
+    # Overnight/early open-invite blocks Carlos does not attend (stated at the
+    # Sprint 107 close). They sit outside his working hours, so they surfaced
+    # as a GAP every sprint.
+    "tuesday breakouts", "office hours: fullstack o11y",
 ]
 
 # All-day markers (>= this many minutes) are context, not meetings.
