@@ -234,7 +234,7 @@ def test_snapshot(wt, wt_api, migrated, scratch):
         "created_at", "activity", "github_repo", "type", "sprints_with_time",
         "start_sprint", "start_sprint_id", "sprint_issues", "current_issue",
         "logged_mins", "live_mins", "reportable_mins", "last_logged_at", "logs",
-        "local_folder",
+        "local_folder", "recurrent_series",
     }
     missing = [k for t in snap["tasks"] for k in want_task_keys if k not in t]
     check(not missing, "every task carries every documented field",
@@ -251,6 +251,34 @@ def test_snapshot(wt, wt_api, migrated, scratch):
     # github_issue is a mirror of the current one.
     leaked = [t["id"] for t in snap["tasks"] if "github_issue" in t]
     check(not leaked, "no raw `github_issue` key in a task view", str(leaked[:3]))
+
+    # `recurrent_series` (plan §13.5 1d) — the shelf's Series column. Resolved
+    # in Python because RECURRENT_SERIES_ALIASES must not be copied into Swift.
+    wrong = [t["id"] for t in snap["tasks"]
+             if t["recurrent_series"]
+             != wt.recurrent_series_for_title(t["title"] or "")]
+    check(not wrong, "recurrent_series matches recurrent_series_for_title()",
+          str(wrong[:3]))
+    # Assert the *wiring*, not the roster: which series the owner is running,
+    # and whether their titles are in the alias table, is a data question. So
+    # retitle a throwaway task to a known alias — with the case and spacing
+    # drift the resolver is supposed to absorb — and check it comes through.
+    probe = dict(data["tasks"][0])
+    probe["title"] = "  AD-HOC   slack questions  "
+    view = wt_api.task_view(probe, data, sprints)
+    check(view["recurrent_series"] == "Ad-hoc Slack Questions - casanabria",
+          "…normalising case and spacing on the way through",
+          str(view["recurrent_series"]))
+    probe["title"] = "Not a series at all, definitely"
+    check(wt_api.task_view(probe, data, sprints)["recurrent_series"] is None,
+          "…and None for a title that is not a known series")
+    # The column's "unsupported" footnote keys off *any* task carrying a name,
+    # so record how many of the real recurrent tasks resolve — 2 of 7 titles
+    # are absent from the alias table, which is the owner's call, not a bug.
+    rec = [t for t in snap["tasks"] if t["status"] == "recurrent"]
+    named = [t for t in rec if t["recurrent_series"]]
+    check(True, f"{len(named)} of {len(rec)} recurrent tasks resolve to a series",
+          str(sorted(t["title"] for t in rec if not t["recurrent_series"])))
 
     by_id = {t["id"]: t for t in snap["tasks"]}
     bad_issue, bad_hours, bad_report, bad_last, bad_logs = [], [], [], [], []

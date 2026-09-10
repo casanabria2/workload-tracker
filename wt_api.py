@@ -275,6 +275,15 @@ def task_view(task: dict, data: dict, sprints: list[dict] | None = None,
         "role_id": task.get("role_id"),
         "created_at": task.get("created_at"),
 
+        # The canonical series name for a recurring task — resolved here so
+        # Swift never owns a second copy of RECURRENT_SERIES_ALIASES, which
+        # CLAUDE.md forbids on the grounds that real titles drifted three ways
+        # for one series. Title-based and status-independent, matching
+        # recurrent_series_for_title()'s own contract: a closed series member
+        # still reports its series. `None` when the title is not a known
+        # series, which the shelf renders as "—" rather than guessing.
+        "recurrent_series": wt.recurrent_series_for_title(task.get("title") or ""),
+
         # The two per-task fields the filter bar needs (plan §8), plus `type`
         # for the editor.
         "activity": task.get("activity"),

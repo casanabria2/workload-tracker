@@ -282,9 +282,11 @@ struct EndSeriesConfirmation: Equatable, Sendable {
 
 /// How the shelf's Series column resolves a task to its canonical series.
 ///
-/// **The snapshot does not carry the series name.** `wt_api.task_view()` emits
-/// no `recurrent_series` key, so there is nothing for Swift to read — verified
-/// against `wt_api.py` at `e11f45d` and against a live `/v1/snapshot`.
+/// **The snapshot carries the series name**, as of plan §13.5 item 1d:
+/// `wt_api.task_view()` emits `recurrent_series` from
+/// `wt.recurrent_series_for_title()`. The field stays optional here, because an
+/// older daemon on the other Mac will not send it and the column reports that
+/// honestly rather than rendering a blank it cannot explain.
 ///
 /// The alias table is deliberately **not** reimplemented here. CLAUDE.md is
 /// explicit — *"Don't group recurring series by fuzzy title matching — use
@@ -297,8 +299,8 @@ struct EndSeriesConfirmation: Equatable, Sendable {
 /// forbids.
 ///
 /// So this type reads a field the daemon *may* send and reports honestly when
-/// it does not. When `task_view()` grows `"recurrent_series"`, the column
-/// populates with no Swift change.
+/// it does not — which is still the case for the two titles above: they resolve
+/// to `nil` and show "—" until the owner decides what to call those series.
 enum RecurrentSeries {
 
     /// The canonical series name for a task, or `nil` when the daemon did not
