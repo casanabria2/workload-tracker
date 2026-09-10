@@ -939,7 +939,7 @@ raising. Fix in `wt.py`/`wt_api.py` so the outcome carries per-operation success
 and have the daemon surface it; the Swift sheets already decode and report the
 flags the daemon *does* send, so most of the client side exists.
 
-### 1d. `task_view()` does not emit `recurrent_series`
+### 1d. `task_view()` does not emit `recurrent_series` — **DONE (code); the alias table is still the owner's call**
 
 The shelf's Series column is built and renders "—" for every row because the
 snapshot carries no canonical series name. Phase 6 deliberately did **not**
@@ -952,6 +952,26 @@ Worth knowing before doing it: **2 of the 7 recurrent tasks are not in the alias
 table at all** (`1:1 with TomD`, `Alex KC 1:1 calls - casanabria`), so even a
 correct implementation resolves five of seven. The aliases need extending, which
 is a data question for the owner rather than a code one.
+
+**Done.** `task_view()` emits `recurrent_series` from
+`recurrent_series_for_title()`. No Swift change was needed, as designed: the
+field was already decoded with `decodeIfPresent`, and `RecurrentSeries` already
+reported honestly that the daemon was not sending it. Verified on a live
+`/v1/snapshot` after a daemon restart — five of seven populate, the two absent
+titles show "—". `test_wt_api` asserts the *wiring* rather than the roster (it
+retitles a throwaway task to a known alias, with the case and spacing drift the
+resolver absorbs), so the coverage does not rot when the owner's set of
+recurring work changes; 163 → 167 checks, 339 Swift tests unchanged.
+
+Also checked, because it is the quiet failure mode: **no non-recurrent task in
+today's data has a title that resolves**, so emitting the field title-based
+rather than status-gated cannot label ordinary work as recurring.
+
+Still open, and still not a code question: whether `1:1 with TomD` and `Alex KC
+1:1 calls - casanabria` join the table, and under what canonical names. `Alex
+KC …` already matches the established `<Name> 1:1 calls - casanabria` shape;
+`1:1 with TomD` does not, so making it consistent means renaming the task —
+which renames its GitHub issue too.
 
 ### 1e. Delete the retired recurrent planner, don't just refuse it at the CLI
 
