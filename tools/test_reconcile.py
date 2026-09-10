@@ -1225,6 +1225,118 @@ def test_hours_withheld_guard(wt, migrated, scratch):
           str(rc["unbillable"]))
 
 
+def test_link_unlinked_binding(wt, migrated, scratch):
+    section("18. an existing binding with no issue gets one (the HOLD dead end)")
+    data = load_copy(wt, migrated, scratch / "link.json")
+    sprints = wt.get_cached_sprints(data)
+
+    # Construct the shape rather than hunt for it. A binding that exists but
+    # carries `issue: None` used to be a dead end: step 3 of the planner only
+    # creates issues for sprints with *no* binding, so --create-issues could
+    # never heal this one, the 4a guard withheld every hours write for the task,
+    # and `wt sync-sprints` still reported it as "already in sync". Found on
+    # `Demo Kit Ownership Transfer` (Sprint 97, 59m, unlinked since the shadow
+    # migration).
+    task, per = pick_multi_sprint(wt, data, sprints)
+    ordered = sprint_time(wt, task, sprints)   # oldest first
+    victim_sid = ordered[0]["sprint_id"]
+    victim_mins = ordered[0]["minutes"]
+    binding = wt.task_binding_for_sprint(task, victim_sid)
+    if binding is None:
+        check(False, "subject has a binding on its oldest sprint with time")
+        return
+    binding["issue"] = None
+    # The real one carried `state: "closed"` on a binding whose issue never
+    # existed, which is what made step 5 skip the close.
+    binding["state"] = "closed"
+    n_bindings_before = len(task["sprint_issues"])
+    print(f"    subject: {task['title'][:52]!r}  unlinked {ordered[0]['sprint']} "
+          f"({round(victim_mins)}m of {len(per)} sprints)")
+
+    with Stubs(wt, mode="strict", sprints=sprints):
+        held = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                         create_issues=False)
+        plan = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                         create_issues=True)
+
+    # create_issues=False must say so out loud, so `--all` can report it.
+    needs = [s for s in held["skipped"] if s.get("needs_issue")
+             and s.get("sprint_id") == victim_sid]
+    check(len(needs) == 1,
+          "create_issues=False reports the unlinked binding as needing an issue",
+          str([s.get("reason") for s in held["skipped"]]))
+    check([e["sprint_id"] for e in held["unbillable"]] == [victim_sid],
+          "and its time is unbillable, so every hours write is withheld",
+          str(held["unbillable"]))
+
+    # create_issues=True must plan a `link`, not a `create` — a second binding
+    # for the same sprint would break one-binding-per-sprint.
+    links = [o for o in plan["planned"] if o["op"] == "link"]
+    creates = [o for o in plan["planned"]
+               if o["op"] == "create" and o["sprint_id"] == victim_sid]
+    check(len(links) == 1 and links[0]["sprint_id"] == victim_sid,
+          "create_issues=True plans exactly one link op for it",
+          str([(o["op"], o.get("sprint")) for o in plan["planned"]]))
+    check(not creates, "and no create op, which would add a second binding",
+          str(creates))
+    check(links and links[0]["hours"] == wt.mins_to_quarter_hours(victim_mins),
+          "carrying that sprint's own hours",
+          str(links[0]["hours"] if links else None))
+    check(plan["unbillable"] == [],
+          "the withhold guard steps aside, since the link mints the issue",
+          str(plan["unbillable"]))
+    # The stale `closed` state must not swallow the close of a brand-new issue.
+    closes = [o for o in plan["planned"]
+              if o["op"] == "close" and o["sprint_id"] == victim_sid]
+    check(len(closes) == 1,
+          "and the ended sprint's new issue is planned for closing",
+          str([(o["op"], o.get("sprint")) for o in plan["planned"]]))
+    lines = wt._reconcile_plan_lines(plan)
+    check(any(l.startswith("link") for l in lines), "plan output shows a link line",
+          "\n".join(lines))
+
+    # Execute it.
+    with Stubs(wt, mode="record", sprints=sprints) as st:
+        out = wt.reconcile_task_sprints(task, data, sprints, create_issues=True)
+    check(out.get("success"), "the reconcile succeeds", str(out.get("error")))
+    after = wt.task_binding_for_sprint(task, victim_sid)
+    check(after is not None and after.get("issue"),
+          "the *existing* binding now carries an issue", str(after))
+    check(len(task["sprint_issues"]) == n_bindings_before,
+          "and no second binding was added for that sprint",
+          f"{n_bindings_before} -> {len(task['sprint_issues'])}")
+    check(after.get("hours_synced") == wt.mins_to_quarter_hours(victim_mins),
+          "with its pushed hours recorded", str(after.get("hours_synced")))
+    check(after.get("state") == "closed",
+          "and the issue closed, the sprint having ended", str(after.get("state")))
+    created = [e for e in out.get("created", []) if e.get("linked")]
+    check(len(created) == 1, "the result reports it as a linked binding",
+          str(out.get("created")))
+
+    # Idempotent: the repair must not re-fire.
+    with Stubs(wt, mode="strict", sprints=sprints):
+        again = wt.reconcile_task_sprints(task, data, sprints, dry_run=True,
+                                          create_issues=True)
+    check(not [o for o in again["planned"] if o["op"] == "link"],
+          "a second pass plans no further link",
+          str([(o["op"], o.get("sprint")) for o in again["planned"]]))
+
+    # A repo-less task is the one case where an issue-less binding is correct.
+    solo = next((t for t in data["tasks"] if not wt.get_task_repo(t)
+                 and (t.get("sprint_issues") or [])), None)
+    if solo is not None:
+        for b in solo["sprint_issues"]:
+            b["issue"] = None
+        with Stubs(wt, mode="strict", sprints=sprints):
+            r = wt.reconcile_task_sprints(solo, data, sprints, dry_run=True,
+                                          create_issues=True)
+        check(not [o for o in r["planned"] if o["op"] == "link"],
+              "a task with no github_repo is left alone (no issue to mint)",
+              str([(o["op"], o.get("sprint")) for o in r["planned"]]))
+    else:
+        print("    (no repo-less task with bindings in the fixture to control against)")
+
+
 def test_project_info_cache(wt, migrated, scratch):
     section("13. project metadata is fetched once per run, not once per task")
     import json as _json
@@ -1535,6 +1647,7 @@ def main():
     test_set_sprint_drift(wt, migrated, scratch)
     test_pre_migration(wt, fixture, scratch)
     test_hours_withheld_guard(wt, migrated, scratch)
+    test_link_unlinked_binding(wt, migrated, scratch)
     test_project_info_cache(wt, migrated, scratch)
     test_phase5_merge(wt, fixture, scratch)
     test_hours_synced_truth(wt, migrated, scratch)

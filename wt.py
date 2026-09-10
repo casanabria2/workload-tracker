@@ -2683,6 +2683,58 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
         plan["ops"].append(op)
         created_plan.append(op)
 
+    # 3b. A target sprint that *is* bound, but whose binding carries no issue,
+    # still has nowhere to report its hours — and step 3 above cannot help,
+    # because it only fires for sprints with no binding at all. Without a repair
+    # path such a binding is permanent: the 4a guard withholds every hours write
+    # for the task and tells the user to "re-run with --create-issues", which
+    # does nothing, while `wt sync-sprints` reports the task as "already in
+    # sync". Observed on real data: `Demo Kit Ownership Transfer` Sprint 97,
+    # 59m with issue=None, stuck since the shadow migration.
+    #
+    # So mint the issue and put it on the binding that already exists. A `link`
+    # op, not a `create` one: adding a second binding for the same sprint would
+    # break the one-binding-per-sprint invariant, and _merge_binding would then
+    # have to pick a winner between two entries describing the same work.
+    linked_plan = []
+    for sid in target_ids:
+        if sid not in bound or sid not in by_id:
+            continue
+        entry = next((w for w in work if w["sprint_id"] == sid), None)
+        if entry is None or entry.get("issue"):
+            continue
+        sprint_title = by_id[sid]["title"]
+        minutes = targets.get(sid, 0)
+        hours = mins_to_quarter_hours(minutes) if minutes > 0 else 0.0
+        if not repo:
+            # Nothing to mint against. A repo-less task never reports to GitHub,
+            # so an issue-less binding is its normal, correct state.
+            continue
+        if not create_issues:
+            plan["skipped"].append({
+                "sprint": sprint_title, "sprint_id": sid, "issue": None,
+                "minutes": minutes, "hours": hours,
+                "needs_issue": True, "repo": repo,
+                "reason": "binding has no issue and create_issues=False",
+            })
+            continue
+        op = {
+            "op": "link",
+            "sprint_id": sid,
+            "sprint": sprint_title,
+            "minutes": minutes,
+            "hours": hours,
+            "issue": None,
+            "create_issue": True,
+            "issue_title": f"{task.get('title')} ({sprint_title})",
+            "repo": repo,
+            "will_close": bool(close_past and ended(sid)),
+            "main_issue": main_issue,
+            "reason": "binding exists but has no issue to report hours on",
+        }
+        plan["ops"].append(op)
+        linked_plan.append(op)
+
     # Post-plan binding set: existing (possibly re-pointed) plus the new ones.
     final = [
         {"sprint_id": w["sprint_id"], "issue": w["issue"], "state": w["state"],
@@ -2696,6 +2748,20 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
         # never needs a separate hours op.
         final.append({"sprint_id": op["sprint_id"], "issue": None, "state": "open",
                       "hours_synced": op["hours"], "new": True})
+    # Same for a linked one, except its entry already exists: mark it `new` so
+    # the hours step below neither re-pushes what the link op just wrote nor
+    # reports it as "binding has no issue" — by then it has one.
+    linked_ids = {op["sprint_id"] for op in linked_plan}
+    for f in final:
+        if f["sprint_id"] in linked_ids:
+            f["new"] = True
+            f["hours_synced"] = next(op["hours"] for op in linked_plan
+                                     if op["sprint_id"] == f["sprint_id"])
+            # The recorded state described an issue that did not exist. Observed:
+            # `state: "closed"` sitting on `issue: null`. Left alone, step 5
+            # skips the close and the freshly minted issue for a sprint that
+            # ended months ago stays open, while the binding claims otherwise.
+            f["state"] = "open"
 
     for sid in target_ids:
         if sid in bound and sid != latest:
@@ -2725,10 +2791,17 @@ def _reconcile_plan(task: dict, data: dict, sprints: list[dict], *,
     # Sprints getting a freshly-minted issue *in this same plan* are billable:
     # the create op carries their hours, so nothing is lost.
     will_mint = {op["sprint_id"] for op in plan["ops"]
-                 if op["op"] == "create" and op.get("create_issue")}
+                 if op["op"] in ("create", "link") and op.get("create_issue")}
     unbillable = []
     for sid, mins in targets.items():
         if mins <= 0 or sid not in by_id or sid in will_mint:
+            continue
+        if not repo:
+            # A task with no github_repo never reports to GitHub, so there are
+            # no Hours to narrow and nothing to protect. Its bindings are
+            # issue-less by design. Counting them made every repo-less task
+            # permanently "unbillable" — harmless while the CLI hid such tasks
+            # behind "nothing to do", and pure noise once it stopped.
             continue
         entry = next((f for f in final if f["sprint_id"] == sid), None)
         if entry is None or not entry.get("issue"):
@@ -3044,6 +3117,72 @@ def reconcile_task_sprints(task: dict, data: dict, sprints: list[dict], *,
                     "issue": binding["issue"], "minutes": op["minutes"],
                     "hours": op["hours"],
                     "skipped_github": op.get("skipped_github"),
+                })
+                if save_callback:
+                    save_callback(data)
+
+            elif kind == "link":
+                # Mint an issue for a binding that already exists without one.
+                # Deliberately mirrors the `create` branch above rather than
+                # sharing a helper with it: `create` is the path every sprint
+                # rollover runs through, and restructuring it to add this was
+                # not a trade worth making. The difference that matters is the
+                # first two statements — the binding is found, not appended, so
+                # the sprint keeps exactly one.
+                binding = next((b for b in bindings
+                                if b.get("sprint_id") == op["sprint_id"]), None)
+                if binding is None:
+                    raise Exception("binding to link has disappeared")
+                if binding.get("issue"):
+                    # Something linked it between plan and execute.
+                    result["skipped"].append({
+                        **op, "issue": binding["issue"],
+                        "reason": "binding already has an issue",
+                    })
+                    continue
+                progress(f"  {label}: Creating issue...")
+                issue_ref = create_github_issue(
+                    {"id": uid(), "title": op["issue_title"]}, op["repo"]
+                )
+                binding["issue"] = issue_ref
+                # Whatever hours_synced said, it described no issue at all.
+                clear_hours_synced(binding)
+                if pi:
+                    progress(f"  {label}: Adding to project...")
+                    item_id = add_issue_to_project(issue_ref, data)
+                    progress(f"  {label}: Setting fields...")
+                    if not op["will_close"]:
+                        sync_project_status(issue_ref, task.get("status", "todo"),
+                                            data, project_info=pi, item_id=item_id)
+                    if op["hours"] > 0 and sync_hours:
+                        if update_project_hours(issue_ref, op["hours"], data,
+                                                project_info=pi, item_id=item_id):
+                            record_hours_synced(task, issue_ref, op["hours"],
+                                                op["sprint_id"])
+                    if sprint and sprint.get("field_id"):
+                        update_project_sprint(issue_ref, op["sprint_id"],
+                                              sprint["field_id"], data,
+                                              project_info=pi, item_id=item_id)
+                    if activity:
+                        update_project_activity(issue_ref, activity, data,
+                                                project_info=pi, item_id=item_id)
+                    if type_val:
+                        update_project_type(issue_ref, type_val, data,
+                                            project_info=pi, item_id=item_id)
+                if op.get("main_issue"):
+                    progress(f"  {label}: Adding comment...")
+                    add_issue_comment(
+                        issue_ref,
+                        f"Sprint split from {op['main_issue']}. "
+                        "See that issue for full details and notes.",
+                    )
+                if not task.get("github_issue"):
+                    task["github_issue"] = issue_ref
+                did_work = True
+                result["created"].append({
+                    "sprint": op["sprint"], "sprint_id": op["sprint_id"],
+                    "issue": issue_ref, "minutes": op["minutes"],
+                    "hours": op["hours"], "linked": True,
                 })
                 if save_callback:
                     save_callback(data)
@@ -6818,7 +6957,7 @@ def _reconcile_plan_lines(res: dict) -> list[str]:
     # Sprints getting a brand-new issue in this same plan: their close op has no
     # issue ref yet, so name it "the new issue" rather than "(no issue)".
     to_create = {op["sprint_id"] for op in res.get("planned", [])
-                 if op["op"] == "create" and op.get("create_issue")}
+                 if op["op"] in ("create", "link") and op.get("create_issue")}
     for op in res.get("planned", []):
         sprint = op.get("sprint") or op.get("sprint_id") or "?"
         kind = op["op"]
@@ -6831,6 +6970,11 @@ def _reconcile_plan_lines(res: dict) -> list[str]:
                 why = op.get("skipped_github") or "no repo"
                 lines.append(f"create  {sprint:<12} local binding only ({why}) — "
                              f"{fmt_mins(op['minutes'])}")
+        elif kind == "link":
+            lines.append(f"link    {sprint:<12} new issue \"{op['issue_title']}\" "
+                         f"in {op['repo']} onto the existing binding — "
+                         f"{fmt_mins(op['minutes'])} → {op['hours']}h"
+                         + ("  (then close)" if op.get("will_close") else ""))
         elif kind == "repoint":
             lines.append(f"repoint {sprint:<12} carry {op['issue']} forward from "
                          f"{op.get('from_sprint') or 'no sprint'} — "
@@ -6854,16 +6998,23 @@ def _reconcile_plan_lines(res: dict) -> list[str]:
         elif kind == "relabel":
             lines.append(f"relabel {sprint:<12} task sprint pointer moves from "
                          f"{op.get('from_sprint') or 'none'}")
+    # A sprint can produce both a needs_issue entry and a "binding has no issue"
+    # one — they are the same fact seen from the create step and the hours step.
+    # Say it once.
+    flagged = {sk.get("sprint_id") for sk in res.get("skipped", [])
+               if sk.get("needs_issue")}
     for sk in res.get("skipped", []):
         if sk.get("needs_issue"):
             lines.append(f"SKIP    {sk.get('sprint'):<12} {fmt_mins(sk.get('minutes') or 0)} "
                          f"has no issue — re-run with --create-issues to mint one")
-        elif sk.get("reason") == "binding has no issue" and (sk.get("minutes") or 0) > 0:
-            # A binding that exists but was never linked: the task has never had a
-            # GitHub issue for that sprint. `wt done` creates the first one;
-            # reconcile only mints issues for *unbound* sprints.
-            lines.append(f"note    {sk.get('sprint'):<12} {fmt_mins(sk['minutes'])} bound but "
-                         f"never linked to an issue — use 'wt link' or 'wt done'")
+        elif (sk.get("reason") == "binding has no issue"
+                and (sk.get("minutes") or 0) > 0
+                and sk.get("sprint_id") not in flagged):
+            # A binding that exists without an issue. Reconcile *can* mint one
+            # now (the `link` op), so this only shows up for a task with no
+            # github_repo — there is nothing to mint against.
+            lines.append(f"note    {sk.get('sprint'):<12} {fmt_mins(sk['minutes'])} bound "
+                         f"with no issue, and the task has no repo to mint one in")
         elif sk.get("withheld_hours"):
             was = sk.get("from_hours")
             was_s = "unknown" if was is None else f"{was}h"
@@ -6981,9 +7132,14 @@ def cmd_sync_sprints(args):
     for t in targets:
         res = reconcile_task_sprints(t, data, all_sprints, create_issues=create_issues,
                                      dry_run=True)
-        if res.get("error") or res.get("planned") or any(
-            sk.get("needs_issue") for sk in res.get("skipped", [])
-        ):
+        # `unbillable` is the authoritative "this task has time with nowhere to
+        # report it" signal. Without it in this predicate, a task whose every
+        # hours write is being withheld has no ops and no needs_issue entry, so
+        # it fell through to "already in sync" — the most misleading summary
+        # available, since the withheld hours are precisely the ones GitHub does
+        # not have. Observed on `Demo Kit Ownership Transfer` (Sprint 97, 59m).
+        if (res.get("error") or res.get("planned") or res.get("unbillable")
+                or any(sk.get("needs_issue") for sk in res.get("skipped", []))):
             plans.append((t, res))
 
     if skipped_tasks:
@@ -6996,6 +7152,7 @@ def cmd_sync_sprints(args):
         return
 
     n_create = n_repoint = n_hours = n_close = n_needs_issue = 0
+    n_link = n_withheld = 0
     print(c(f"\n  Plan for {len(plans)} task(s):", "bold"))
     for t, res in plans:
         print(c(f"\n    {t['title']}", "cyan"))
@@ -7009,8 +7166,12 @@ def cmd_sync_sprints(args):
             print(c(f"      logs by sprint: {breakdown}", "dim"))
         for line in _reconcile_plan_lines(res):
             print(f"      {line}")
+        if res.get("unbillable"):
+            n_withheld += 1
         for op in res.get("planned", []):
-            if op["op"] == "create":
+            if op["op"] == "link":
+                n_link += 1
+            elif op["op"] == "create":
                 n_create += 1 if op.get("create_issue") else 0
             elif op["op"] == "repoint":
                 n_repoint += 1
@@ -7020,8 +7181,13 @@ def cmd_sync_sprints(args):
                 n_close += 1
         n_needs_issue += sum(1 for sk in res.get("skipped", []) if sk.get("needs_issue"))
 
-    print(c(f"\n  Totals: {n_create} issue(s) to create, {n_repoint} to re-point, "
-            f"{n_hours} hours update(s), {n_close} issue(s) to close.", "bold"))
+    print(c(f"\n  Totals: {n_create} issue(s) to create, {n_link} binding(s) to link, "
+            f"{n_repoint} to re-point, {n_hours} hours update(s), "
+            f"{n_close} issue(s) to close.", "bold"))
+    if n_withheld:
+        print(c(f"  {n_withheld} task(s) have hours WITHHELD: some of their logged "
+                f"time has no issue to report on, so narrowing the other issues "
+                f"would delete it from the project's reporting.", "yellow"))
     if n_needs_issue:
         print(c(f"  {n_needs_issue} past sprint(s) with unbilled time were NOT bound "
                 f"(no --create-issues).", "yellow"))

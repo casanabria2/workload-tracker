@@ -284,14 +284,37 @@ def check_against_baseline(data: dict, base: dict, rep: Report) -> None:
                      f"parent {parent.get('title')!r} has no binding for "
                      f"{snap['sprint']} (from shadow {snap['title']!r})")
             continue
-        rep.check(match.get("issue") == snap["github_issue"], "6/shadow-binding-issue",
-                  f"parent {parent.get('title')!r} binding for {snap['sprint']} has issue "
-                  f"{match.get('issue')!r}, shadow had {snap['github_issue']!r}")
+        # A shadow that carried **no** issue may since have been *linked* — a
+        # reconcile with create_issues=True mints one for a binding that has
+        # none (wt.py's `link` op). That is repair, not corruption: the sprint's
+        # time gains somewhere to be reported. So the strict equality only
+        # applies when the shadow actually had an issue to preserve; gaining one
+        # where there was nothing is allowed, losing or changing one is not.
+        if snap["github_issue"]:
+            rep.check(match.get("issue") == snap["github_issue"], "6/shadow-binding-issue",
+                      f"parent {parent.get('title')!r} binding for {snap['sprint']} has issue "
+                      f"{match.get('issue')!r}, shadow had {snap['github_issue']!r}")
+        elif match.get("issue"):
+            rep.warn("6/shadow-binding-linked",
+                     f"parent {parent.get('title')!r} binding for {snap['sprint']} gained "
+                     f"issue {match.get('issue')!r} where the shadow had none "
+                     "(a reconcile linked it)")
         expected_hours = _shadow_expected_hours(snap["marker_minutes"])
-        rep.check(match.get("hours_synced") == expected_hours, "6/shadow-binding-hours",
-                  f"parent {parent.get('title')!r} binding for {snap['sprint']} has "
-                  f"hours_synced {match.get('hours_synced')!r}, expected "
-                  f"{expected_hours} (from {snap['marker_minutes']}m)")
+        if match.get("hours_synced") != expected_hours and match.get("issue"):
+            # Likewise for the cached hours: the marker minutes said 0, but a
+            # linked binding reports its sprint's *real* logged hours. Only a
+            # value with no issue behind it is a violation — hours_synced means
+            # "GitHub confirmed this", and nothing can have confirmed it.
+            rep.warn("6/shadow-binding-hours-pushed",
+                     f"parent {parent.get('title')!r} binding for {snap['sprint']} has "
+                     f"hours_synced {match.get('hours_synced')!r} against issue "
+                     f"{match.get('issue')!r} (shadow marker said "
+                     f"{snap['marker_minutes']}m)")
+        else:
+            rep.check(match.get("hours_synced") == expected_hours, "6/shadow-binding-hours",
+                      f"parent {parent.get('title')!r} binding for {snap['sprint']} has "
+                      f"hours_synced {match.get('hours_synced')!r}, expected "
+                      f"{expected_hours} (from {snap['marker_minutes']}m)")
         if snap["sprint_id"] in unended:
             rep.check(match.get("state") in ("open", "closed"), "6/shadow-binding-state",
                       f"parent {parent.get('title')!r} binding for {snap['sprint']} state "
