@@ -393,8 +393,36 @@ class RefusingToEmptyDataFile(Exception):
     """
 
 
+def _data_file_presence(path) -> tuple[bool, str | None]:
+    """``(exists, denied_reason)`` — ENOENT and EPERM are *not* the same answer.
+
+    ``Path.exists()`` collapses them: it returns False both for a file that is
+    genuinely absent and for one this process was refused permission to stat.
+    That is the documented second-Mac shape, where TCC denies the whole iCloud
+    directory rather than the file, so the denial surfaces on the ``stat`` and
+    not on the ``read``. Read as "absent", the callers below conclude *fresh
+    install* — the one state in which writing defaults is correct — and write.
+    Measured before this existed: ``load()`` on a file inside a mode-000
+    directory ran the migrations and called ``save()``, which failed only
+    because the same denial refused the write. The data survived by filesystem
+    permission, not by a guard.
+
+    So: absent means we proved it absent. Anything else is unreadable.
+    """
+    try:
+        Path(path).stat()
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        return True, f"{type(exc).__name__}: {exc}"
+    return True, None
+
+
 def load() -> dict:
-    if DATA_FILE.exists():
+    exists, denied = _data_file_presence(DATA_FILE)
+    if denied:
+        raise DataFileUnreadable(DATA_FILE, denied)
+    if exists:
         # Read and parse before touching anything. A failure here must abort:
         # the migrations below write, so falling back to {} would persist it.
         try:
@@ -462,16 +490,24 @@ def save(data: dict, path=None, *, allow_empty: bool = False):
     """
     target = Path(path) if path is not None else DATA_FILE
     with data_lock(target, required=False):
-        if not allow_empty and not data.get("tasks") and target.exists():
+        exists, denied = _data_file_presence(target)
+        if not allow_empty and not data.get("tasks") and exists:
             # A target that does not exist yet cannot be destroyed — creating
             # the file on a fresh install is the one legitimate empty write.
-            try:
-                existing = json.loads(target.read_text())
-                had_tasks = len(existing.get("tasks", []))
-            except (OSError, ValueError):
-                # Unreadable or corrupt: we cannot prove it was empty, so we
-                # must not assume it was. Treat it as populated and refuse.
+            # "Does not exist" has to mean *proven* absent, though: see
+            # _data_file_presence, or a stat we were denied reads as a fresh
+            # install and skips this check on the very shape it exists for.
+            if denied:
                 had_tasks = -1
+            else:
+                try:
+                    existing = json.loads(target.read_text())
+                    had_tasks = len(existing.get("tasks", []))
+                except (OSError, ValueError):
+                    # Unreadable or corrupt: we cannot prove it was empty, so
+                    # we must not assume it was. Treat it as populated and
+                    # refuse.
+                    had_tasks = -1
             if had_tasks != 0:
                 raise RefusingToEmptyDataFile(
                     f"Refusing to write 0 tasks over {target}, which currently has "

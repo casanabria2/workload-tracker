@@ -1114,13 +1114,56 @@ differ where a harness interpolates the fixture's own counts (`61 tasks` vs
 which is the property 1g was after — literal byte-identical output was never
 reachable for label-interpolating harnesses.
 
-### 2. Collapse the daemon's `_guarded_load()`
+### 2. Collapse the daemon's `_guarded_load()` — **WON'T DO, and here's what
+it turned up instead**
 
-`wt_daemon.Daemon.read()` wraps `wt.load()` in its own probe. That predates the
-`wt.py` fix in `9daf5a1`, which moved the same guard into `load()` itself, so
-there are now two guards for one hazard. Collapse to the `wt.py` one and keep the
-daemon's HTTP mapping (`data_unreadable` → 503). Verify `test_daemon.py`'s
-unreadable-file section still fails for the right reason afterwards.
+The item claimed `wt_daemon.Daemon.read()`'s probe and `wt.load()`'s guard were
+"two guards for one hazard" and one should go. Measured before deleting
+anything, that premise is wrong in both directions.
+
+**They do not cover the same set.** `probe_data_file` refuses five shapes;
+`wt.load()` raises on three:
+
+| shape | `probe.reason` | `wt.load()` |
+|---|---|---|
+| mode-000 *file* (stat ok, read denied) | `permission_denied` | raises `DataFileUnreadable` |
+| corrupt JSON / non-object | `unparseable` | raises `DataFileUnreadable` |
+| zero bytes (iCloud placeholder) | `empty_file` | raises (empty string is invalid JSON) |
+| **absent** | `missing` | **returns defaults** — deliberate, a fresh install |
+| **valid JSON, no `tasks`** | `no_tasks` | **returns it** |
+
+The last two are why the probe still earns its place on the *write* path: an
+`os.replace` onto a file that vanished mid-iCloud-sync is risk #9 arriving as a
+brand-new empty document, and `load()` cannot tell that from a first run. The
+probe also carries the `{path, reason, size, tasks, detail}` payload the client
+renders the Full-Disk-Access state from, and `read()`'s empty-document-plus-probe
+is a deliberate contract (the client reads `data_file`, not `len(tasks)`) rather
+than duplicated defence. Nothing here should be collapsed.
+
+**And the probe was masking a hole in `load()`.** `Path.exists()` returns False
+for a file that is absent *and* for one this process was denied permission to
+`stat` — which is the documented second-Mac shape exactly, because TCC denies
+the whole iCloud directory, so the denial lands on the `stat` and never reaches
+the `read_text()` that `9daf5a1` guarded. Read as "absent", `load()` took the
+fresh-install branch, ran the migrations on a `{}` document and **called
+`save()` over the real file**. Measured: `load()` on a file inside a mode-000
+directory raised `PermissionError` from inside `tempfile.mkstemp` in
+`_atomic_write_json` — the write was attempted and the filesystem refused it.
+The data survived by permission, not by a guard, and `save()`'s own
+empty-write refusal was skipped on the same shape for the same reason
+(`target.exists()` → False → "cannot be destroyed").
+
+Fixed with `_data_file_presence(path) -> (exists, denied_reason)`, which
+separates `FileNotFoundError` from every other `OSError`; `load()` raises
+`DataFileUnreadable` on a denial, and `save()` treats an unprovable target as
+populated (`had_tasks = -1`) and refuses. `tools/test_load_safety.py` section 8
+covers it (25 checks now, up from 20) and was written first: against the
+unfixed code both its assertions fail with `PermissionError` raised from
+`_atomic_write_json`, which is the signature of the guard never running.
+
+Note this is a hazard the daemon never actually reached — its probe runs first
+and answers `permission_denied` — but every other front end calls `wt.load()`
+directly, so the CLI, MCP server and TUI had no such cover.
 
 ### 3. A committed old-vs-new differential harness
 

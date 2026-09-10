@@ -254,6 +254,59 @@ def main():
     check(json.loads(real.read_text()).get("config", {}).get("_probe") == 1,
           "and the write landed on the symlink's target")
 
+    # ── 8. EPERM is not ENOENT ──────────────────────────────────────────────
+    section("8. an unreadable directory is not mistaken for a fresh install")
+    # `Path.exists()` answers False for a missing file *and* for one it was
+    # denied permission to stat — the documented second-Mac TCC shape, where
+    # the whole iCloud directory is refused rather than the file. Read as
+    # "fresh install", load() then migrates a {} document and calls save() on
+    # top of real history. It survived only because the same denial refused
+    # the write; that is the filesystem saving us, not a guard.
+    denied_dir = scratch / "denied"
+    if denied_dir.exists():
+        os.chmod(denied_dir, 0o700)
+        shutil.rmtree(denied_dir)
+    denied_dir.mkdir()
+    buried = denied_dir / "data.json"
+    shutil.copy2(src, buried)
+    buried_size = size_of(buried)
+    wt.DATA_FILE = buried
+    os.chmod(denied_dir, 0o000)
+    raised = None
+    tasks_seen = None
+    try:
+        tasks_seen = len(wt.load().get("tasks", []))
+    except Exception as exc:                       # noqa: BLE001 - that's the point
+        raised = exc
+    # Restore before asserting, so a failure cannot leave an unusable scratch.
+    os.chmod(denied_dir, 0o700)
+
+    check(isinstance(raised, wt.DataFileUnreadable),
+          "load() raises DataFileUnreadable rather than reporting a fresh install",
+          f"raised {type(raised).__name__ if raised else None}, "
+          f"returned {tasks_seen} tasks")
+    check(size_of(buried) == buried_size,
+          "the buried file still holds every byte",
+          f"{buried_size} -> {size_of(buried)}")
+    check(json.loads(buried.read_text()).get("tasks"),
+          "and its tasks are still there")
+
+    # save()'s empty-file refusal reads the same `exists()`, so it skipped the
+    # check entirely on this shape: it could not prove the target was empty and
+    # must therefore treat it as populated.
+    os.chmod(denied_dir, 0o000)
+    raised = None
+    try:
+        wt.save({"tasks": [], "active_timer": None, "roles": [], "config": {}})
+    except Exception as exc:                       # noqa: BLE001
+        raised = exc
+    os.chmod(denied_dir, 0o700)
+    check(isinstance(raised, wt.RefusingToEmptyDataFile),
+          "save() refuses an empty write it cannot prove is safe",
+          f"raised {type(raised).__name__ if raised else None}")
+    check(json.loads(buried.read_text()).get("tasks"),
+          "…and the buried file is still intact")
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} checks FAILED:")
