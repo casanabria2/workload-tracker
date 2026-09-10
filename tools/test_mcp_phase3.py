@@ -281,17 +281,49 @@ def test_list_tasks(wt, mcp_server, migrated, scratch):
     section("3. list_tasks — no shadow filter, filters still work")
     point_at(wt, mcp_server, migrated, scratch / "list.json")
     data = mcp_server.load()
+    # Park one open task rather than hoping the fixture has one: the two
+    # opt-ins below are only really tested when both hidden statuses are
+    # present, and "does today's data happen to contain a parked task?" is
+    # the coupling §13.5 1g/1h existed to remove.
+    victim = next((t for t in data["tasks"]
+                   if t.get("status") in ("todo", "inprogress")), None)
+    if victim is None:
+        check(False, "fixture has an open task to park")
+        return
+    victim["status"] = "parked"
+    mcp_server.save(data)
+
     n_all = len(data["tasks"])
     n_done = sum(1 for t in data["tasks"] if t.get("status") == "done")
+    n_parked = sum(1 for t in data["tasks"] if t.get("status") == "parked")
 
     out = mcp_server.list_tasks()
     n_default = out.count("\n  ID: ")
-    check(n_default == n_all - n_done,
-          f"default list = {n_all - n_done} non-done tasks", str(n_default))
+    # Done and parked are hidden by *separate* opt-ins — "what did I finish?"
+    # and "what did I defer?" are different questions — so include_done alone
+    # must not reveal the parked ones.
+    check(n_default == n_all - n_done - n_parked,
+          f"default list hides {n_done} done + {n_parked} parked "
+          f"= {n_all - n_done - n_parked} shown", str(n_default))
 
     out_all = mcp_server.list_tasks(include_done=True)
-    check(out_all.count("\n  ID: ") == n_all,
-          f"include_done=True lists all {n_all}", str(out_all.count("\n  ID: ")))
+    check(out_all.count("\n  ID: ") == n_all - n_parked,
+          f"include_done=True reveals done but not parked ({n_all - n_parked})",
+          str(out_all.count("\n  ID: ")))
+
+    out_parked = mcp_server.list_tasks(include_parked=True)
+    check(out_parked.count("\n  ID: ") == n_all - n_done,
+          f"include_parked=True reveals parked but not done ({n_all - n_done})",
+          str(out_parked.count("\n  ID: ")))
+
+    out_both = mcp_server.list_tasks(include_done=True, include_parked=True)
+    check(out_both.count("\n  ID: ") == n_all,
+          f"both opt-ins list all {n_all}", str(out_both.count("\n  ID: ")))
+
+    out_only_parked = mcp_server.list_tasks(status="parked")
+    check(out_only_parked.count("\n  ID: ") == n_parked,
+          f'status="parked" lists {n_parked} without include_parked',
+          str(out_only_parked.count("\n  ID: ")))
 
     out_done = mcp_server.list_tasks(status="done")
     check(out_done.count("\n  ID: ") == n_done,
@@ -304,7 +336,8 @@ def test_list_tasks(wt, mcp_server, migrated, scratch):
 
     role = data["tasks"][0]["role_id"]
     n_role = sum(1 for t in data["tasks"]
-                 if t.get("role_id") == role and t.get("status") != "done")
+                 if t.get("role_id") == role
+                 and t.get("status") not in ("done", "parked"))
     out_role = mcp_server.list_tasks(role=role)
     check(out_role.count("\n  ID: ") == n_role, f"role={role!r} filter",
           str(out_role.count("\n  ID: ")))
@@ -314,7 +347,7 @@ def test_list_tasks(wt, mcp_server, migrated, scratch):
 
     # A previously-shadowed task's parent is visible exactly once, and none of
     # the 12 shadow titles (parent title + " (Sprint N)") appears at all.
-    titles = [l for l in out_all.splitlines() if l and not l.startswith("  ID: ")]
+    titles = [l for l in out_both.splitlines() if l and not l.startswith("  ID: ")]
     check(titles.count("IRON Infusion") == 1,
           "the ex-shadow parent appears exactly once",
           str(titles.count("IRON Infusion")))

@@ -570,14 +570,37 @@ def test_task_commands(wt, wt_api, migrated, scratch):
           "set_task_repo(None) clears it")
 
     # list_tasks filters
-    all_rows = wt_api.list_tasks(data, include_done=True)
+    # Park one open task so both hidden statuses are present whatever the
+    # fixture holds (see the same note in test_mcp_phase3).
+    victim = next((t for t in data["tasks"]
+                   if t.get("status") in ("todo", "inprogress")), None)
+    if victim is None:
+        check(False, "fixture has an open task to park")
+        return
+    was = victim["status"]
+    victim["status"] = "parked"
+    n_all = len(data["tasks"])
     n_done = sum(1 for t in data["tasks"] if t.get("status") == "done")
-    check(len(all_rows) == len(data["tasks"]), "include_done=True lists everything",
-          str(len(all_rows)))
-    check(len(wt_api.list_tasks(data)) == len(data["tasks"]) - n_done,
-          "done tasks are hidden by default")
+    n_parked = sum(1 for t in data["tasks"] if t.get("status") == "parked")
+
+    # Two hidden statuses, two independent opt-ins.
+    check(len(wt_api.list_tasks(data)) == n_all - n_done - n_parked,
+          f"done ({n_done}) and parked ({n_parked}) are both hidden by default",
+          str(len(wt_api.list_tasks(data))))
+    check(len(wt_api.list_tasks(data, include_done=True)) == n_all - n_parked,
+          "include_done=True reveals done but not parked",
+          str(len(wt_api.list_tasks(data, include_done=True))))
+    check(len(wt_api.list_tasks(data, include_parked=True)) == n_all - n_done,
+          "include_parked=True reveals parked but not done",
+          str(len(wt_api.list_tasks(data, include_parked=True))))
+    check(len(wt_api.list_tasks(data, include_done=True,
+                                include_parked=True)) == n_all,
+          "both opt-ins list everything", str(n_all))
     check(len(wt_api.list_tasks(data, status="done")) == n_done,
           'status="done" wins over the default hide')
+    check(len(wt_api.list_tasks(data, status="parked")) == n_parked,
+          'status="parked" wins over the default hide too')
+    victim["status"] = was          # later sections share this `data`
     check(wt_api.list_tasks(data, role="no-such-role") == [],
           "an unknown role filters everything out")
 

@@ -282,13 +282,27 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
             print(f"    (re-opened {close_target['title'][:40]!r} on the scratch "
                   "copy: no cross-sprint task was in progress today)")
 
+    # Park one open task, for the same reason close_target is re-opened above:
+    # whether the owner has deferred anything today is a property of the week.
+    # The main table hides `parked` alongside `done`, and asserting that needs a
+    # parked row to exist.
+    park_target = next((t for t in data["tasks"]
+                        if t.get("status") == "todo" and t is not multi
+                        and t is not close_target and t is not old_start), None)
+    if park_target is not None:
+        park_target["status"] = "parked"
+        print(f"    (parked {park_target['title'][:40]!r} on the scratch copy)")
+
     async with app.run_test() as pilot:
         await pilot.pause()
         section("1. board render")
         main_tbl = app.query_one("#task-table", tracker.DataTable)
         rec_tbl = app.query_one("#task-table-recurrent", tracker.DataTable)
+        # `parked` is hidden with `done` — deferred and finished are hidden for
+        # different reasons but share the one `a` toggle, since the TUI is no
+        # longer the primary surface and a second binding would not earn itself.
         expected_main = [t for t in data["tasks"]
-                         if t.get("status") not in ("done", "recurrent")]
+                         if t.get("status") not in ("done", "recurrent", "parked")]
         expected_rec = [t for t in data["tasks"] if t.get("status") == "recurrent"]
         check(main_tbl.row_count == len(expected_main),
               f"main table has {len(expected_main)} rows", str(main_tbl.row_count))
@@ -326,7 +340,9 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         await pilot.press("a")
         await pilot.pause()
         with_done = len([t for t in data["tasks"] if t.get("status") != "recurrent"])
-        check(main_tbl.row_count == with_done, f"'a' shows done tasks ({with_done} rows)",
+        n_parked = sum(1 for t in data["tasks"] if t.get("status") == "parked")
+        check(main_tbl.row_count == with_done,
+              f"'a' shows done *and* parked ({with_done} rows, {n_parked} parked)",
               str(main_tbl.row_count))
         await pilot.press("a")
         await pilot.pause()
@@ -628,6 +644,15 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         # fake arc_browser module raises rather than silently no-op, so switch the
         # feature off for this copy (the timer path is what's under test).
         app._data.setdefault("config", {})["tab_cleanup_enabled"] = False
+        # Start from no timer. `t` toggles, so a fixture cut while the owner had
+        # one running made the first press *stop* that timer instead of starting
+        # this one — both assertions below then failed on a working code path,
+        # decided by whether a timer happened to be live at copy time.
+        was_running = app._data.get("active_timer")
+        if was_running:
+            print(f"    (cleared a running timer from the scratch copy: "
+                  f"{was_running.get('task_id')})")
+            app._data["active_timer"] = None
         timed = next(t for t in app._data["tasks"]
                      if t.get("status") == "inprogress"
                      and wt.task_current_issue(t, app._data))

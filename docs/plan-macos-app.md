@@ -1114,6 +1114,41 @@ differ where a harness interpolates the fixture's own counts (`61 tasks` vs
 which is the property 1g was after — literal byte-identical output was never
 reachable for label-interpolating harnesses.
 
+### 1i. The `parked` status rotted three harnesses — **DONE**
+
+`abd27cc` added a fifth status hidden by default, and nothing re-ran the suite
+against it. On today's data (10 parked tasks of 70) three harnesses broke:
+
+- `test_mcp_phase3` — `default list = 28 non-done tasks` got 18, and
+  `include_done=True lists all 70` got 60. Both encoded "non-done" as the whole
+  of the default hide, which stopped being true: done and parked have
+  **separate** opt-ins on purpose, so `include_done` must *not* reveal parked.
+- `test_wt_api` — the same two assertions, same cause.
+- `test_tracker_phase3` — **crashed**, not failed: `expected_main` still
+  included parked tasks, so `rows[t["id"]]` raised `KeyError` on a row the main
+  table no longer renders.
+
+Fixed by asserting the rule in four parts (default hides both; each opt-in
+reveals only its own status; both together list everything) and by **parking a
+task on the scratch copy** rather than depending on the fixture to contain one
+— whether the owner has deferred anything this week is a property of the week.
+`test_mcp_phase3` 164 → 167 checks, `test_wt_api` 160 → 163.
+
+While there, one more rot of the same family in `test_tracker_phase3` §13: the
+fixture was cut while a timer was running (the owner's, mid-afternoon), and `t`
+*toggles*, so the first press stopped that timer instead of starting the
+section's own — two failures on a working code path, decided by whether a timer
+happened to be live at copy time. The section now clears `active_timer` as an
+explicit precondition and says so.
+
+Nine harnesses, 1,147 checks, green on a fixture cut 2026-09-10 with a fake
+`gh` first on `PATH` and an empty call log.
+
+**The standing lesson, third time now (see 1g, 1h):** a status, field or
+default added anywhere in the data model needs the suite re-run in the same
+change. Nothing runs these on a schedule, so rot is only ever found by the next
+person to need them.
+
 ### 2. Collapse the daemon's `_guarded_load()` — **WON'T DO, and here's what
 it turned up instead**
 
