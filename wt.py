@@ -954,6 +954,14 @@ RECURRENT_SERIES_ALIASES = {
     "ad-hoc slack questions":             "Ad-hoc Slack Questions - casanabria",
     "ad-hoc slack questions - casanabria": "Ad-hoc Slack Questions - casanabria",
     "ad-hoc slack question casanabria":   "Ad-hoc Slack Questions - casanabria",
+    "alex kc 1:1 calls - casanabria":     "Alex KC 1:1 calls - casanabria",
+    # Renamed 2026-09-10 to match the "<Name> 1:1 calls - casanabria" shape the
+    # other 1:1 series use. Both spellings stay mapped: the old one so any task
+    # or clone an older wt.py syncs back from the other Mac still resolves to
+    # the same series instead of splitting it, and the new one so the canonical
+    # title resolves to itself.
+    "1:1 with tomd":                      "TomD 1:1 calls - casanabria",
+    "tomd 1:1 calls - casanabria":        "TomD 1:1 calls - casanabria",
 }
 
 

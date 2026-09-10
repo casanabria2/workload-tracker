@@ -967,11 +967,33 @@ Also checked, because it is the quiet failure mode: **no non-recurrent task in
 today's data has a title that resolves**, so emitting the field title-based
 rather than status-gated cannot label ordinary work as recurring.
 
-Still open, and still not a code question: whether `1:1 with TomD` and `Alex KC
-1:1 calls - casanabria` join the table, and under what canonical names. `Alex
-KC …` already matches the established `<Name> 1:1 calls - casanabria` shape;
-`1:1 with TomD` does not, so making it consistent means renaming the task —
-which renames its GitHub issue too.
+**Both series added, 2026-09-10** (owner's decision: add both, rename TomD for
+consistency). `Alex KC 1:1 calls - casanabria` maps to itself; `1:1 with TomD`
+became `TomD 1:1 calls - casanabria`, matching the shape the other 1:1 series
+use. **Both spellings stay mapped**, so a task an older `wt.py` syncs back from
+the other Mac resolves to the same series instead of splitting it. All 7 now
+resolve, verified on a live snapshot.
+
+Two things measured before writing anything, because both could have been
+silent:
+
+- `_migrate_recurrent_series_to_bindings` runs on **every** `load()` and merges
+  members of a series, so a new alias can consolidate task objects. Checked on
+  a copy: exactly one task resolves to each new series, so there was nothing to
+  merge — tasks, logs, minutes and bindings all identical before and after, the
+  only difference being the one intended title.
+- The migration retitles the surviving member itself, offline. So the *local*
+  rename needed no `wt rename` and made no GitHub call; the issue title was then
+  set once, on the **open** binding only, in the `<title> (Sprint N)` form the
+  other series use (`wt rename` would have dropped the suffix). The three closed
+  past-sprint issues keep their historical titles, which is `wt rename`'s
+  documented scope too.
+
+Re-running the suite mattered here: the alias table feeds `make_fixtures`'
+de-migration, and the regenerated `pre.json` now yields 60 recurrent clones and
+26 shadows instead of 52 and 32 — those two series' extra bindings had been
+de-migrating as *shadow* tasks and are now recognised as clones. Nine
+harnesses, 1,155 checks, green.
 
 ### 1e. Delete the retired recurrent planner, don't just refuse it at the CLI
 
