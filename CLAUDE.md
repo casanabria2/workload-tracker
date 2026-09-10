@@ -911,8 +911,21 @@ rm -f ~/.zcompdump* && exec zsh
 Authoritative signatures (use these instead of guessing — see live values via `python3 -c "import wt, inspect; print(inspect.signature(wt.<fn>))"`):
 
 **Data loading & ids**
-- `load() -> dict` — reads `~/.workload_tracker.json`
-- `save(data: dict)` — writes it back; always call after mutating
+- `load() -> dict` — reads `~/.workload_tracker.json`. **Raises**
+  `DataFileUnreadable` rather than returning an empty dataset when the file is
+  there but unusable (denied, corrupt, zero-byte). It has to: `load()` is a
+  read-modify-*write* — the migrations `save()` when they mutate — so
+  "pretend it was empty" meant persisting that emptiness. A genuinely **absent**
+  file is still a fresh install and returns defaults, but absent means *proven*
+  absent: `_data_file_presence()` separates `FileNotFoundError` from every other
+  `OSError`, because `Path.exists()` answers False for a denied `stat` too and
+  that is exactly the second-Mac TCC shape (the denial lands on the `stat`, not
+  the read). Catch it in any caller that legitimately tolerates no dataset.
+- `save(data: dict, path=None, *, allow_empty=False)` — writes it back; always
+  call after mutating. **Raises** `RefusingToEmptyDataFile` rather than replacing
+  a populated file with a task-less one; a target it cannot prove is empty
+  counts as populated. Pass `allow_empty=True` when you mean it (deleting the
+  last task, a fresh install).
 - `uid() -> str` — timestamp-based id (yyyymmddHHMMSS + 4 random letters)
 - `notes_path(task_id: str) -> Path`
 
