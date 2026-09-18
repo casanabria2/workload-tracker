@@ -1191,6 +1191,77 @@ default added anywhere in the data model needs the suite re-run in the same
 change. Nothing runs these on a schedule, so rot is only ever found by the next
 person to need them.
 
+### 1j. The data lock is held across GitHub round-trips, so concurrent writes are lost
+
+Found 2026-09-18 the hard way: two `wt delete-log` writes both warned
+
+```
+WARNING:root:data_lock: /Users/carlos/.workload_tracker.lock busy after 5.0s — proceeding unlocked
+```
+
+and one of them was then **silently reverted** — the deleted log entries were
+back in the file minutes later. That is risk #1 landing for real, with the lock
+nominally in place.
+
+**Measured, not inferred.** A single `gh project field-list` round trip against
+the live project takes **3.7–4.0s** (three samples). `Daemon.write()` holds
+`self._locked()` — i.e. `wt.data_lock(required=True)` — around the whole of
+`fn(data)`, and `sync_hours_async`'s `fn` calls `wt.sync_project_hours`, which
+makes *several* such calls (project info is two, then item-add, then item-edit).
+So a routine hours sync holds the data lock for something like 8–16s.
+`DATA_LOCK_TIMEOUT_SECONDS` is **5.0**. `save()` uses `required=False` and
+therefore *proceeds unlocked* on expiry — deliberately, so a stuck holder could
+never wedge the TUI's 1 Hz tick — which converts every long hold into a window
+where two writers can both read, both write, and the later one wins.
+
+`sync_hours_async`'s own docstring already says a `gh project` round trip "can
+exceed 4 seconds". The part nobody joined up is that it says so *inside* the
+lock.
+
+The fix is to stop doing network I/O under the lock: read under lock, run the
+`gh` calls unlocked, then re-acquire, re-read and apply the small mutation
+(re-checking that what the push was computed from still holds). That is a real
+change to the daemon's transaction model and wants its own pass — noted here
+rather than attempted alongside the diagnosis.
+
+Worth reconsidering at the same time: `required=False`'s unlocked fallback was
+chosen to protect the TUI's tick loop, and the TUI is retired. Failing the write
+loudly is probably now the better trade than losing it quietly.
+
+### 1k. A leaked `data_lock` is invisible, so it can run for days — **DETECTION DONE**
+
+Distinct from 1j, and found in the same session. A daemon that had been up for
+**7 days** was holding the sidecar `flock` on one fd *indefinitely* while
+answering lock-taking requests in **170ms**. Those two facts can only both be
+true if the re-entrancy `depth` counter is stuck above zero: every transaction
+reads as *nested*, so it skips the `flock` entirely and takes no real lock,
+while the leaked fd keeps excluding every other process. Both halves are silent
+— the daemon looks healthy and fast, and other writers just get the
+`required=False` warning and degrade to unlocked writes. A restart clears it,
+which is exactly why it can persist for days unnoticed.
+
+Root cause **not** established: it needs `depth` incremented without its
+matching decrement while the RLock is released, and the process that did it was
+restarted before it could be inspected (no `py-spy`, no `faulthandler`). Do not
+guess at a rewrite of the primitive without a reproduction.
+
+What is done is the instrument, so it can never be silent again:
+
+- `wt.data_lock_health()` → `{depth, fh_open, fd, at_rest}`.
+- `Daemon._check_data_lock_at_rest()`, called at the top of each presence pass —
+  the one place that reliably runs *between* transactions — logs an error naming
+  the restart command, and remembers it.
+- `/v1/health` gains `data_lock` (with `leak_noticed`). `ok` deliberately stays
+  `True`: the daemon still serves, and a client keying a banner off `ok` should
+  not start flapping on a field it predates.
+
+**Read `leak_noticed`, not `at_rest`, from outside.** A poll of `/v1/health`
+legitimately catches `at_rest: false` whenever another thread is mid-transaction
+— measured during a 20s presence pass. Only the watchdog samples at a genuinely
+at-rest moment. `tools/test_daemon.py` section 11b covers the accessor, the
+nesting (depth 1 → 2, one fd), a reproduced leak, and its appearance in health;
+299 → 310 checks.
+
 ### 2. Collapse the daemon's `_guarded_load()` — **WON'T DO, and here's what
 it turned up instead**
 

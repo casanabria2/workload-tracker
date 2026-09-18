@@ -231,7 +231,13 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
 
     def pick(pred):
         for t in data["tasks"]:
-            if t.get("status") in ("done", "recurrent") or t["id"] in used:
+            # `parked` joined `done` as hidden-by-default, so a parked task is
+            # unreachable by select() and every keypress below would act on
+            # whatever row the cursor happened to land on instead. That is how
+            # section 8 came to press "S" on nothing and then crash dismissing
+            # a modal that never mounted.
+            if (t.get("status") in ("done", "recurrent", "parked")
+                    or t["id"] in used):
                 continue
             if pred(t):
                 used.add(t["id"])
@@ -246,6 +252,21 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
 
     # Far-out-of-window start sprint → the old InvalidSelectValueError crash.
     old_start = pick(lambda t: gap(t) > 4)
+    if old_start is None and current and idx.get(current["id"], 0) >= 6:
+        # Whether any *visible* task started more than four sprints ago is a
+        # property of the owner's quarter, not of the code — and it stopped
+        # being true once `parked` became hidden (the tasks that satisfied it
+        # were parked, so the picker above now skips them, correctly: an
+        # unselectable row makes every keypress land somewhere else).
+        # Construct it instead, the way close_target is re-opened below.
+        far = sprints[idx[current["id"]] - 6]
+        old_start = pick(lambda t: t.get("start_sprint_id"))
+        if old_start is not None:
+            old_start["start_sprint_id"] = far["id"]
+            old_start["start_sprint"] = far["title"]
+            print(f"    (back-dated {old_start['title'][:40]!r} to start in "
+                  f"{far['title']} on the scratch copy: no visible task "
+                  "started >4 sprints ago today)")
     # A cross-sprint task with something for a reconcile to do. "Something to do"
     # is *constructed*, not assumed: the owner's sprint-start ritual reconciles
     # every task, so on a freshly-copied live file `S` answers "already in sync",
@@ -351,6 +372,8 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         check(old_start is not None,
               "found a visible task whose start_sprint is >4 sprints back",
               old_start["title"] if old_start else "none")
+        if old_start is None:
+            raise SystemExit("section 4 cannot continue without a subject")
         check(select(main_tbl, old_start["id"]), f"selected '{old_start['title']}'")
         main_tbl.focus()
         await pilot.pause()
@@ -450,8 +473,14 @@ async def run_tui_checks(tracker, wt, sprints, data_file, stubs, opened_urls):
         expected_sprints = {e["sprint_id"] for e in wt.task_sprints_with_time(multi, sprints)}
         await pilot.press("S")
         await pilot.pause()
-        check(isinstance(app.screen, tracker.SyncSprintsModal),
-              "preview re-opened for the execution pass", type(app.screen).__name__)
+        opened = isinstance(app.screen, tracker.SyncSprintsModal)
+        check(opened, "preview re-opened for the execution pass",
+              type(app.screen).__name__)
+        if not opened:
+            # Report and stop, rather than raising ScreenStackError from
+            # dismiss() and losing every later section to a stack trace.
+            raise SystemExit("section 8 cannot continue: no SyncSprintsModal "
+                             "mounted, so there is nothing to execute")
         app.screen.dismiss(True)
         await pilot.pause()
         await app.workers.wait_for_complete()

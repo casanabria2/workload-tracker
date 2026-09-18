@@ -183,6 +183,46 @@ class DataLockTimeout(RuntimeError):
     """Raised when ``data_lock()`` cannot acquire the sidecar lock in time."""
 
 
+def data_lock_health() -> dict:
+    """The in-process lock bookkeeping, for a caller that is **at rest**.
+
+    ``depth`` counts nested ``data_lock()`` blocks on the holding thread and
+    ``fh_open`` says whether this process still has the sidecar file open and
+    flocked. Between transactions both must be zero/False; ``at_rest`` reports
+    that in one boolean.
+
+    Why this exists. Observed 2026-09-18 on a daemon up for 7 days: the process
+    held the flock on one fd **indefinitely** while serving lock-taking requests
+    in 170ms. That combination is only possible with ``depth`` stuck above zero
+    — every transaction read as *nested*, so it skipped the ``flock`` and took
+    no real lock, while the leaked fd excluded every other process. Both halves
+    are silent: the daemon looks healthy and fast, and other writers get the
+    ``required=False`` warning and degrade to unlocked writes. Nothing pointed
+    at the lock.
+
+    A restart clears it, which is why it can persist for days unnoticed. Call
+    this from a loop that runs outside any transaction (the daemon's presence
+    loop does) so a leak is *reported* rather than merely survived. The root
+    cause is not yet known: it needs ``depth`` to be incremented without its
+    matching decrement while the RLock is released, and the process that did it
+    was restarted before it could be inspected.
+    """
+    fh = _DATA_LOCK_STATE["fh"]
+    open_fd = None
+    if fh is not None:
+        try:
+            open_fd = fh.fileno()
+        except (ValueError, OSError):
+            open_fd = -1        # set but already closed: also not at rest
+    depth = _DATA_LOCK_STATE["depth"]
+    return {
+        "depth": depth,
+        "fh_open": fh is not None,
+        "fd": open_fd,
+        "at_rest": depth == 0 and fh is None,
+    }
+
+
 def _resolve_lock_file(path=None) -> Path:
     """Sidecar advisory-lock path for *path* (default: the current DATA_FILE).
 

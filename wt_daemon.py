@@ -137,6 +137,10 @@ log = logging.getLogger("wt_daemon")
 
 #: How a URL is handed to the OS. A module attribute so a test can replace it
 #: without launching a browser.
+#: The LaunchAgent label, used only to tell the reader of a log line how to
+#: restart this process. Mirrors launchd/com.carlossanabria.wtdaemon.plist.
+LAUNCHD_LABEL = "com.carlossanabria.wtdaemon"
+
 OPEN_COMMAND = "/usr/bin/open"
 
 #: The cmux CLI. cmux is the owner's terminal-and-browser; GitHub issues open
@@ -766,6 +770,8 @@ class Daemon:
 
         self.broker = EventBroker()
         self.started_at = time.time()
+        #: Set by _check_data_lock_at_rest when the sidecar flock has leaked.
+        self._lock_leak = None
 
         self._mtime_lock = threading.Lock()
         self._last_mtime = self._current_mtime()
@@ -893,9 +899,40 @@ class Daemon:
         """
         while not self._stop.wait(self.presence_interval):
             try:
+                self._check_data_lock_at_rest()
                 self._presence_pass()
             except Exception:  # noqa: BLE001 - the loop must never die
                 log.exception("presence iteration failed")
+
+    def _check_data_lock_at_rest(self):
+        """Notice a leaked ``data_lock`` instead of silently running unlocked.
+
+        This loop is the one place that reliably runs *between* transactions, so
+        the bookkeeping must read as at-rest here. When it does not, the process
+        is holding the sidecar flock forever while believing every new
+        transaction is nested — so it takes no real lock, and every other writer
+        stalls for ``DATA_LOCK_TIMEOUT_SECONDS`` and then writes unlocked.
+
+        Seen in the wild (2026-09-18, daemon up 7 days): `wt delete-log` warned
+        "busy after 5.0s — proceeding unlocked" twice while `/v1/snapshot`
+        answered in 170ms. Neither symptom names the lock, and a restart hides
+        it, so it can run for days. Log it loudly and remember it for
+        ``/v1/health``; do **not** try to self-heal by unlocking, because a
+        transaction on another thread may legitimately be holding it and
+        stealing its flock is worse than reporting the leak.
+        """
+        health = wt.data_lock_health()
+        if health["at_rest"]:
+            self._lock_leak = None
+            return
+        self._lock_leak = {**health, "noticed_at": time.time()}
+        log.error(
+            "data lock is not at rest between transactions: depth=%s fh_open=%s "
+            "fd=%s — this process is holding the sidecar flock while treating "
+            "every transaction as nested, so nothing is actually locked. "
+            "Restart the daemon (launchctl kickstart -k gui/$UID/%s).",
+            health["depth"], health["fh_open"], health["fd"], LAUNCHD_LABEL,
+        )
 
     def _presence_pass(self):
         """One poll. Returns the reason it did nothing, for tests and logs.
@@ -1333,6 +1370,12 @@ class Daemon:
                          "interval_seconds": self.presence_interval,
                          "active": self.presence and not self.tui_bridge_running()},
             "subscribers": self.broker.subscribers,
+            # Additive. `at_rest` False here means the flock is leaked and no
+            # transaction in this process is really locked — see
+            # Daemon._check_data_lock_at_rest. `ok` above stays True on purpose:
+            # the daemon still serves, and a client that keys a banner off `ok`
+            # should not start flapping on a field it predates.
+            "data_lock": {**wt.data_lock_health(), "leak_noticed": self._lock_leak},
             "allow_empty": self.allow_empty,
             "python": sys.version.split()[0],
         }

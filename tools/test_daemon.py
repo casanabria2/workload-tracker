@@ -1407,6 +1407,66 @@ def test_lock_timeout(wt, wt_daemon, migrated, scratch):
     invariants(work, "the lock-timeout test")
 
 
+def test_lock_leak_detection(wt, wt_daemon, migrated, scratch):
+    section("11b. a leaked data lock is reported, not silently survived")
+    work = scratch / "lockleak.json"
+    fresh(wt, migrated, work)
+
+    # The accessor first, at rest and nested.
+    at_rest = wt.data_lock_health()
+    check(at_rest["at_rest"] and at_rest["depth"] == 0
+          and not at_rest["fh_open"],
+          "data_lock_health() reads at-rest before any transaction", str(at_rest))
+    with wt.data_lock():
+        held = wt.data_lock_health()
+        with wt.data_lock():
+            nested = wt.data_lock_health()
+    check(held["depth"] == 1 and held["fh_open"] and not held["at_rest"],
+          "…depth 1 and the sidecar open inside a transaction", str(held))
+    check(nested["depth"] == 2 and nested["fd"] == held["fd"],
+          "…depth 2 on re-entry, still one fd (not a second flock)", str(nested))
+    check(wt.data_lock_health()["at_rest"],
+          "…and back at rest once the outermost block exits",
+          str(wt.data_lock_health()))
+
+    # Now the failure this exists for. Observed 2026-09-18 on a daemon up for
+    # seven days: `depth` stuck above zero, so every transaction read as nested
+    # and skipped the flock, while the leaked fd excluded every other process.
+    # Both halves are silent — fast, healthy-looking requests here; "busy after
+    # 5.0s — proceeding unlocked" over there.
+    with DaemonHarness(wt_daemon) as h:
+        d = h.daemon
+        d._check_data_lock_at_rest()
+        check(d._lock_leak is None,
+              "the watchdog finds nothing wrong on a healthy daemon",
+              str(d._lock_leak))
+        status, body, _ = h.get("/v1/health")
+        check(status == 200 and body.get("data_lock", {}).get("at_rest") is True,
+              "/v1/health reports the lock at rest",
+              f"{status} {body.get('data_lock')}")
+
+        saved_depth = wt._DATA_LOCK_STATE["depth"]
+        wt._DATA_LOCK_STATE["depth"] = 1        # the leak, reproduced
+        try:
+            d._check_data_lock_at_rest()
+            check(d._lock_leak is not None and d._lock_leak["depth"] == 1,
+                  "a leaked depth is noticed by the watchdog", str(d._lock_leak))
+            status, body, _ = h.get("/v1/health")
+            check(status == 200
+                  and body.get("data_lock", {}).get("at_rest") is False,
+                  "…and surfaces in /v1/health as not at rest",
+                  f"{status} {body.get('data_lock')}")
+            check(body.get("ok") is True,
+                  "…while `ok` stays True, so a client predating the field "
+                  "does not start flapping", str(body.get("ok")))
+        finally:
+            wt._DATA_LOCK_STATE["depth"] = saved_depth
+        d._check_data_lock_at_rest()
+        check(d._lock_leak is None, "and it clears once the count is sane again",
+              str(d._lock_leak))
+    invariants(work, "the lock-leak detection test")
+
+
 def test_sse(wt, wt_daemon, migrated, scratch):
     section("12. SSE: changed (daemon + external), heartbeat, framing")
     work = scratch / "sse.json"
@@ -1972,6 +2032,7 @@ def main():
             test_transport_errors(wt, wt_daemon, migrated, scratch)
             test_risk_nine(wt, wt_daemon, migrated, scratch)
             test_lock_timeout(wt, wt_daemon, migrated, scratch)
+            test_lock_leak_detection(wt, wt_daemon, migrated, scratch)
             test_sse(wt, wt_daemon, migrated, scratch)
             test_lifecycle(wt, wt_daemon, migrated, scratch)
             test_presence(wt, wt_api, wt_daemon, migrated, scratch)
