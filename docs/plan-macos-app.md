@@ -1218,6 +1218,15 @@ where two writers can both read, both write, and the later one wins.
 exceed 4 seconds". The part nobody joined up is that it says so *inside* the
 lock.
 
+**The client-visible symptom, measured.** Three consecutive `GET /v1/health`
+calls to an otherwise idle daemon returned in **0.014s, 1.12s and 6.57s**. That
+endpoint takes no lock of its own, so the delay is queueing behind whatever
+does. The monitor gives every request a **4-second** timeout — the very reason
+`sync_hours_async` was pushed onto a worker thread — so a long hold does not
+merely slow the client down, it makes a healthy daemon read as unreachable.
+Worth remembering when triaging "the app says the daemon is down": check the
+lock before believing it.
+
 The fix is to stop doing network I/O under the lock: read under lock, run the
 `gh` calls unlocked, then re-acquire, re-read and apply the small mutation
 (re-checking that what the push was computed from still holds). That is a real
